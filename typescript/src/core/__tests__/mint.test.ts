@@ -16,8 +16,9 @@ import { RealtimeClient } from '../realtime_client';
 import { SDK_NAME, SDK_VERSION } from '../../constants';
 
 const SDK_IDENTITY = `${SDK_NAME}/${SDK_VERSION}`;
-import { CredentialError, MintTokenError } from '../auth';
+import { CredentialsError, MintTokenError } from '../auth';
 import type { RealtimeConnectOptions, RealtimeTransport } from '../../transport/types';
+import type { RealtimeInboundMessage } from '../../transport/envelope';
 
 vi.mock('livekit-client', () => {
   class Room {
@@ -75,7 +76,7 @@ describe('RealtimeClient credential construction', () => {
   it('rejects providing both apiKey and token', () => {
     expect(
       () => new RealtimeClient({ apiKey: 'sk-secret', token: 'end-user-jwt' }),
-    ).toThrow(CredentialError);
+    ).toThrow(CredentialsError);
   });
 
   it('accepts exactly one credential, or none (same-origin cookie flow)', () => {
@@ -138,20 +139,22 @@ describe('RealtimeClient.mintToken', () => {
     });
   });
 
-  it('rejects with no_api_key on a token-credentialed client without reaching the network', async () => {
+  it('rejects with missing_api_key on a token-credentialed client without reaching the network', async () => {
     const client = new RealtimeClient({ token: 'end-user-jwt' });
 
     const err = await client.mintToken('user-123').catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(MintTokenError);
-    expect((err as MintTokenError).code).toBe('no_api_key');
+    expect((err as MintTokenError).code).toBe('missing_api_key');
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('rejects with no_api_key on a credential-less (cookie flow) client', async () => {
-    const client = new RealtimeClient({});
+  it('rejects with missing_api_key on a host-auth (getAuthHeaders) client', async () => {
+    const client = new RealtimeClient({
+      getAuthHeaders: () => ({ Authorization: 'Bearer host-app-jwt' }),
+    });
 
-    await expect(client.mintToken('user-123')).rejects.toMatchObject({ code: 'no_api_key' });
+    await expect(client.mintToken('user-123')).rejects.toMatchObject({ code: 'missing_api_key' });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -164,7 +167,8 @@ describe('RealtimeClient.mintToken', () => {
     const err = await client.mintToken('user-123').catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(MintTokenError);
-    expect((err as MintTokenError).code).toBe('forbidden');
+    expect((err as MintTokenError).code).toBe('request_rejected');
+    expect((err as MintTokenError).serverCode).toBe('forbidden');
     expect((err as MintTokenError).message).toBe('nope');
   });
 
@@ -176,15 +180,18 @@ describe('RealtimeClient.mintToken', () => {
     );
     const client = new RealtimeClient({ apiKey: 'sk-secret' });
 
-    await expect(client.mintToken('user-123')).rejects.toMatchObject({ code: 'rate_limited' });
+    await expect(client.mintToken('user-123')).rejects.toMatchObject({
+      code: 'request_rejected',
+      serverCode: 'rate_limited',
+    });
   });
 
-  it('maps a network failure to transport_error', async () => {
+  it('maps a network failure to request_failed', async () => {
     fetchMock.mockRejectedValue(new TypeError('Failed to fetch'));
     const client = new RealtimeClient({ apiKey: 'sk-secret' });
 
     await expect(client.mintToken('user-123')).rejects.toMatchObject({
-      code: 'transport_error',
+      code: 'request_failed',
       message: 'Failed to fetch',
     });
   });
@@ -212,18 +219,27 @@ describe('credential on session-start and merged getAuthHeaders', () => {
   } {
     let headersPromise: Promise<Record<string, string>> | undefined;
     let captured: RealtimeConnectOptions | undefined;
+    const messageListeners = new Set<(msg: RealtimeInboundMessage) => void>();
     return {
       connect: async (opts: RealtimeConnectOptions): Promise<void> => {
         captured = opts;
         headersPromise = opts.getAuthHeaders ? Promise.resolve(opts.getAuthHeaders()) : undefined;
+        for (const cb of messageListeners) cb({ type: 'ready', session_id: 'sess-mint' });
       },
       disconnect: async (): Promise<void> => {},
       send: async (): Promise<void> => {},
       setMicMuted: async (): Promise<void> => {},
       getInputStream: () => null,
       getOutputAudioElement: () => null,
+      getOutputStream: () => null,
+      onOutputStreamChanged: () => () => {},
       attachAudioElement: () => {},
-      onMessage: () => () => {},
+      onMessage: (cb) => {
+        messageListeners.add(cb);
+        return () => {
+          messageListeners.delete(cb);
+        };
+      },
       onClose: () => () => {},
       onReconnecting: () => () => {},
       onReconnected: () => () => {},

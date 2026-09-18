@@ -7,6 +7,7 @@
  * ``livekit-client`` dependency (like ``auth.ts`` and ``transport/dial.ts``).
  */
 
+import { RealtimeError, ApiError } from './errors';
 import { parseErrorDetail } from '../transport/error_detail';
 
 /** Which of the two realtime credentials the server saw. Open-ended — treat
@@ -15,7 +16,9 @@ export type CredentialKind = 'api_key' | 'user_token' | (string & {});
 
 /** The workspace a credential is bound to. */
 export type VerifyWorkspace = {
+  /** Human-readable workspace name. */
   name: string;
+  /** URL-safe workspace identifier. */
   slug: string;
 };
 
@@ -23,11 +26,15 @@ export type VerifyWorkspace = {
  *  all means the credential authenticated against this backend; the fields
  *  say what it can do from here. */
 export type CredentialInfo = {
+  /** Which of the two credential kinds the server saw. */
   credential: CredentialKind;
   /** The workspace the credential is bound to. Present for an API key, which
    *  the workspace's own developer holds; null for a minted token, which is
    *  held by an end user. */
   workspace: VerifyWorkspace | null;
+  /** Scopes granted to this credential, e.g. ``realtime:use``. Minting an
+   *  end-user token needs its own scope, so read this rather than assuming a
+   *  key can mint. */
   scopes: string[];
   /** Whether the credential carries the scope a session start needs. False
    *  means valid but under-scoped. */
@@ -39,22 +46,33 @@ export type CredentialInfo = {
   externalUserId: string | null;
 };
 
-/** ``code`` carried on :class:`VerifyError`. The server's slug when
- *  the rejection carried one, or a client-side synthetic
- *  (``transport_error``, ``invalid_response``). Open-ended — treat unknown
- *  codes defensively. */
-export type VerifyErrorCode = string;
+/** How far a credential check got before it failed.
+ *
+ *  Closed: every one is thrown by this SDK, so it changes only when the SDK
+ *  does. It says what happened to the attempt, never why the server refused —
+ *  that is the server's own slug, an open set, on `ApiError.serverCode`. */
+export type VerifyErrorCode =
+  /** The request did not produce a usable answer — a network failure or
+   *  timeout, or a redirect, which is refused rather than followed so a
+   *  credential is never re-sent to another origin. */
+  | 'request_failed'
+  /** The server refused. `serverCode` carries its own slug for why. */
+  | 'request_rejected'
+  /** The server answered, but not with a body this SDK could parse. */
+  | 'invalid_response';
 
 /** ``verify()`` failed. An invalid credential surfaces here; a valid one that
  *  simply cannot start sessions does not — that is a field on the resolved
  *  :type:`CredentialInfo`. */
-export class VerifyError extends Error {
+export class VerifyError extends ApiError {
+  /** Always ``'VerifyError'``. */
   readonly name = 'VerifyError';
+  /** Why verification failed. Match on this, not on the message. */
   readonly code: VerifyErrorCode;
 
-  constructor(code: VerifyErrorCode, message: string) {
-    super(message || code);
-    this.code = code;
+  constructor(options: { code: VerifyErrorCode; message: string; serverCode?: string }) {
+    super(options.message || options.code, { serverCode: options.serverCode });
+    this.code = options.code;
   }
 }
 
@@ -64,8 +82,8 @@ export type GetVerifyArgs = {
 };
 
 /** Place the authenticated preflight GET. Server rejections raise
- *  :class:`VerifyError` carrying the server slug; a network failure
- *  raises ``transport_error`` and a malformed success raises
+ *  :class:`VerifyError` carrying the server slug on `serverCode`; a network failure
+ *  raises ``request_failed`` and a malformed success raises
  *  ``invalid_response``. */
 export async function getVerify(args: GetVerifyArgs): Promise<CredentialInfo> {
   let response: Response;
@@ -75,28 +93,28 @@ export async function getVerify(args: GetVerifyArgs): Promise<CredentialInfo> {
       headers: await args.getAuthHeaders(),
     });
   } catch (err) {
-    throw new VerifyError(
-      'transport_error',
-      err instanceof Error ? err.message : 'Verify request failed to send.',
-    );
+    throw new VerifyError({
+      code: 'request_failed',
+      message: err instanceof Error ? err.message : 'Verify request failed to send.',
+    });
   }
   if (!response.ok) {
     const { code, message } = await parseErrorDetail(response);
     console.warn('[realtime] verify rejected', { status: response.status, code });
-    throw new VerifyError(code, message);
+    throw new VerifyError({ code: 'request_rejected', message, serverCode: code });
   }
   let body: unknown;
   try {
     body = await response.json();
   } catch (err) {
-    throw new VerifyError(
-      'invalid_response',
-      err instanceof Error ? err.message : 'Verify response was not JSON.',
-    );
+    throw new VerifyError({
+      code: 'invalid_response',
+      message: err instanceof Error ? err.message : 'Verify response was not JSON.',
+    });
   }
   const info = extractCredentialInfo(body);
   if (info === null) {
-    throw new VerifyError('invalid_response', 'Verify response had an unexpected shape.');
+    throw new VerifyError({ code: 'invalid_response', message: 'Verify response had an unexpected shape.' });
   }
   return info;
 }

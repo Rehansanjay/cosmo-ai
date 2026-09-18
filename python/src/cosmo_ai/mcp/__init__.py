@@ -3,15 +3,21 @@ exposed to the model, each call proxied to the live server subprocess.
 
 Attach servers with the ``mcp`` argument on :meth:`RealtimeClient.agent` — a
 ``.mcp.json`` config file (the Claude Code format), or a list whose elements
-are config files and/or inline :class:`McpStdioServer` objects. See
+are config files and/or inline :class:`McpStdioServer` objects. Every failure
+raises :class:`McpError`, whose ``code`` names which one it was. See
 :mod:`cosmo_ai.mcp._engine` for the parse/connect semantics.
 """
 
 from cosmo_ai.mcp._engine import (
-    McpConfigError,
-    McpExtraNotInstalledError,
+    McpError,
+    McpErrorCode,
     McpInput,
     McpStdioServer,
 )
 
-__all__ = ["McpConfigError", "McpExtraNotInstalledError", "McpInput", "McpStdioServer"]
+__all__ = [
+    "McpError",
+    "McpErrorCode",
+    "McpInput",
+    "McpStdioServer",
+]

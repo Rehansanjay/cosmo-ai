@@ -11,13 +11,13 @@ from cosmo_ai.skills._engine import (
     LOAD_SKILL_TOOL_NAME,
     PRIVATE_INSTRUCTIONS_PREFIX,
     Skill,
-    SkillParseError,
+    SkillError,
+    SkillErrorCode,
     build_load_skill_tool,
     menu_text,
     parse_skill_md,
     resolve_skills,
 )
-from cosmo_ai.tools import ClientTool
 from cosmo_ai.tools._sdk_tools import _SdkClientTool
 
 from .fakes import run_awaitable
@@ -78,13 +78,15 @@ def test_unknown_frontmatter_keys_are_ignored() -> None:
 
 
 def test_missing_frontmatter_raises() -> None:
-    with pytest.raises(SkillParseError):
+    with pytest.raises(SkillError) as exc_info:
         parse_skill_md("Just a body, no frontmatter.", default_name="x")
+    assert exc_info.value.code is SkillErrorCode.MISSING_FRONTMATTER
 
 
 def test_missing_description_raises() -> None:
-    with pytest.raises(SkillParseError):
+    with pytest.raises(SkillError) as exc_info:
         parse_skill_md("---\nname: x\n---\nbody", default_name="x")
+    assert exc_info.value.code is SkillErrorCode.MISSING_DESCRIPTION
 
 
 def test_description_with_colon_is_preserved() -> None:
@@ -95,8 +97,9 @@ def test_description_with_colon_is_preserved() -> None:
 
 def test_duplicate_frontmatter_key_raises() -> None:
     text = "---\ndescription: first.\ndescription: second.\n---\nbody"
-    with pytest.raises(SkillParseError, match="duplicate"):
+    with pytest.raises(SkillError) as exc_info:
         parse_skill_md(text, default_name="x")
+    assert exc_info.value.code is SkillErrorCode.DUPLICATE_FRONTMATTER_KEY
 
 
 def _write_skill(root: Path, dir_name: str, body: str = "Body.") -> None:
@@ -139,8 +142,9 @@ def test_resolve_detects_a_single_skill_directory(tmp_path: Path) -> None:
 
 
 def test_resolve_missing_path_raises(tmp_path: Path) -> None:
-    with pytest.raises(SkillParseError, match="not a directory"):
+    with pytest.raises(SkillError) as exc_info:
         resolve_skills(tmp_path / "does-not-exist")
+    assert exc_info.value.code is SkillErrorCode.NOT_A_DIRECTORY
 
 
 def test_resolve_empty_directory_warns_and_attaches_none(tmp_path: Path) -> None:
@@ -159,8 +163,11 @@ def test_resolve_malformed_skill_raises_with_its_path(tmp_path: Path) -> None:
     bad.mkdir()
     (bad / "SKILL.md").write_text("no frontmatter here", encoding="utf-8")
 
-    with pytest.raises(SkillParseError, match=r"bad[/\\]SKILL\.md"):
+    with pytest.raises(SkillError) as exc_info:
         resolve_skills(root)
+    # Re-wrapped to name the offending file, and the inner code survives it.
+    assert exc_info.value.code is SkillErrorCode.MISSING_FRONTMATTER
+    assert "bad" in exc_info.value.message and "SKILL.md" in exc_info.value.message
 
 
 def test_resolve_duplicate_names_raise(tmp_path: Path) -> None:
@@ -171,8 +178,9 @@ def test_resolve_duplicate_names_raise(tmp_path: Path) -> None:
     (override / "SKILL.md").write_text(
         "---\nname: a\ndescription: shadows a.\n---\nbody", encoding="utf-8"
     )
-    with pytest.raises(SkillParseError, match="duplicate skill name"):
+    with pytest.raises(SkillError) as exc_info:
         resolve_skills(root)
+    assert exc_info.value.code is SkillErrorCode.DUPLICATE_SKILL_NAME
 
 
 def test_resolve_passes_skill_lists_through() -> None:
@@ -194,13 +202,46 @@ def test_resolve_expands_path_elements_in_place(tmp_path: Path) -> None:
 def test_resolve_duplicate_names_across_elements_raise(tmp_path: Path) -> None:
     _write_skill(tmp_path / "user-skills", "faq")
     inline = Skill(name="faq", description="In code.", body="b")
-    with pytest.raises(SkillParseError, match="duplicate skill name"):
+    with pytest.raises(SkillError) as exc_info:
         resolve_skills([inline, tmp_path / "user-skills"])
+    assert exc_info.value.code is SkillErrorCode.DUPLICATE_SKILL_NAME
 
 
 def test_resolve_rejects_non_skill_non_path_elements() -> None:
     with pytest.raises(TypeError, match="must be Skill or a path"):
         resolve_skills([42])  # type: ignore[list-item]
+
+
+@pytest.mark.parametrize("target", ["root", "child"])
+def test_unreadable_directory_is_a_cannot_read_skill_error(
+    tmp_path: Path, target: str
+) -> None:
+    """``Path.is_dir``/``is_file`` swallow only ENOENT, ENOTDIR, EBADF and
+    ELOOP, so an unreadable directory used to escape as a bare
+    ``PermissionError`` — outside the error family a caller catches."""
+    root = tmp_path / "skills"
+    (root / "a-skill").mkdir(parents=True)
+    blocked = root if target == "root" else root / "a-skill"
+    blocked.chmod(0o000)
+    try:
+        with pytest.raises(SkillError) as exc_info:
+            resolve_skills(root)
+        assert exc_info.value.code is SkillErrorCode.CANNOT_READ
+    finally:
+        blocked.chmod(0o755)
+
+
+def test_unreadable_skill_file_is_a_cannot_read_skill_error(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    _write_skill(root, "faq")
+    skill_file = root / "faq" / "SKILL.md"
+    skill_file.chmod(0o000)
+    try:
+        with pytest.raises(SkillError) as exc_info:
+            resolve_skills(root)
+        assert exc_info.value.code is SkillErrorCode.CANNOT_READ
+    finally:
+        skill_file.chmod(0o644)
 
 
 def test_menu_text_lists_all_skills() -> None:

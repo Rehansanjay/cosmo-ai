@@ -41,7 +41,7 @@ describe('agent voice.speakingStyle → agent.voice.speaking_style', () => {
 
   it('forwards a preset string as agent.voice.speaking_style', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
 
     await client.agent({ voice: { speakingStyle: naturalness('human') } }).start({});
 
@@ -50,7 +50,7 @@ describe('agent voice.speakingStyle → agent.voice.speaking_style', () => {
 
   it('forwards a literal string as agent.voice.speaking_style', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
 
     await client.agent({ voice: { speakingStyle: 'literal text' } }).start({});
 
@@ -59,7 +59,7 @@ describe('agent voice.speakingStyle → agent.voice.speaking_style', () => {
 
   it('omits the voice block when no voice is supplied', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
 
     await client.agent().start({});
 

@@ -19,15 +19,40 @@ import type { NormalizedBox, NormalizedPoint } from './draw';
  *  ``object-fit`` and `AVLayerVideoGravity` both offer. */
 export type VideoContentMode = 'fit' | 'fill';
 
-export type Size = { width: number; height: number };
-export type Rect = { x: number; y: number; width: number; height: number };
-export type Point = { x: number; y: number };
+/** Width and height in CSS pixels. */
+export type Size = {
+  /** Width in CSS pixels. */
+  width: number;
+  /** Height in CSS pixels. */
+  height: number;
+};
+/** A box in CSS pixels, positioned from the element's top-left corner. */
+export type Rect = {
+  /** Left edge in CSS pixels, from the element's top-left corner. */
+  x: number;
+  /** Top edge in CSS pixels, from the element's top-left corner. */
+  y: number;
+  /** Width in CSS pixels. */
+  width: number;
+  /** Height in CSS pixels. */
+  height: number;
+};
+/** A position in CSS pixels, from the element's top-left corner. */
+export type Point = {
+  /** Horizontal position in CSS pixels, from the element's top-left corner. */
+  x: number;
+  /** Vertical position in CSS pixels, from the element's top-left corner. */
+  y: number;
+};
 
 /** Where the frame sits: the element's size in CSS pixels, the frame's own
  *  size (a video element's ``videoWidth`` / ``videoHeight``), how it is
  *  fitted, and whether the preview is mirrored. */
 export type VideoPlacement = {
+  /** The element's own size, in CSS pixels. */
   container: Size;
+  /** The frame's intrinsic size — a video element's ``videoWidth`` /
+   *  ``videoHeight``. */
   frameSize: Size;
   /** Defaults to ``fill`` — the common preview case. */
   contentMode?: VideoContentMode;

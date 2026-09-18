@@ -4,6 +4,7 @@ import itertools
 
 import pytest
 
+from cosmo_ai.hooks import HookError, HookErrorCode
 from cosmo_ai._internal.hooks import (
     Hook,
     HookEngine,
@@ -137,8 +138,9 @@ def test_resolve_hooks_snapshots_and_rejects_non_hooks() -> None:
 
     assert resolve_hooks(None) is None
     assert resolve_hooks([fine]) == (fine,)
-    with pytest.raises(TypeError, match="must be Hook"):
+    with pytest.raises(HookError, match="must be Hook") as excinfo:
         resolve_hooks([lambda ctx: None])  # type: ignore[list-item]
+    assert excinfo.value.code is HookErrorCode.INVALID_HOOK
 
 
 @pytest.mark.asyncio
@@ -242,6 +244,9 @@ def test_public_surface() -> None:
     assert sorted(hooks_mod.__all__) == [
         "EndCall",
         "Hook",
+        "HookError",
+        "HookErrorCode",
+        "HookEventName",
         "PostToolUseContext",
         "PreToolUseContext",
         "PreToolUseResult",
@@ -254,6 +259,7 @@ def test_public_surface() -> None:
         "ToolDenied",
         "ToolError",
         "ToolOk",
+        "ToolOutcome",
         "post_tool_use",
         "pre_tool_use",
         "session_end",

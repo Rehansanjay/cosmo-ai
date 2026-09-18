@@ -29,22 +29,36 @@ whole frame, ``fill`` crops it to cover."""
 
 @dataclass(frozen=True)
 class Size:
+    """A width and height in your view's coordinate space."""
+
     width: float
+    """Width, in the units you passed in."""
     height: float
+    """Height, in the units you passed in."""
 
 
 @dataclass(frozen=True)
 class Rect:
+    """A rectangle in your view's coordinate space, ready to draw."""
+
     x: float
+    """Left edge, in the units you passed in."""
     y: float
+    """Top edge, in the units you passed in."""
     width: float
+    """Width, in the units you passed in."""
     height: float
+    """Height, in the units you passed in."""
 
 
 @dataclass(frozen=True)
 class Point:
+    """A position in your view's coordinate space, ready to draw."""
+
     x: float
+    """Horizontal position, in the units you passed in."""
     y: float
+    """Vertical position, in the units you passed in."""
 
 
 _ZERO_RECT = Rect(0.0, 0.0, 0.0, 0.0)

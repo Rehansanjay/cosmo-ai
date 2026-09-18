@@ -13,6 +13,7 @@ case an allow-list would let through.
 """
 
 from __future__ import annotations
+from cosmo_ai.errors import ToolDefinitionError, ToolDefinitionErrorCode
 
 from collections.abc import Iterable
 
@@ -27,10 +28,11 @@ class _SdkClientTool(ClientTool):
     """A client tool one of this package's SDK-tool factories built."""
 
 
-def reserved_name_error(name: str) -> ValueError:
-    return ValueError(
-        f"tool name {name!r}: the {SDK_TOOL_NAME_PREFIX!r} prefix is "
-        f"reserved for tools the SDK ships — rename your tool"
+def reserved_name_error(name: str) -> ToolDefinitionError:
+    return ToolDefinitionError(
+        code=ToolDefinitionErrorCode.INVALID_TOOL_NAME,
+        message=f"tool name {name!r}: the {SDK_TOOL_NAME_PREFIX!r} prefix is "
+        f"reserved for tools the SDK ships — rename your tool",
     )
 
 

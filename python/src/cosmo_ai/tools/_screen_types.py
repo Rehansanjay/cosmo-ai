@@ -25,10 +25,11 @@ async def _resolved(value: _T | Awaitable[_T]) -> _T:
 
 
 SCREEN_PLACEMENTS: tuple[str, ...] = ("auto", "top", "bottom", "left", "right")
-"""Which side of the target the tooltip sits on; ``auto`` picks the side with
-the most room."""
+"""The ``ScreenPlacement`` values as a runtime tuple, for validation."""
 
 ScreenPlacement = Literal["auto", "top", "bottom", "left", "right"]
+"""Which side of the target the tooltip sits on; ``auto`` picks the side with
+the most room."""
 
 SCREEN_AFFORDANCES: tuple[str, ...] = (
     "pointer",
@@ -40,8 +41,7 @@ SCREEN_AFFORDANCES: tuple[str, ...] = (
     "press_hold",
     "inform",
 )
-"""Which glyph the highlight draws — the action being asked of the user. A
-highlight never acts on the user's behalf; see :class:`ScreenClickAction`."""
+"""The ``ScreenAffordance`` values as a runtime tuple, for validation."""
 
 ScreenAffordance = Literal[
     "pointer",
@@ -53,6 +53,8 @@ ScreenAffordance = Literal[
     "press_hold",
     "inform",
 ]
+"""Which glyph the highlight draws — the action being asked of the user. A
+highlight never acts on the user's behalf; see :class:`ScreenClickAction`."""
 
 ScreenClickButton = Literal["left", "right"]
 """Which button/gesture to click with: ``left`` is a left click on desktop / tap
@@ -71,21 +73,26 @@ class ScreenElement:
     ``(x, y, w, h)`` in the platform's screen coordinates."""
 
     index: int
+    """Position in this capture's element list, 0-based and contiguous. The
+    model refers to an element by this."""
     role: str
+    """What kind of control it is, in the platform's own vocabulary — e.g.
+    ``button``, ``textfield``."""
     frame: tuple[float, float, float, float]
+    """``(x, y, width, height)`` in the platform's screen coordinates."""
     title: str | None = None
+    """Its visible title, when it has one."""
     label: str | None = None
+    """Its accessibility label, when it has one."""
     value: str | None = None
+    """Its current value — the text in a field, a control's setting."""
 
 
 @dataclass(frozen=True)
 class ScreenCaptureRequest:
-    """What the server wants out of this capture. The accessibility walk is the
-    expensive half and only the grounding locator reads it, so a handler that
-    can skip it when ``wants_elements`` is false answers materially faster.
-    Ignoring it is always correct — the extra elements are dropped."""
-
-    wants_elements: bool
+    """The capture being asked for. It carries no options today; any future
+    capture option lands here, inside the parameter every handler already
+    accepts."""
 
 
 @dataclass(frozen=True)
@@ -96,8 +103,14 @@ class ScreenCapture:
     identity); the SDK never inspects it."""
 
     image_jpeg: bytes
+    """The screenshot the model reasons over, JPEG-encoded."""
     elements: Sequence[ScreenElement] = field(default_factory=tuple)
-    context: object = None
+    """The elements it may pick from. Empty when the capture did not gather
+    them."""
+    context: object | None = None
+    """Opaque state you may stash and read back at click time — the SDK never
+    inspects it. Use it to check the capture is still current, e.g. that the
+    same app is still frontmost."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -128,9 +141,13 @@ class ScreenBox:
     of the screen."""
 
     x: float
+    """Left edge, ``0``–``1`` across the shared surface."""
     y: float
+    """Top edge, ``0``–``1`` down the shared surface."""
     width: float
+    """Width as a fraction of the surface's width."""
     height: float
+    """Height as a fraction of the surface's height."""
 
 
 @dataclass(frozen=True)
@@ -142,7 +159,10 @@ class ScreenElementHint:
     changed"), not the tooltip; ``role`` disambiguates a repeated title."""
 
     title: str
+    """What the model believes the target is called — its visible text, not
+    the tooltip."""
     role: str | None = None
+    """The kind of control, to disambiguate a repeated title."""
 
 
 @dataclass(frozen=True)
@@ -151,7 +171,9 @@ class ScreenClickAction:
     a double. Button and double are orthogonal axes rather than a flat enum."""
 
     button: ScreenClickButton
+    """Which button or gesture to use."""
     double: bool
+    """Whether it is a double click. Orthogonal to ``button``."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -188,10 +210,17 @@ class ScreenHighlightBoxRequest:
     expose no usable label."""
 
     box: ScreenBox
+    """Where the model believes the target is."""
     label: str
+    """Tooltip text to show beside the highlight."""
     placement: ScreenPlacement
+    """Which side of the target the tooltip sits on."""
     interaction: ScreenAffordance
+    """Which glyph to draw — the action being asked of the user."""
     element_guess: ScreenElementHint | None = None
+    """What the model thinks the target is called, when it can guess. A bonus
+    signal for snapping the box onto a real control — never a requirement,
+    and ``None`` on most apps."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -205,8 +234,12 @@ class ScreenClickTarget:
     the capture it was picked from, and how to click it."""
 
     element: ScreenElement
+    """The element the handle resolved to."""
     capture: ScreenCapture
+    """The capture it was picked from — check ``context`` if you need to
+    confirm the screen has not moved on."""
     action: ScreenClickAction
+    """Which button, and whether it is a double."""
 
 
 @dataclass(frozen=True)
@@ -214,10 +247,15 @@ class ScreenHighlightTarget:
     """What a highlight handler is asked to do, for a handle the locator minted."""
 
     element: ScreenElement
+    """The element to highlight."""
     capture: ScreenCapture
+    """The capture it was picked from."""
     label: str
+    """Tooltip text to show beside the highlight."""
     placement: ScreenPlacement
+    """Which side of the element the tooltip sits on."""
     interaction: ScreenAffordance
+    """Which glyph to draw — the action being asked of the user."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -236,7 +274,10 @@ class ScreenClickOutcome:
     ("the window moved — locate it again"), not an error code."""
 
     clicked: bool
+    """Whether the click actually happened."""
     reason: str | None = None
+    """Why it did not, when ``clicked`` is ``False`` — model-facing prose the
+    agent says out loud, not an error code."""
 
 
 @dataclass(frozen=True)
@@ -244,7 +285,7 @@ class ScreenHighlightOutcome:
     """What either highlight reports back to the model — the mark is showing, but
     is it *on* the thing?
 
-    Shared by :func:`screen_highlight_element` and :func:`screen_highlight_box`
+    Shared by :func:`screen_highlight_element_tool` and :func:`screen_highlight_box_tool`
     so the model reads the same field whichever it called. A handler that
     resolved the target to a real control answers ``exact=True``; one that could
     only draw where the model estimated answers ``exact=False``, the model's cue
@@ -256,8 +297,14 @@ class ScreenHighlightOutcome:
     sharing their screen"), not an error code."""
 
     shown: bool
+    """Whether the highlight is now visible."""
     exact: bool = False
+    """Whether it landed on a real resolved control (``True``) or only where
+    the model estimated (``False``) — the model's cue to re-target through
+    the locator. Always ``True`` from a grounded handle."""
     reason: str | None = None
+    """Why nothing is showing, when ``shown`` is ``False`` — model-facing
+    prose the agent says out loud, not an error code."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -265,16 +312,13 @@ class ScreenHighlightOutcome:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-ScreenCaptureHandler = Union[
-    Callable[[], Union[ScreenCapture, Awaitable[ScreenCapture]]],
-    Callable[[ScreenCaptureRequest], Union[ScreenCapture, Awaitable[ScreenCapture]]],
+ScreenCaptureHandler = Callable[
+    [ScreenCaptureRequest], Union[ScreenCapture, Awaitable[ScreenCapture]]
 ]
-"""Snapshot the shared screen: ``() -> ScreenCapture`` or
-``(request) -> ScreenCapture``, sync or async. Take the
-:class:`ScreenCaptureRequest` to skip the accessibility walk when the caller
-will not read it. Raising (or returning no elements) surfaces to the model as
-an inability to see the screen — the raised message reaches the model as the
-locator's reason."""
+"""Snapshot the shared screen: ``(request) -> ScreenCapture``, sync or async.
+Raising (or returning no elements) surfaces to the model as an inability to
+see the screen — the raised message reaches the model as the locator's
+reason."""
 
 ScreenClickHandler = Callable[
     [ScreenClickTarget], Union[ScreenClickOutcome, Awaitable[ScreenClickOutcome]]

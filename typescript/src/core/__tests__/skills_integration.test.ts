@@ -13,6 +13,7 @@ if (typeof global.TextDecoder === 'undefined') {
   global.TextDecoder = NodeTextDecoder as typeof global.TextDecoder;
 }
 
+import { mintAgentTool } from '../agent';
 import { RealtimeClient } from '../realtime_client';
 import {
   LOAD_SKILL_TOOL_NAME,
@@ -41,7 +42,7 @@ function makeSkill(overrides: Partial<Skill> = {}): Skill {
 
 describe('skills through agent.start()', () => {
   it('duplicate skill names throw at agent build', () => {
-    const client = new RealtimeClient({ transportFactory: () => makeFakeTransport() });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => makeFakeTransport() });
     expect(() => client.agent({ skills: [makeSkill(), makeSkill()] })).toThrow(
       /duplicate skill name/,
     );
@@ -52,7 +53,7 @@ describe('skills through agent.start()', () => {
     // namespace, so a caller tool taking that name is rejected at config
     // assembly — it never silently drops the skills.
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
 
     await expect(
       client
@@ -60,7 +61,13 @@ describe('skills through agent.start()', () => {
           instructions: 'Be helpful.',
           skills: [makeSkill()],
           tools: [
-            { kind: 'client', name: LOAD_SKILL_TOOL_NAME, description: 'mine', parameters: {} },
+            mintAgentTool({
+              kind: 'client',
+              name: LOAD_SKILL_TOOL_NAME,
+              description: 'mine',
+              parameters: {},
+              handler: async () => null,
+            }),
           ],
         })
         .start(),
@@ -69,7 +76,7 @@ describe('skills through agent.start()', () => {
 
   it('adds the load_skill tool and the menu to the sent config', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     const skills = [makeSkill()];
 
     await client.agent({ instructions: 'Be helpful.', skills }).start();
@@ -85,7 +92,7 @@ describe('skills through agent.start()', () => {
 
   it('makes the menu the sole instructions when none are supplied', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     const skills = [makeSkill()];
 
     await client.agent({ skills }).start();
@@ -99,19 +106,20 @@ describe('skills through agent.start()', () => {
     // into the reserved namespace — so a caller tool taking it coexists with
     // the skills' own cosmo_sdk_load_skill tool and menu.
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
 
     await client
       .agent({
         instructions: 'Be helpful.',
         skills: [makeSkill()],
         tools: [
-          {
+          mintAgentTool({
             kind: 'client',
             name: 'load_skill',
             description: 'caller-owned',
             parameters: { type: 'object' },
-          },
+            handler: async () => null,
+          }),
         ],
       })
       .start();
@@ -127,7 +135,7 @@ describe('skills through agent.start()', () => {
 
   it('an empty skills array adds no tool and no menu', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
 
     await client.agent({ instructions: 'Be helpful.', skills: [] }).start();
 
@@ -138,7 +146,7 @@ describe('skills through agent.start()', () => {
 
   it('serves a skill body over the RPC bridge', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     const skills = [makeSkill()];
 
     await client.agent({ skills }).start();

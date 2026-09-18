@@ -32,8 +32,8 @@ import type { RealtimeAgent, SessionStartOptions } from '../core/agent';
 import { log } from '../core/logger';
 import { RealtimeClient, type RealtimeClientOptions } from '../core/realtime_client';
 import type { RealtimeSession } from '../core/session';
-import type { DisconnectReason, SessionLifecycleState } from '../core/state';
-import type { RejectedTool } from '../wire/types.gen';
+import type { DisconnectReason, SessionState } from '../core/state';
+import type { RejectedTool } from '../protocol';
 
 /** Where the hook's one session slot is in its life. ``'ending'`` covers
  *  the gap between an exit and the spent client's mic release landing. */
@@ -44,17 +44,35 @@ export type RealtimeSessionPhase = 'idle' | 'starting' | 'live' | 'ending';
  *  ``ended``: the run was over before it went live — cancelled by ``end()``
  *  or an unmount while connecting, or ended the instant it started. */
 export type RealtimeSessionStartResult =
-  | { ok: true; session: RealtimeSession }
-  | { ok: false; reason: 'busy' | 'failed' | 'ended'; error: Error | null };
+  | {
+      ok: true;
+      /** The live session this run produced. */
+      session: RealtimeSession;
+    }
+  | {
+      ok: false;
+      /** Why it did not start: ``busy`` (a run is already underway and
+       *  nothing changed), ``failed`` (the start threw), or ``ended`` (the
+       *  run was over before it went live). */
+      reason: 'busy' | 'failed' | 'ended';
+      /** The thrown error on ``failed``; ``null`` for the other reasons,
+       *  which are not errors. */
+      error: Error | null;
+    };
 
 /** Typed record of how the last run ended. ``reason`` is the lifecycle
  *  machine's typed reason; ``detail`` carries the server's end slug or a
  *  transport message when one exists. */
 export type RealtimeSessionEndSummary = {
+  /** The lifecycle machine's typed reason for the ending. */
   reason: DisconnectReason;
+  /** The server's end slug or a transport message when one exists,
+   *  otherwise ``null``. */
   detail: string | null;
 };
 
+/** Options for ``useRealtimeSession()``. Neither field needs memoizing —
+ *  fresh literals every render are fine. */
 export type UseRealtimeSessionOptions = {
   /** Build the agent for one run on the freshly constructed client —
    *  return ``client.agent({...})`` or ``client.catalogAgent(name)``.
@@ -67,12 +85,16 @@ export type UseRealtimeSessionOptions = {
   clientOptions?: RealtimeClientOptions;
 };
 
+/** What ``useRealtimeSession()`` returns: the two controls, the current
+ *  phase, and everything worth surfacing about the last run.
+ *
+ *  ``phase`` is a discriminant — narrowing on ``phase === 'live'`` gives you
+ *  a non-null ``client`` and ``session`` without a null check. */
 export type UseRealtimeSessionResult = {
-  /** Open a session. Resolves once the run is live — connected enough to
-   *  render, though not necessarily ``ready`` yet (await
-   *  ``session.waitUntilReady()`` before publishing media) — or with the
-   *  typed reason it isn't. A failed start also lands in ``error``. */
-  start: (opts?: SessionStartOptions) => Promise<RealtimeSessionStartResult>;
+  /** Open a session. Resolves once the run is live — the session is ready
+   *  and every method usable — or with the typed reason it isn't. A failed
+   *  start also lands in ``error``. */
+  start: (options?: SessionStartOptions) => Promise<RealtimeSessionStartResult>;
   /** End the run: gracefully for a live session, by cancellation for one
    *  still ``'starting'`` (its client is disconnected the moment the start
    *  settles). A no-op when nothing is underway. */
@@ -94,14 +116,23 @@ export type UseRealtimeSessionResult = {
   endedReason: string | null;
 } & (
   | {
+      /** No session is usable right now: nothing started, one is connecting,
+       *  or one is winding down. */
       phase: 'idle' | 'starting' | 'ending';
+      /** ``null`` outside a live run — narrow on ``phase === 'live'`` to get
+       *  a non-null client without a check. */
       client: null;
+      /** ``null`` outside a live run. */
       session: null;
     }
   | {
       /** ``'live'`` statically implies a non-null ``client``/``session``. */
       phase: 'live';
+      /** The client backing this run. A client is single-use, so this is a
+       *  fresh one per ``start()``. */
       client: RealtimeClient;
+      /** The live session. The phase turns ``'live'`` once ``start()``
+       *  resolves, which is at ``ready``, so it is usable. */
       session: RealtimeSession;
     }
 );
@@ -119,7 +150,7 @@ const LOCAL_END_REASONS: ReadonlySet<DisconnectReason> = new Set([
 const NO_REJECTED_TOOLS: RejectedTool[] = [];
 
 function endSummaryFromState(
-  state: SessionLifecycleState,
+  state: SessionState,
   fallbackDetail: string | null,
 ): RealtimeSessionEndSummary {
   if (state.kind === 'disconnected') {
@@ -128,6 +159,27 @@ function endSummaryFromState(
   return { reason: 'transport_error', detail: fallbackDetail };
 }
 
+/**
+ * Runs one voice session at a time, with start/stop wired up.
+ *
+ * ```tsx
+ * const { phase, session, start, end } = useRealtimeSession({
+ *   makeAgent: (client) => client.agent({ instructions: 'Be brief.' }),
+ * });
+ * ```
+ *
+ * Sugar over the imperative surface for the ordinary browser-app shape: a
+ * Start button, an End button, and a session in between. It builds a fresh
+ * client per run, keeps ``phase`` honest through teardown so a Start button
+ * gated on ``phase === 'idle'`` cannot open a session while the last one
+ * still holds the microphone, and releases the mic if the component
+ * unmounts mid-call.
+ *
+ * Pair it with ``<RealtimeProvider session={session}>`` to render the run.
+ * Own the lifecycle yourself with ``agent.start()`` when you need something
+ * this shape does not cover — several concurrent sessions, or a session
+ * that outlives the component.
+ */
 export function useRealtimeSession(
   options: UseRealtimeSessionOptions,
 ): UseRealtimeSessionResult {
@@ -159,9 +211,25 @@ export function useRealtimeSession(
   /** Set by ``end()`` while a start is in flight; the start settles into a
    *  disconnect instead of going live. */
   const cancelRef = useRef(false);
+  /** The in-flight start's session, handed over before its connect begins,
+   *  so a cancel during the ready wait has something to close. */
+  const pendingRef = useRef<RealtimeSession | null>(null);
   /** Set on unmount. No state moves after it; a start still in flight
    *  disconnects its client the moment it settles. */
   const disposedRef = useRef(false);
+
+  /** Tear down the in-flight start's session, once. The pending ``start()``
+   *  rejects as cancelled, which its own catch turns into ``'ended'``. */
+  const closePending = useCallback(async (): Promise<void> => {
+    const pending = pendingRef.current;
+    if (pending === null) return;
+    pendingRef.current = null;
+    try {
+      await pending.close();
+    } catch (err) {
+      log.error('[realtime] closing a cancelled start failed', err);
+    }
+  }, []);
 
   const movePhase = useCallback((next: 'idle' | 'starting' | 'ending') => {
     if (disposedRef.current) return;
@@ -197,7 +265,7 @@ export function useRealtimeSession(
   );
 
   const start = useCallback(
-    async (opts?: SessionStartOptions): Promise<RealtimeSessionStartResult> => {
+    async (options?: SessionStartOptions): Promise<RealtimeSessionStartResult> => {
       if (disposedRef.current || phaseRef.current !== 'idle') {
         return { ok: false, reason: 'busy', error: null };
       }
@@ -213,7 +281,21 @@ export function useRealtimeSession(
       let started: RealtimeSession;
       try {
         live = new RealtimeClient(clientOptions);
-        started = await makeAgent(live).start(opts);
+        started = await makeAgent(live).start({
+          ...options,
+          // ``start()`` resolves at ready, so the wait can run for the whole
+          // ready budget. Take the session before the connect begins so
+          // ``end()`` / unmount can tear it down mid-wait instead of holding
+          // the microphone until the wait settles; the caller's own
+          // ``onSession`` still runs.
+          onSession: (session) => {
+            pendingRef.current = session;
+            if (cancelRef.current || disposedRef.current) {
+              void closePending();
+            }
+            options?.onSession?.(session);
+          },
+        });
       } catch (err) {
         // agent.start() has already torn its client down on failure —
         // nothing is holding the microphone.
@@ -224,8 +306,10 @@ export function useRealtimeSession(
           setError(error);
         }
         movePhase('idle');
+        // A cancelled start reports no error: the rejection is this hook's
+        // own teardown answering, not a failure the caller needs handed back.
         return cancelled
-          ? { ok: false, reason: 'ended', error }
+          ? { ok: false, reason: 'ended', error: null }
           : { ok: false, reason: 'failed', error };
       }
 
@@ -245,6 +329,7 @@ export function useRealtimeSession(
 
       clientRef.current = live;
       sessionRef.current = started;
+      pendingRef.current = null;
 
       // ``ready`` is replayed to late subscribers, so a fast connect
       // cannot slip past this.
@@ -269,13 +354,16 @@ export function useRealtimeSession(
       setSlot({ phase: 'live', client: live, session: started });
       return { ok: true, session: started };
     },
-    [handleEnded, movePhase],
+    [closePending, handleEnded, movePhase],
   );
 
   const end = useCallback(async (): Promise<void> => {
     if (phaseRef.current === 'starting') {
       cancelRef.current = true;
       movePhase('ending');
+      // Tear the in-flight run down now rather than waiting out its ready
+      // budget — the microphone is captured for the whole of it.
+      await closePending();
       return;
     }
     const current = sessionRef.current;
@@ -290,7 +378,7 @@ export function useRealtimeSession(
       log.error('[realtime] session end failed', err);
       handleEnded(current, { reason: 'client_ended', detail: null });
     }
-  }, [handleEnded, movePhase]);
+  }, [closePending, handleEnded, movePhase]);
 
   useEffect(() => {
     // StrictMode re-runs this effect on the same instance; only the final
@@ -305,8 +393,10 @@ export function useRealtimeSession(
           log.error('[realtime] end on unmount failed', err);
         });
       }
+      // Unmounted mid-start: the same release, for a run that never went live.
+      void closePending();
     };
-  }, []);
+  }, [closePending]);
 
   const endedReason =
     lastEnd === null || LOCAL_END_REASONS.has(lastEnd.reason)

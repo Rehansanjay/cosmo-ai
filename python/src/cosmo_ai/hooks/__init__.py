@@ -19,9 +19,11 @@ the shared hook-engine vectors).
 """
 
 from cosmo_ai._internal.protocol import EndCall, Say, ServerHook, SilenceTimeout
+from cosmo_ai.errors import HookError, HookErrorCode
 
 from cosmo_ai._internal.hooks import (
     Hook,
+    HookEventName,
     PostToolUseContext,
     PreToolUseContext,
     PreToolUseResult,
@@ -31,6 +33,7 @@ from cosmo_ai._internal.hooks import (
     ToolDenied,
     ToolError,
     ToolOk,
+    ToolOutcome,
     post_tool_use,
     pre_tool_use,
     session_end,
@@ -40,6 +43,9 @@ from cosmo_ai._internal.hooks import (
 __all__ = [
     "EndCall",
     "Hook",
+    "HookError",
+    "HookErrorCode",
+    "HookEventName",
     "PostToolUseContext",
     "PreToolUseContext",
     "PreToolUseResult",
@@ -52,6 +58,7 @@ __all__ = [
     "ToolDenied",
     "ToolError",
     "ToolOk",
+    "ToolOutcome",
     "post_tool_use",
     "pre_tool_use",
     "session_end",

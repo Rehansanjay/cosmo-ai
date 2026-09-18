@@ -1,44 +1,49 @@
-// WebSocket wire types live under ``./wire/`` and are generated from
-// the backend's OpenAPI schema. The generated code is self-contained —
-// no host-project path aliases — so an external ``npm install cosmo-ai``
-// resolves cleanly.
+// The wire protocol this SDK speaks is declared in ``./protocol``, not
+// re-exported from the schema-generated ``./wire/``. Every published type is
+// therefore the SDK's own, so regenerating the backend schema cannot change a
+// consumer's types on its own; ``protocol/__tests__/wire_parity.test.ts``
+// holds each declaration identical to its generated twin.
 
 export { setLogLevel, getLogLevel } from './core/logger';
 export type { LogLevel } from './core/logger';
 export { RealtimeClient } from './core/realtime_client';
 export type { RealtimeClientOptions } from './core/realtime_client';
 
-export { RealtimeAgent } from './core/agent';
+export { PreparedSession, RealtimeAgent } from './core/agent';
+export {
+  detectObjectsTool,
+  endCallTool,
+  examineImageTool,
+  pointAtObjectTool,
+  speakerLogTool,
+  webSearchTool,
+} from './core/agent';
+export {
+  GeminiModel,
+  GrokModel,
+  OpenAILiveModel,
+  OpenAIMiniModel,
+  OpenAIModel,
+} from './core/agent';
 export type {
   AgentConfig,
-  AmbienceConfig,
+  AgentTool,
   AudioConfig,
   BackgroundClientToolHandler,
-  BackgroundClientToolSpec,
   ClientToolHandler,
   CatalogAgentOptions,
-  ClientToolSpec,
-  DetectObjectsToolSpec,
-  EndCallToolSpec,
-  ExamineImageToolSpec,
   CosmoVadConfig,
-  GeminiModelOptions,
-  GrokModelOptions,
-  ModelOptions,
-  OpenAIMiniModelOptions,
-  OpenAIModelOptions,
-  PointAtObjectToolSpec,
-  RealtimeTool,
+  RealtimeModel,
+  RealtimeModelBlock,
   SessionStartOptions,
   VoiceConfig,
-  WebSearchToolSpec,
 } from './core/agent';
 
 export {
   DRAW_BOX_TOOL_NAME,
   DRAW_POINT_TOOL_NAME,
-  drawBox,
-  drawPoint,
+  drawBoxTool,
+  drawPointTool,
   notShown,
   parseDrawBoxRequest,
   parseDrawPointRequest,
@@ -62,9 +67,10 @@ export {
   landedOnEstimate,
   notClicked,
   parseScreenHighlightBoxRequest,
-  screenClickElement,
-  screenHighlightBox,
-  screenHighlightElement,
+  screenClickElementTool,
+  screenLocateTool,
+  screenHighlightBoxTool,
+  screenHighlightElementTool,
 } from './tool/screen';
 export type {
   ScreenAffordance,
@@ -72,7 +78,6 @@ export type {
   ScreenCapture,
   ScreenCaptureHandler,
   ScreenCaptureRequest,
-  ScreenLocateTool,
   ScreenClickAction,
   ScreenClickButton,
   ScreenClickOutcome,
@@ -96,18 +101,30 @@ export type {
 
 export { ClientToolJob } from './core/client_tool_jobs';
 
-export { AudioPublishAlreadyActiveError, RealtimeError } from './core/errors';
+export {
+  SessionStateError,
+  type SessionStateErrorCode,
+  AudioUnavailableError,
+  type AudioUnavailableErrorCode,
+  ApiError,
+  RealtimeError,
+} from './core/errors';
 
 export {
   Hook,
+  HookError,
+  type HookErrorCode,
   postToolUse,
   preToolUse,
   sessionEnd,
   sessionStart,
 } from './core/hooks';
 export type {
+  EndCall,
   HookEventName,
+  Say,
   ServerHook,
+  SilenceTimeout,
   PostToolUseContext,
   PostToolUseHook,
   PreToolUseContext,
@@ -122,21 +139,34 @@ export type {
   ToolOutcome,
 } from './core/hooks';
 
-export { SkillParseError, parseSkillMd } from './core/skills';
+export { SkillError, parseSkillMd } from './core/skills';
+export type { SkillErrorCode } from './core/skills';
 export type { Skill } from './core/skills';
 
+// The only generated types on the public surface: closed string unions, whose
+// members are the wire's values in every language, so they carry no wire
+// spelling into user code. Everything else is declared in ``./protocol``.
 export type {
-  EndCall as EndCall,
   EndOfSpeechSensitivity,
+  GrokReasoningEffort,
   InterruptionSensitivity,
-  Say as Say,
+  NoiseCancellation,
   SemanticEagerness,
-  SessionStartTimings,
-  SilenceTimeout as SilenceTimeout,
+  OpenAiLiveDelegation as OpenAILiveDelegation,
+  OpenAiLiveReasoningEffort as OpenAILiveReasoningEffort,
+  OpenAiLiveServiceTier as OpenAILiveServiceTier,
+  OpenAiLiveToolChoice as OpenAILiveToolChoice,
+  OpenAiLiveVerbosity as OpenAILiveVerbosity,
   ThinkingLevel,
 } from './wire/types.gen';
 
 export type { SessionConnectTimings } from './core/state';
+
+// The wire shapes the barrel publishes. Declared in ``./protocol`` and
+// imported, not re-exported, by the modules that use them, so they stay off
+// the ``core/*`` entry points. ``ErrorCode`` is the server's error enum, a
+// closed union of wire values that Python and Swift publish identically.
+export type { DelegationChannel, ErrorCode, RejectedTool, SessionStartTimings } from './protocol';
 
 export { RealtimeSession } from './core/session';
 export type {
@@ -145,11 +175,17 @@ export type {
   UnknownEvent,
 } from './core/session';
 
-export { CredentialError, MintTokenError } from './core/auth';
+export {
+  CredentialsError,
+  type CredentialsErrorCode,
+  MintTokenError,
+} from './core/auth';
 export type { MintedToken, MintTokenErrorCode } from './core/auth';
+export { TokenSourceError } from './core/token_source';
+export type { TokenSourceErrorCode } from './core/token_source';
 
 export { TokenSource } from './core/token_source';
-export type { FetchedToken, TokenSourceEndpointOptions } from './core/token_source';
+export type { TokenSourceEndpointOptions } from './core/token_source';
 
 export { VerifyError } from './core/verify';
 export type {
@@ -168,64 +204,20 @@ export type {
   SessionUsage,
 } from './core/usage';
 
-export {
-  RealtimeProvider,
-  CosmoRealtimeProvider,
-  useRealtimeSessionContext,
-} from './react/RealtimeProvider';
-export type {
-  RealtimeProviderProps,
-  CosmoRealtimeProviderProps,
-  RealtimeSnapshotState,
-  RealtimeTranscriptItem,
-  RealtimeToolCallItem,
-} from './react/RealtimeProvider';
+// The React bindings are not re-exported here: importing them would pull
+// react into the module graph of every consumer, including headless ones.
+// They live at `cosmo-ai/react`.
 
-export {
-  useTransportState,
-  useAgentState,
-  useMediaState,
-  useTranscript,
-  useToolCalls,
-  useRealtimeError,
-  useMicLevel,
-  useOutputLevel,
-} from './react/hooks';
-
-export { useRealtimeSession } from './react/use_realtime_session';
-export type {
-  RealtimeSessionEndSummary,
-  RealtimeSessionPhase,
-  RealtimeSessionStartResult,
-  UseRealtimeSessionOptions,
-  UseRealtimeSessionResult,
-} from './react/use_realtime_session';
-export type { RejectedTool } from './wire/types.gen';
-
-export { RealtimeAudio } from './react/components/RealtimeAudio';
-export { MicToggle } from './react/components/MicToggle';
-export { BarVisualizer } from './react/components/BarVisualizer';
-export { StartAudio } from './react/components/StartAudio';
-
-export { NotReadyError } from './core/types';
-export type {
-  ErrorEvent,
-  ErrorCode,
-  ScreenShareState,
-} from './core/types';
+export type { ErrorEvent, ScreenShareState } from './core/types';
 
 export { DialError } from './transport/dial';
 export type { DialResult, DialErrorCode } from './transport/dial';
 
-export {
-  SessionStartError,
-  SessionBusyError,
-  SessionEntitlementError,
-  SessionConfigError,
-  VersionMismatchError,
-  SessionStartTransportError,
+export { SessionStartError } from './transport/session_start_error';
+export type {
+  SessionStartRejection,
+  SessionStartErrorCode,
 } from './transport/session_start_error';
-export type { RealtimeSessionStartDetail } from './transport/session_start_error';
 
 export type {
   TransportState,
@@ -234,12 +226,17 @@ export type {
   MediaState,
   OutputState,
   MicState,
-  SessionLifecycleState,
+  SessionState,
+  SessionStateKind,
 } from './core/state';
 
 export type {
+  DelegationCreatedEvent,
   UserSpeechTimeoutEvent,
   TranscriptDeltaEvent,
+  TranscriptItem,
+  TranscriptRole,
+  TranscriptUpdatedEvent,
   ModelTextEvent,
   ToolCallEvent,
   ToolResultEvent,

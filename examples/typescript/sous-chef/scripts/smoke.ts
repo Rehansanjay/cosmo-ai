@@ -11,7 +11,30 @@
  */
 import assert from 'node:assert/strict';
 
-import type { BackgroundClientToolSpec, ClientToolJob, ClientToolSpec, RealtimeTool } from 'cosmo-ai';
+import type { ClientToolJob, AgentTool } from 'cosmo-ai';
+
+/** The declared shape of a client tool, for a script that reads back what it
+ *  built. The SDK keeps its per-tool models internal — a tool is built by
+ *  calling a constructor and ``AgentTool`` is the only tool type it publishes.
+ *  ``job`` is optional because the background form takes it and the plain form
+ *  does not. */
+type Declared = {
+  kind: 'client';
+  background?: boolean;
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  handler?: (args: Record<string, unknown>) => Promise<unknown>;
+};
+
+/** ``AgentTool`` is opaque, so reading a declaration back goes through an
+ *  explicit cast. */
+const asDeclared = (tool: AgentTool): Declared => tool as unknown as Declared;
+
+/** The background counterpart's handler takes the job that answers later. */
+type DeclaredBackground = Omit<Declared, 'handler'> & {
+  handler?: (args: Record<string, unknown>, job: ClientToolJob) => Promise<unknown>;
+};
 
 import { sousChefAgent } from '../src/agent/agent';
 import { guardDecision } from '../src/agent/guards';
@@ -135,19 +158,23 @@ function arraySchemas(node: unknown, found: Record<string, unknown>[] = []): Rec
   return found;
 }
 
-function localTool(tools: RealtimeTool[], name: string): ClientToolSpec {
-  const found = tools.find((entry) => entry.kind === 'client' && entry.name === name);
-  assert.ok(found !== undefined && found.kind === 'client', `tool ${name} is missing`);
+function localTool(tools: AgentTool[], name: string): Declared {
+  const found = tools
+    .map(asDeclared)
+    .find((entry) => entry.kind === 'client' && entry.name === name);
+  assert.ok(found !== undefined, `tool ${name} is missing`);
   assert.ok(found.background !== true, `tool ${name} is a background tool`);
   return found;
 }
 
 /** The background counterpart: its handler takes the job that answers later. */
-function backgroundTool(tools: RealtimeTool[], name: string): BackgroundClientToolSpec {
-  const found = tools.find((entry) => entry.kind === 'client' && entry.name === name);
-  assert.ok(found !== undefined && found.kind === 'client', `tool ${name} is missing`);
+function backgroundTool(tools: AgentTool[], name: string): DeclaredBackground {
+  const found = tools
+    .map(asDeclared)
+    .find((entry) => entry.kind === 'client' && entry.name === name);
+  assert.ok(found !== undefined, `tool ${name} is missing`);
   assert.ok(found.background === true, `tool ${name} is not a background tool`);
-  return found;
+  return found as DeclaredBackground;
 }
 
 async function toolsSmoke(): Promise<void> {
@@ -161,7 +188,7 @@ async function toolsSmoke(): Promise<void> {
   // The dialect has no array bounds, so a Zod `.min()`/`.max()` on an array
   // would have thrown above. Assert the emitted shape too, because that
   // failure is the one worth naming.
-  for (const spec of tools) {
+  for (const spec of tools.map(asDeclared)) {
     if (spec.kind !== 'client') continue;
     for (const array of arraySchemas(spec.parameters)) {
       assert.equal(array.minItems, undefined, `${spec.name} emits minItems`);
@@ -169,8 +196,10 @@ async function toolsSmoke(): Promise<void> {
     }
   }
 
-  const timer = tools.find((entry) => entry.kind === 'client' && entry.name === 'start_timer');
-  assert.ok(timer !== undefined && timer.kind === 'client');
+  const timer = tools
+    .map(asDeclared)
+    .find((entry) => entry.kind === 'client' && entry.name === 'start_timer');
+  assert.ok(timer !== undefined);
   assert.equal(timer.background, true, 'start_timer must stay a background tool');
 
   // Handlers run the same validation the model's calls go through.
@@ -340,22 +369,20 @@ async function timerSmoke(): Promise<void> {
 
 function agentSmoke(): void {
   const config = sousChefAgent(new CookStore());
-  const kinds = (config.tools ?? []).map((entry) => entry.kind);
+  const kinds = (config.tools ?? []).map((entry) => asDeclared(entry).kind as string);
   for (const kind of ['web_search', 'examine_image', 'end_call']) {
-    assert.ok(kinds.includes(kind as RealtimeTool['kind']), `missing server tool ${kind}`);
+    assert.ok(kinds.includes(kind), `missing server tool ${kind}`);
   }
   assert.equal(kinds.filter((kind) => kind === 'client').length, 6);
 
   const silence = (config.hooks ?? []).find((hook) => 'timeout_seconds' in hook);
   assert.ok(silence !== undefined, 'the silence check-in is not configured');
 
-  // The provider is selected by ``model``; ``modelOptions`` only carries that
-  // provider's knobs. They have to agree, or the session silently runs on the
-  // workspace default instead of the one asked for.
+  // One field names the provider, so the block the agent ships is the
+  // provider the session runs on.
   for (const provider of ['gemini', 'openai'] as const) {
-    const forProvider = sousChefAgent(new CookStore(), provider);
-    assert.equal(forProvider.model, provider);
-    assert.equal(forProvider.modelOptions?.provider, provider);
+    const { model } = sousChefAgent(new CookStore(), provider);
+    assert.equal(typeof model === 'object' ? model.provider : model, provider);
   }
 
   console.log('smoke: agent OK');

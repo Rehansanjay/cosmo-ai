@@ -5,6 +5,7 @@ import { useEffect, useRef } from 'react';
 
 import { useRealtimeAudioElementRef, useRealtimeSessionContext } from '../RealtimeProvider';
 
+/** Props for ``<RealtimeAudio />``. */
 export type RealtimeAudioProps = {
   /** Fired when the browser refuses to auto-play (HTMLMediaElement.play
    *  rejects). Hosts typically surface a "Click to enable audio" toast

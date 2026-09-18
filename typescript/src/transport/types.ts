@@ -12,7 +12,8 @@
  * keep the public SDK swap-friendly.
  */
 
-import type { SessionConfig } from '../wire/types.gen';
+import type { SessionConfig } from '../protocol';
+import { SessionStateError } from '../core/errors';
 import type { SessionConnectTimings } from '../core/state';
 
 import type {
@@ -20,8 +21,12 @@ import type {
   RealtimeInboundMessage,
 } from './envelope';
 
+/** Returned by every ``on*`` subscription on a transport; call it to stop
+ *  listening. */
 export type Unsubscribe = () => void;
 
+/** Everything a transport needs to open one session, passed to
+ *  ``RealtimeTransport.connect``. */
 export type RealtimeConnectOptions = {
   /** External-protocol ``session-config`` body the transport POSTs
    *  verbatim to mint the session. Built by the agent mapping
@@ -59,27 +64,25 @@ export type RealtimeConnectOptions = {
    *  join credentials to satisfy the signature, and no caller needs them. */
   onSessionStarted?: (sessionId: string) => void;
   /** Optional callback fired once the connect completes, carrying the
-   *  measured phase breakdown. */
-  onConnectTimings?: (timings: SessionConnectTimings) => void;
+   *  measured phase breakdown and, optionally, the ``performance.now()``
+   *  origin those phases were measured from — marks that land after the
+   *  connect (``ready``, the agent's speaking event) are relative to that
+   *  origin. A transport that passes no origin gets the one the caller
+   *  stamped just before ``connect()``, which is close enough for the marks
+   *  but does not share a clock with ``wsMs``. */
+  onConnectTimings?: (timings: SessionConnectTimings, startedAt?: number) => void;
+  /** Report whether the browser blocked remote-audio playback. */
+  onOutputBlocked?: (blocked: boolean) => void;
 };
 
-export type ScreenShareOptions = {
-  /** Capture frame rate. Defaults to a transport-chosen low value
-   *  (~1 FPS) suitable for vision input on the receiving model. */
-  fps?: number;
-  /** Capture resolution. Implementations cap at the requested ceiling
-   *  but may downscale based on bandwidth. */
-  resolution?: '720p' | '1080p';
-  /** Fires once when the underlying capture ends — either because the
-   *  user clicked the browser's "Stop sharing" UI or the transport
-   *  programmatically unpublished the track. Called at most once. */
-  onEnded?: () => void;
-};
-
+/** What a published video track is: an ordinary camera-style source, or a
+ *  display capture. */
 export type VideoStreamKind = 'camera' | 'screen';
 
+/** Identifies one published video stream, for ``removeVideoStream``. */
 export type VideoStreamHandle = string;
 
+/** How a video stream is published, passed to ``addVideoStream``. */
 export type VideoStreamOptions = {
   /** Caller-supplied id used to refer to the stream on
    *  ``removeVideoStream``. When omitted the transport returns its own
@@ -95,12 +98,18 @@ export type VideoStreamOptions = {
   kind?: VideoStreamKind;
 };
 
+/** Why a transport closed, as reported to ``onClose``. */
 export type RealtimeCloseInfo = {
   /** Human-readable disconnect reason, prefixed by the transport
    *  (e.g. ``livekit:CLIENT_INITIATED``). */
   reason?: string;
   /** Optional machine-readable code; transport-defined. */
   code?: string;
+  /** The remote side hung up deliberately rather than the connection
+   *  failing — set by transports that can tell the two apart, so the
+   *  session reports a clean end instead of a transport error. Left unset
+   *  when the transport has no such signal. */
+  serverEnded?: boolean;
 };
 
 /** One inbound RPC invocation, narrowed at the transport boundary so SDK
@@ -114,6 +123,8 @@ export type RpcInvocation = {
    *  transport resolves the vendor participant-kind). Client-tool dispatch
    *  uses this as the agent-only caller guard. */
   callerIsAgent: boolean;
+  /** Aborted when the remote caller withdraws this invocation. */
+  signal?: AbortSignal;
 };
 
 /** Transport-agnostic interface every realtime adapter implements.
@@ -133,7 +144,7 @@ export interface RealtimeTransport {
   /** Tear down the session. Idempotent; safe to call when already
    *  disconnected. ``sendEndFrame: false`` skips the graceful wire ``end``
    *  frame (an abrupt local close). */
-  disconnect(opts?: { sendEndFrame?: boolean }): Promise<void>;
+  disconnect(options?: { sendEndFrame?: boolean }): Promise<void>;
 
   /** Send one logical client message. Implementations are responsible
    *  for any chunking required by their underlying transport. Resolves
@@ -188,7 +199,7 @@ export interface RealtimeTransport {
    *  A session carries one voice, so the stream takes it from the device
    *  microphone for its lifetime and ``stopAudioStream`` hands it back. A
    *  second ``startAudioStream`` while one is running throws
-   *  ``AudioPublishAlreadyActiveError``.
+   *  ``SessionStateError``.
    *
    *  Optional on the interface so test fakes can opt out — call sites
    *  must null-check or feature-detect before invoking. */
@@ -203,10 +214,35 @@ export interface RealtimeTransport {
    *  mic permission. ``null`` until the session is connected. */
   getInputStream(): MediaStream | null;
 
-  /** Underlying remote audio element. Exposed so callers can side-tap
-   *  an ``AnalyserNode`` for the AI-output waveform. ``null`` until
-   *  the session is connected. */
+  /** Underlying remote audio element. ``null`` until the session is
+   *  connected.
+   *
+   *  Do NOT build an output analyser from this via
+   *  ``createMediaElementSource``: that claims the element for the life of
+   *  the page and diverts its audio into the graph, so the tap cannot be
+   *  rebuilt for a later session and closing its context leaves the element
+   *  silent. Use ``getOutputStream`` for metering. */
   getOutputAudioElement(): HTMLAudioElement | null;
+
+  /** The remote agent audio as a ``MediaStream``, for building an
+   *  ``AnalyserNode`` on the AI-output waveform. ``null`` until a remote
+   *  audio track is subscribed.
+   *
+   *  Stable by reference between track changes, so a caller can skip
+   *  rebuilding when it has not moved.
+   *
+   *  Optional on the interface so an existing custom transport keeps
+   *  compiling — call sites must feature-detect. A transport without it
+   *  simply reports no output level. */
+  getOutputStream?(): MediaStream | null;
+
+  /** Fires when ``getOutputStream`` starts returning a different stream —
+   *  the remote track arriving after connect, being replaced, or going
+   *  away. Returns an unsubscribe function.
+   *
+   *  Optional for the same reason as ``getOutputStream``; a transport that
+   *  omits it is metered once, at connect. */
+  onOutputStreamChanged?(cb: () => void): Unsubscribe;
 
   /** Hand the transport a host-owned ``<audio>`` element. The transport
    *  attaches the remote-bot audio track to this element instead of the

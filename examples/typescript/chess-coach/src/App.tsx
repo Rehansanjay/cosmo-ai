@@ -1,13 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  RealtimeClient,
+  RealtimeSession,
+  TokenSource,
+} from 'cosmo-ai';
+import {
   RealtimeProvider,
   MicToggle,
   RealtimeAudio,
-  RealtimeClient,
-  RealtimeSession,
   useTranscript,
   useTransportState,
-} from 'cosmo-ai';
+} from 'cosmo-ai/react';
 
 import type { BoardOrientation } from './board_vision';
 import { FrameCapture } from './frame_capture';
@@ -20,10 +23,28 @@ import {
 import { SPEECH_PEAK_THRESHOLD, monitorMicLevel, type MicMonitor } from './mic_check';
 import { makeBoardPositionTool } from './tools';
 
-// Prefill from a gitignored .env for local dev convenience (see .env.example).
-// Never hardcode a key here — this file is committed.
+// No key in page code: the /token route (vite.config's tokenRoute plugin in
+// dev; a real route when deployed) mints short-lived tokens for the session
+// AND the board-vision REST calls. The settings panel's key field stays as
+// an override for a deployment without one.
 const BASE_URL_DEFAULT = import.meta.env.VITE_COSMO_BASE_URL ?? 'https://platform.askcosmo.ai';
-const API_KEY_DEFAULT = import.meta.env.VITE_COSMO_API_KEY ?? '';
+
+/** Bearer for the board-vision REST calls when no key is pasted: the app's
+ *  own /token route, cached until near expiry — the same token the session's
+ *  TokenSource fetches, minus the SDK (this call isn't made through it). */
+function makeTokenBearer(): () => Promise<string> {
+  let jwt = '';
+  let expiresAtMs = 0;
+  return async () => {
+    if (jwt !== '' && Date.now() < expiresAtMs - 60_000) return jwt;
+    const res = await fetch('/token', { method: 'POST' });
+    if (!res.ok) throw new Error(`token route returned ${res.status}`);
+    const body = (await res.json()) as { jwt: string; expires_at: string };
+    jwt = body.jwt;
+    expiresAtMs = Date.parse(body.expires_at);
+    return jwt;
+  };
+}
 
 /** Name the backend from inside the page. The SDK reads ``COSMO_BASE_URL``
  *  on Node; a browser has no environment, so it reads this tag instead —
@@ -115,7 +136,7 @@ function SessionView({
 }
 
 export function App() {
-  const [apiKey, setApiKey] = useState(API_KEY_DEFAULT);
+  const [apiKey, setApiKey] = useState('');
   const [baseUrl, setBaseUrl] = useState(BASE_URL_DEFAULT);
   const [orientation, setOrientation] = useState<BoardOrientation | 'auto'>('auto');
   const [phase, setPhase] = useState<Phase>('idle');
@@ -184,7 +205,7 @@ export function App() {
   }, []);
 
   const start = useCallback(async () => {
-    if (!apiKey || phase !== 'idle') return;
+    if (phase !== 'idle') return;
     setPhase('starting');
     setStartError(null);
     setNote(null);
@@ -196,7 +217,11 @@ export function App() {
     micMonitorRef.current = null;
 
     const pinned = orientation === 'auto' ? undefined : orientation;
-    const vision = { baseUrl, apiKey };
+    const pastedKey = apiKey.trim();
+    const vision = {
+      baseUrl,
+      getBearer: pastedKey !== '' ? async () => pastedKey : makeTokenBearer(),
+    };
     let capture: FrameCapture | null = null;
     let session: RealtimeSession;
     try {
@@ -206,7 +231,11 @@ export function App() {
       // share" on a session that has one.
       captureRef.current = capture;
       warmAnalysisEngine();
-      const live = new RealtimeClient({ apiKey });
+      const live = new RealtimeClient(
+        pastedKey !== ''
+          ? { apiKey: pastedKey }
+          : { token: TokenSource.endpoint('/token') },
+      );
       session = await live
         .agent({
           instructions: COACH_INSTRUCTIONS,
@@ -292,7 +321,7 @@ export function App() {
   if (phase === 'live' && session !== null && stream !== null) {
     return (
       <div className="shell wide">
-        <RealtimeProvider session={session} maxTranscriptLength={50}>
+        <RealtimeProvider session={session}>
           <SessionView stream={stream} warning={warning} onEnd={() => void end()} />
         </RealtimeProvider>
       </div>
@@ -301,9 +330,8 @@ export function App() {
 
   const micBar = Math.min(100, Math.round(micPeak * 400));
   const steps: { label: string; state: 'todo' | 'current' | 'done' }[] = [
-    { label: 'Connect', state: apiKey ? 'done' : 'current' },
-    { label: 'Microphone', state: micHeard ? 'done' : apiKey ? 'current' : 'todo' },
-    { label: 'Play', state: apiKey && micHeard ? 'current' : 'todo' },
+    { label: 'Microphone', state: micHeard ? 'done' : 'current' },
+    { label: 'Play', state: micHeard ? 'current' : 'todo' },
   ];
 
   return (
@@ -368,21 +396,17 @@ export function App() {
         <button
           className="btn btn-primary"
           onClick={() => void start()}
-          disabled={phase === 'starting' || !apiKey}
+          disabled={phase === 'starting'}
         >
-          {phase === 'starting'
-            ? 'Connecting…'
-            : apiKey
-              ? 'Start the lesson  →'
-              : 'Add a key below to start'}
+          {phase === 'starting' ? 'Connecting…' : 'Start the lesson  →'}
         </button>
         {startError && <div className="err">{startError}</div>}
         {note && <p className="empty">{note}</p>}
 
-        <details className="settings" open={!apiKey}>
+        <details className="settings">
           <summary>Connection</summary>
           <div className="field">
-            <label htmlFor="k">API key</label>
+            <label htmlFor="k">API key (optional — the /token route is used when empty)</label>
             <input
               id="k"
               type="password"

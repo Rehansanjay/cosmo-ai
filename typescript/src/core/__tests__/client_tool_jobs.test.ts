@@ -7,8 +7,8 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { RpcInvocation } from '../../transport/types';
-import type { ToolJobResult } from '../../wire/types.gen';
-import type { BackgroundClientToolSpec } from '../agent';
+import type { ToolJobResult } from '../../protocol';
+import type { BackgroundClientTool } from '../agent';
 import { ClientToolJobSink, TRUNCATION_SUFFIX, type ClientToolJob } from '../client_tool_jobs';
 import { MAX_REPLY_BYTES, registerClientToolHandlers } from '../client_tools';
 import { type Hook,
@@ -29,7 +29,7 @@ function makeSink(opts: { open?: boolean } = {}) {
 }
 
 function makeRegistrar(opts: {
-  tool: BackgroundClientToolSpec;
+  tool: BackgroundClientTool;
   hooks?: HookEngine;
   sessionId?: string | null;
   sink?: ClientToolJobSink | null;
@@ -65,8 +65,8 @@ function makeRegistrar(opts: {
 }
 
 function bgTool(
-  handler: BackgroundClientToolSpec['handler'],
-): BackgroundClientToolSpec {
+  handler: BackgroundClientTool['handler'],
+): BackgroundClientTool {
   return {
     kind: 'client',
     background: true,

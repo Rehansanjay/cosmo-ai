@@ -29,13 +29,62 @@
  * vectors shared across the SDKs.
  */
 
+import { RealtimeError } from './errors';
 import { log } from './logger';
-import type {
-  SilenceTimeout,
-  UserSpeechTimeoutEvent,
-} from '../wire/types.gen';
+import type { EndCall, Say, SilenceTimeout } from '../protocol';
 
 import type { DisconnectReason } from './state';
+
+/** Why a hook could not be registered.
+ *
+ *  Closed: every one is thrown when hooks are declared, so it changes only
+ *  when the SDK does. Every member is declared in every SDK even where that
+ *  SDK cannot reach the case, so a branch written against one ports
+ *  unchanged. */
+export type HookErrorCode =
+  /** The matcher pattern does not parse — an unterminated `[` group. The
+   *  underlying matcher never errors on one, it just silently matches
+   *  nothing, which for a deny matcher is a guard that never fires. */
+  | 'malformed_matcher'
+  /** A `hooks` element is neither a hook built by a seam factory nor a server
+   *  hook. */
+  | 'invalid_hook'
+  /** A server hook was passed to a catalog agent, which runs its stored
+   *  configuration verbatim. */
+  | 'server_hook_not_allowed';
+
+/** A hook could not be registered.
+ *
+ *  `malformed_matcher` and `invalid_hook` are thrown where the hook is
+ *  declared — a matcher that would never fire is refused up front rather than
+ *  silently matching nothing. `server_hook_not_allowed` is thrown when the
+ *  agent's session config is assembled, which in this SDK is during
+ *  `agent.start()`. `code` names which — switch on it rather than matching
+ *  the message. */
+export class HookError extends RealtimeError {
+  /** Why the hook was refused. A closed set this SDK throws — switch on it. */
+  readonly code: HookErrorCode;
+
+  constructor(options: { code: HookErrorCode; message: string }) {
+    super(options.message !== '' ? options.message : options.code);
+    this.name = 'HookError';
+    this.code = options.code;
+  }
+}
+
+
+
+/** The two actions a server hook can take, and the hook config itself.
+ *  Declared in ``../protocol`` — these cross the wire as-is, so the SDK
+ *  re-exports the protocol's own shapes rather than a second spelling of
+ *  them. */
+export type { Say, EndCall, SilenceTimeout } from '../protocol';
+
+/** What a server hook does when it fires — speak a line, or end the call,
+ *  as reported on the frame the firing produced. */
+export type ServerHookAction =
+  | ({ type?: 'say' } & Say)
+  | ({ type?: 'end_call' } & EndCall);
 
 /** A server-executed hook — wire config, not a callback. The family's
  *  extension point: becomes a union when a second server-hook kind lands. */
@@ -50,65 +99,125 @@ const SLOW_HOOK_WARN_THRESHOLD_MS = 200;
 
 // ── Tool outcome (what PostToolUse observes) ───────────────────────────
 
+/** How one client-tool call finished: its handler returned, it threw, or a
+ *  ``PreToolUse`` hook denied it before the handler ran. */
 export type ToolOutcome =
-  | { kind: 'ok'; result: Record<string, unknown> | null }
-  | { kind: 'error'; message: string }
-  | { kind: 'denied'; reason: string };
+  | {
+      /** The handler returned. */
+      kind: 'ok';
+      /** What the handler returned, or ``null`` if it returned nothing. */
+      result: Record<string, unknown> | null;
+    }
+  | {
+      /** The handler threw. */
+      kind: 'error';
+      /** The exception text from the handler that threw. */
+      message: string;
+    }
+  | {
+      /** A ``PreToolUse`` hook refused the call before the handler ran. */
+      kind: 'denied';
+      /** Why a ``PreToolUse`` hook refused the call. The handler never ran. */
+      reason: string;
+    };
 
 // ── Per-event contexts ─────────────────────────────────────────────────
 
+/** Passed to a ``SessionStart`` hook, which runs before the config is sent.
+ *  There is no session id yet — the handshake has not completed; read the
+ *  ``ready`` event for the started id. */
 export type SessionStartContext = {
-  // The session id does not exist until the handshake completes; read the
-  // ``ready`` event for the started id.
+  /** Names the seam, so one callback can serve several events. */
   event: 'SessionStart';
 };
 
+/** Passed to a ``PreToolUse`` hook, before the local handler runs. Return a
+ *  ``PreToolUseResult`` to deny the call or rewrite its arguments. */
 export type PreToolUseContext = {
+  /** Names the seam, so one callback can serve several events. */
   event: 'PreToolUse';
+  /** The tool about to run — what a ``matcher`` is tested against. */
   toolName: string;
   /** Read-only view; rewrite via ``PreToolUseResult.updatedArguments``. */
   arguments: Readonly<Record<string, unknown>>;
+  /** The session the call belongs to. */
   sessionId: string;
 };
 
+/** Passed to a ``PostToolUse`` hook once the local handler settled.
+ *  ``arguments`` are the ones the handler actually ran with, after any
+ *  ``PreToolUse`` rewrite. Observer-only: it cannot change the result. It
+ *  is awaited before the reply goes back to the model, so a slow hook
+ *  delays the tool call — keep it quick, or hand the work off. */
 export type PostToolUseContext = {
+  /** Names the seam, so one callback can serve several events. */
   event: 'PostToolUse';
+  /** The tool that ran. */
   toolName: string;
+  /** The arguments it ran with, after any ``PreToolUse`` rewrite. */
   arguments: Record<string, unknown>;
+  /** How it finished — switch on ``kind``; a denial is not an error. */
   outcome: ToolOutcome;
+  /** The session the call belonged to. */
   sessionId: string;
 };
 
+/** Passed to a ``SessionEnd`` hook at teardown, on every exit path,
+ *  including a start that never reached ``ready``. ``sessionId`` is
+ *  ``null`` only when the failure predates the server's session-start
+ *  response; a socket that drops after that still carries the id. */
 export type SessionEndContext = {
+  /** Names the seam, so one callback can serve several events. */
   event: 'SessionEnd';
+  /** Why the session ended — who ended it, and whether cleanly. */
   reason: DisconnectReason;
+  /** Extra context on the ending when the server or transport supplied any. */
   detail: string | null;
+  /** The session that ended, or ``null`` if it never became live. */
   sessionId: string | null;
 };
 
-/** The server action a fired silence timeout performed (``say`` or
- *  ``end_call``), as reported on the wire frame. */
-export type ServerHookAction = UserSpeechTimeoutEvent['action'];
-
 // ── Per-event results ──────────────────────────────────────────────────
 
+/** What a ``SessionStart`` hook may return. ``additionalContext`` is
+ *  appended to the agent's instructions for this run; every hook's
+ *  contribution is joined in list order. Return nothing to change
+ *  nothing. */
 export type SessionStartResult = {
+  /** Text to add to the agent's instructions before the session opens.
+   *  Applies to an inline agent only — a catalog agent runs its stored
+   *  config verbatim, so context returned here is dropped. */
   additionalContext?: string | null;
 };
 
+/** What a ``PreToolUse`` hook may return. ``permission: 'deny'`` stops the
+ *  call and reports ``reason`` to the model; ``updatedArguments`` replaces
+ *  the arguments the handler runs with and is passed on to later hooks.
+ *  Return nothing to let the call through unchanged. */
 export type PreToolUseResult = {
+  /** ``'deny'`` blocks the call; ``'allow'`` states no objection. Unset
+   *  abstains and leaves the decision to the other hooks. Any deny wins. */
   permission?: 'allow' | 'deny';
+  /** Why it was denied — surfaced to the model so it can say something
+   *  useful instead of retrying blindly. */
   reason?: string;
+  /** Replacement arguments for the call. Unset leaves them untouched; the
+   *  last hook to rewrite wins. */
   updatedArguments?: Record<string, unknown>;
 };
 
 /** Folded result of all PreToolUse hooks for one tool call. */
 export type PreToolUseOutcome = {
+  /** Whether any hook denied the call. */
   denied: boolean;
+  /** The denying hook's reason, or ``null`` when nothing denied. */
   reason: string | null;
+  /** The arguments after every rewrite, in hook order. */
   arguments: Record<string, unknown>;
 };
 
+/** The callback ``sessionStart(fn)`` takes. Sync or async; a throw is
+ *  logged and skipped rather than failing the session. */
 export type SessionStartHook = (
   ctx: SessionStartContext,
 ) =>
@@ -118,12 +227,17 @@ export type SessionStartHook = (
   | void
   | Promise<SessionStartResult | null | undefined | void>;
 
+/** The callback ``preToolUse(fn)`` takes. Sync or async; a throw is logged
+ *  and skipped, which lets the call through. */
 export type PreToolUseHook = (
   ctx: PreToolUseContext,
 ) => PreToolUseResult | null | undefined | void | Promise<PreToolUseResult | null | undefined | void>;
 
+/** The callback ``postToolUse(fn)`` takes. Returns nothing — the tool
+ *  result has already gone back to the model. */
 export type PostToolUseHook = (ctx: PostToolUseContext) => void | Promise<void>;
 
+/** The callback ``sessionEnd(fn)`` takes. Fires exactly once per session. */
 export type SessionEndHook = (ctx: SessionEndContext) => void | Promise<void>;
 
 // ── Matcher grammar ────────────────────────────────────────────────────
@@ -154,9 +268,10 @@ export function validateMatcher(pattern: string): void {
       if (j < n && pattern[j] === ']') j += 1;
       while (j < n && pattern[j] !== ']') j += 1;
       if (j >= n) {
-        throw new Error(
-          `malformed hook matcher ${JSON.stringify(pattern)}: unterminated '[' at index ${String(i)}`,
-        );
+        throw new HookError({
+          code: 'malformed_matcher',
+          message: `malformed hook matcher ${JSON.stringify(pattern)}: unterminated '[' at index ${String(i)}`,
+        });
       }
       i = j + 1;
     } else {
@@ -202,12 +317,14 @@ function translateMatcher(pattern: string): RegExp {
 
 // ── Declared hooks + the seam factories ────────────────────────────────
 
+/** The four seams a client hook can fire at. */
 export type HookEventName =
   | 'SessionStart'
   | 'PreToolUse'
   | 'PostToolUse'
   | 'SessionEnd';
 
+/** Any of the four seam callbacks, as carried on a built ``Hook``. */
 type AnyHookCallback =
   | SessionStartHook
   | PreToolUseHook
@@ -218,9 +335,13 @@ type AnyHookCallback =
  *  the tool seams) an optional matcher. Built by the seam factories; list
  *  order in ``hooks: [...]`` is fold order. */
 export class Hook {
+  /** Which seam this hook fires at. */
   readonly event: HookEventName;
   /** @internal */
   readonly callback: AnyHookCallback;
+  /** Which tools it applies to, for the tool seams — a glob tested against
+   *  the tool name. ``null`` matches every tool, and the field is meaningless
+   *  on the session seams. */
   readonly matcher: string | null;
 
   /** @internal — construct via the seam factories. */
@@ -241,16 +362,16 @@ export function sessionStart(fn: SessionStartHook): Hook {
 /** Declare a ``PreToolUse`` hook — may deny or rewrite a local client-tool
  *  call. ``matcher`` restricts it to matching tool names (glob grammar); a
  *  malformed matcher throws here, not at session start. */
-export function preToolUse(fn: PreToolUseHook, opts?: { matcher?: string }): Hook {
-  if (opts?.matcher !== undefined) validateMatcher(opts.matcher);
-  return new Hook('PreToolUse', fn, opts?.matcher ?? null);
+export function preToolUse(fn: PreToolUseHook, options?: { matcher?: string }): Hook {
+  if (options?.matcher !== undefined) validateMatcher(options.matcher);
+  return new Hook('PreToolUse', fn, options?.matcher ?? null);
 }
 
 /** Declare a ``PostToolUse`` observer, fired with the final ``ToolOutcome``
  *  of each local client-tool call. */
-export function postToolUse(fn: PostToolUseHook, opts?: { matcher?: string }): Hook {
-  if (opts?.matcher !== undefined) validateMatcher(opts.matcher);
-  return new Hook('PostToolUse', fn, opts?.matcher ?? null);
+export function postToolUse(fn: PostToolUseHook, options?: { matcher?: string }): Hook {
+  if (options?.matcher !== undefined) validateMatcher(options.matcher);
+  return new Hook('PostToolUse', fn, options?.matcher ?? null);
 }
 
 /** Declare a ``SessionEnd`` observer, fired exactly once at teardown. */
@@ -278,9 +399,11 @@ export function resolveHooks(
     ) {
       serverHooks.push(hook);
     } else {
-      throw new Error(
-        'hooks elements must be seam-factory Hooks or server hooks (SilenceTimeout)',
-      );
+      throw new HookError({
+        code: 'invalid_hook',
+        message:
+          'hooks elements must be seam-factory Hooks or server hooks (SilenceTimeout)',
+      });
     }
   }
   return { clientHooks, serverHooks };
@@ -336,24 +459,24 @@ export class HookEngine {
     return chunks.length > 0 ? chunks.join('\n\n') : null;
   }
 
-  async runPreToolUse(opts: {
+  async runPreToolUse(options: {
     toolName: string;
     arguments: Record<string, unknown>;
     sessionId: string;
   }): Promise<PreToolUseOutcome> {
-    let current: Record<string, unknown> = { ...opts.arguments };
+    let current: Record<string, unknown> = { ...options.arguments };
     for (const { matcher, hook } of this.preToolUseHooks) {
-      if (matcher !== null && !toolNameMatches(opts.toolName, matcher)) continue;
+      if (matcher !== null && !toolNameMatches(options.toolName, matcher)) continue;
       const out = await callHook(hook, {
         event: 'PreToolUse',
-        toolName: opts.toolName,
+        toolName: options.toolName,
         arguments: Object.freeze({ ...current }),
-        sessionId: opts.sessionId,
+        sessionId: options.sessionId,
       });
       if (out === null || out === undefined) continue;
       if (out.permission === 'deny') {
         log.info('[realtime] hook denied tool', {
-          tool: opts.toolName,
+          tool: options.toolName,
           reason: out.reason,
         });
         return {

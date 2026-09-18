@@ -10,7 +10,6 @@ the sibling SDKs.
 from __future__ import annotations
 
 import base64
-import inspect
 import json
 import re
 import time
@@ -138,29 +137,23 @@ def parse_found_element_handle(handle: str) -> FoundElement | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# AX descriptor budgets, matching the backend's ``AXElement``. A descriptor is a
-# *name* for a click target, so anything longer is a document the screenshot
+# Descriptor budgets, matching the backend's ``ScreenElement``. A descriptor is
+# a *name* for a click target, so anything longer is a document the screenshot
 # already shows; ``value`` is content rather than identity and is held tighter.
 # The backend clamps too — capping here keeps the bytes off the wire rather than
 # guarding validation.
+# Budgets count Unicode scalars — ``str`` slicing's native unit, and the
+# clamp unit every SDK shares (the reply shrinker counts the same).
 _ROLE_MAX_CHARS = 64
 _LABEL_MAX_CHARS = 512
 _VALUE_MAX_CHARS = 256
 
 
-def _screen_capture_payload(
-    capture_id: str,
-    capture: ScreenCapture,
-    mime_type: str = "image/jpeg",
-    *,
-    include_elements: bool = True,
-) -> bytes:
+def _screen_capture_payload(capture_id: str, capture: ScreenCapture) -> bytes:
     """Encode a capture into the ``ScreenCapturePayload`` JSON bytes the byte
-    stream carries. Absent descriptors are omitted. The list still rides as
-    ``ax_elements``; the server also accepts ``elements``, and this SDK moves
-    once every deployed backend reads both."""
-    ax_elements: list[dict[str, Any]] = []
-    for element in capture.elements if include_elements else ():
+    stream carries. Absent descriptors are omitted."""
+    elements: list[dict[str, Any]] = []
+    for element in capture.elements:
         obj: dict[str, Any] = {
             "idx": element.index,
             "role": element.role[:_ROLE_MAX_CHARS],
@@ -178,30 +171,14 @@ def _screen_capture_payload(
         )
         if element.value is not None and not named:
             obj["value"] = element.value[:_VALUE_MAX_CHARS]
-        ax_elements.append(obj)
+        elements.append(obj)
     payload = {
         "capture_id": capture_id,
         "image_b64": base64.b64encode(capture.image_jpeg).decode("ascii"),
-        "mime_type": mime_type,
-        "ax_elements": ax_elements,
+        "mime_type": "image/jpeg",
+        "elements": elements,
     }
     return json.dumps(payload).encode("utf-8")
-
-
-def _capture_takes_request(capture: Callable[..., Any]) -> bool:
-    """Whether a capture handler wants the :class:`ScreenCaptureRequest`. Both
-    forms are supported, so a host that does not care about the hint keeps its
-    existing no-argument handler. A callable that cannot be introspected (a
-    builtin, some C extensions) is called the original way."""
-    try:
-        return bool(inspect.signature(capture).parameters)
-    except (TypeError, ValueError):
-        logger.warning(
-            "realtime.capture_signature_unreadable",
-            capture=getattr(capture, "__qualname__", repr(capture)),
-            exc_info=True,
-        )
-        return False
 
 
 def screen_capture_handler(
@@ -215,19 +192,14 @@ def screen_capture_handler(
     answered as "no capture" rather than as an RPC error — the locator has its
     own typed answer for it — while a byte-stream publish failure propagates and
     reaches the model as the call's error."""
-    takes_request = _capture_takes_request(spec.capture)
-
     async def handler(args: dict[str, Any]) -> dict[str, Any]:
         capture_id = args.get("capture_id")
         if not isinstance(capture_id, str) or not capture_id:
-            return {"captured": False}
-        # Absent means a server older than the hint, which only ever wanted both.
-        wants_elements = args.get("want_elements", True) is not False
+            # The server mints an id for every capture, so a missing one is a
+            # protocol violation, not a decline.
+            raise ValueError("screen_capture: missing required 'capture_id'")
         try:
-            request = ScreenCaptureRequest(wants_elements)
-            capture = await _resolved(
-                spec.capture(request) if takes_request else spec.capture()
-            )
+            capture = await _resolved(spec.capture(ScreenCaptureRequest()))
         except Exception as exc:
             logger.exception("realtime.screen_capture_failed", stack_info=True)
             # The message is what the locator says to the model when it cannot
@@ -236,9 +208,7 @@ def screen_capture_handler(
             return {"captured": False, "message": str(exc) or exc.__class__.__name__}
         cache.put(capture_id, capture)
         await send_bytes(
-            _screen_capture_payload(
-                capture_id, capture, include_elements=wants_elements
-            ),
+            _screen_capture_payload(capture_id, capture),
             _SCREEN_CAPTURE_TOPIC,
         )
         return {"captured": True}

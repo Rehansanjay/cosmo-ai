@@ -7,7 +7,7 @@ import {
   useToolCalls,
   useTranscript,
   useTransportState,
-} from 'cosmo-ai';
+} from 'cosmo-ai/react';
 
 export function AgentPanel({ onEnd }: { onEnd: () => void }) {
   const session = useRealtimeSessionContext();

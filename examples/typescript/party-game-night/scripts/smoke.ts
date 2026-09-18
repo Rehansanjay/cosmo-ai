@@ -16,7 +16,7 @@ import { makeGameTools } from '../src/game/tools';
 import { HAND_SIZE, assembleGameSkill, shuffledQuestionBank } from '../src/skills/question_bank';
 
 const skillText = readFileSync(new URL('../src/skills/family_feud/SKILL.md', import.meta.url), 'utf8');
-const skill = parseSkillMd(skillText, { defaultName: 'family-feud' });
+const skill = parseSkillMd(skillText, 'family-feud');
 if (skill.name !== 'family-feud' || skill.body.length < 500) {
   throw new Error(`skill parsed oddly: ${skill.name}, body ${skill.body.length} chars`);
 }

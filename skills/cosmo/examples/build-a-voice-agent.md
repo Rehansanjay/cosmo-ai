@@ -15,7 +15,7 @@ curl -fsSL https://platform.askcosmo.ai/docs/install.sh | sh
 cosmo init     # browser sign-in; stores an API key in ~/.cosmo/credentials
 ```
 
-Alternatively an existing workspace API key with the `realtime:use` scope
+Alternatively an existing workspace API key with the `realtime:start` scope
 (created in the Cosmo web app under **Developer platform → API keys**)
 works via `COSMO_API_KEY` or `api_key=...`. Either way, check before
 writing code, not after it fails — `client.verify()` reports the key's
@@ -30,6 +30,10 @@ pip install cosmo-ai-sdk
 
 ## 3. Write it
 
+This app takes voice input and looks up orders with a tool, so it explicitly
+selects Grok realtime. For camera, video, or screen understanding, follow
+the [provider selection guide](../reference/core.md#choose-the-realtime-engine).
+
 ```python
 import asyncio
 import sys
@@ -37,6 +41,7 @@ import sys
 from pydantic import BaseModel, Field
 
 from cosmo_ai import (
+    GrokModel,
     RealtimeClient,
     ErrorEvent,
     ReadyEvent,
@@ -85,7 +90,8 @@ async def main() -> None:
     async with RealtimeClient() as client:
         agent = client.agent(
             instructions="You are a concise order-support agent. Use lookup_order for status questions.",
-            voice="Puck",
+            model=GrokModel(),
+            voice="ara",
             tools=[lookup_order],
         )
         async with agent.start() as session:
@@ -118,9 +124,9 @@ COSMO_API_KEY=cosmo_... python agent.py
 
 | Symptom | Cause |
 |---|---|
-| `CredentialsNotFoundError` on construction | no `COSMO_API_KEY` and no stored login — run `cosmo login` (step 1) |
+| `CredentialsError` on construction | no `COSMO_API_KEY` and no stored login — run `cosmo login` (step 1) |
 | Session starts, agent never hears you | mic not enabled, or OS mic permission not granted |
-| `agent.start()` rejected | key missing the `realtime:use` scope (`verify()` shows `can_start_sessions` false), or a key issued for a different Cosmo backend (`401` — check `COSMO_BASE_URL`) |
+| `agent.start()` rejected | key missing the `realtime:start` scope (`verify()` shows `can_start_sessions` false), or a key issued for a different Cosmo backend (`401` — check `COSMO_BASE_URL`) |
 | Tool never called | check `ReadyEvent.rejected_tools`; a declared tool with no handler is rejected |
 
 ## If they want this in a browser

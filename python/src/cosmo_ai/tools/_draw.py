@@ -7,7 +7,7 @@ model; the model picks the one matching what it is looking at and passes it to
 the renderer, which draws it over the user's live camera or screen preview::
 
     from cosmo_ai import DetectObjectsTool
-    from cosmo_ai.tools import DrawBoxRequest, DrawOutcome, draw_box
+    from cosmo_ai.tools import DrawBoxRequest, DrawOutcome, draw_box_tool
 
     def on_draw(request: DrawBoxRequest) -> DrawOutcome:
         if not camera.streaming:
@@ -18,7 +18,7 @@ the renderer, which draws it over the user's live camera or screen preview::
         overlay.show(request.box, label=request.label)
         return DrawOutcome(shown=True)
 
-    agent = client.agent(tools=[DetectObjectsTool(), draw_box(on_draw)])
+    agent = client.agent(tools=[DetectObjectsTool(), draw_box_tool(on_draw)])
 
 The renderers measure nothing — they carry the model's choice to your UI. The
 SDK owns the name, description, schema, decode and reply shape; you own the
@@ -31,7 +31,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Union
 
-from cosmo_ai._internal.protocol import ClientTool
+from cosmo_ai._internal.protocol import AgentTool
 from cosmo_ai.tools._sdk_tools import _SdkClientTool
 
 DRAW_BOX_TOOL_NAME = "cosmo_sdk_draw_box"
@@ -116,9 +116,13 @@ class NormalizedBox:
     screen."""
 
     x: float
+    """Left edge, ``0``–``1`` across the frame's width."""
     y: float
+    """Top edge, ``0``–``1`` down the frame's height."""
     width: float
+    """Width as a fraction of the frame's width."""
     height: float
+    """Height as a fraction of the frame's height."""
 
 
 @dataclass(frozen=True)
@@ -126,7 +130,9 @@ class NormalizedPoint:
     """A position in ``[0,1]``, on the same terms as :class:`NormalizedBox`."""
 
     x: float
+    """Horizontal position, ``0``–``1`` across the frame's width."""
     y: float
+    """Vertical position, ``0``–``1`` down the frame's height."""
 
 
 @dataclass(frozen=True)
@@ -135,7 +141,9 @@ class DrawBoxRequest:
     an optional short caption."""
 
     box: NormalizedBox
+    """Where to draw it, in frame-normalized coordinates."""
     label: str | None = None
+    """Short caption to show with the box. ``None`` draws it unlabelled."""
 
 
 @dataclass(frozen=True)
@@ -144,7 +152,9 @@ class DrawPointRequest:
     optional short caption."""
 
     point: NormalizedPoint
+    """Where to mark, in frame-normalized coordinates."""
     label: str | None = None
+    """Short caption to show with the mark. ``None`` draws it unlabelled."""
 
 
 @dataclass(frozen=True)
@@ -160,7 +170,10 @@ class DrawOutcome:
     """
 
     shown: bool
+    """Whether the mark is now visible to the user."""
     reason: str | None = None
+    """Why it is not, when ``shown`` is ``False`` — model-facing prose the
+    agent says out loud, not an error code."""
 
 
 DrawBoxHandler = Callable[
@@ -217,7 +230,7 @@ async def _tool_result(
     return result
 
 
-def draw_box(on_draw: DrawBoxHandler) -> ClientTool:
+def draw_box_tool(on_draw: DrawBoxHandler) -> AgentTool:
     """The box renderer, ready to add to ``tools=`` alongside the locator that
     feeds it (:class:`~cosmo_ai.DetectObjectsTool`).
 
@@ -245,9 +258,9 @@ def draw_box(on_draw: DrawBoxHandler) -> ClientTool:
     )
 
 
-def draw_point(on_draw: DrawPointHandler) -> ClientTool:
+def draw_point_tool(on_draw: DrawPointHandler) -> AgentTool:
     """The point renderer, pairing with
-    :class:`~cosmo_ai.PointAtObjectTool`. Same contract as :func:`draw_box`,
+    :class:`~cosmo_ai.PointAtObjectTool`. Same contract as :func:`draw_box_tool`,
     with a :class:`DrawPointRequest` — it exists next to the box renderer
     because the two answer different questions: a box around a leaf includes
     everything behind it, where a marked point says one thing.

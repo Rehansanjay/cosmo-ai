@@ -1,11 +1,10 @@
 // Auto-generated. Do not edit.
-//
-// The server-defined union of local desktop tool names — the tools
-// a desktop host process executes, which browser-side adapters must
-// NOT register handlers for, so the per-session allowlist excludes
-// them rather than hitting ``RpcError 1400 Method not supported at
-// destination``.
 
+/** The server-defined union of local desktop tool names — the tools
+ *  a desktop host process executes, which browser-side adapters must
+ *  NOT register handlers for, so the per-session allowlist excludes
+ *  them rather than hitting ``RpcError 1400 Method not supported at
+ *  destination``. */
 export const LOCAL_DESKTOP_PRESET_UNION: readonly string[] = [
   "accessibility_tree",
   "clipboard_read",

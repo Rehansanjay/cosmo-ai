@@ -34,19 +34,31 @@ from __future__ import annotations
 
 import inspect
 import re
-from typing import Any, Awaitable, Callable, Literal, get_type_hints, overload
+from typing import Any, Awaitable, Callable, Literal, TypeVar, get_type_hints, overload
 
 from pydantic import BaseModel, ValidationError
 
-from cosmo_ai.errors import ToolInputValidationError
+from cosmo_ai.errors import (
+    ToolDefinitionError,
+    ToolDefinitionErrorCode,
+    ToolInputIssue,
+    ToolInputValidationError,
+)
 from cosmo_ai._internal.protocol import (
+    AgentTool,
     _CLIENT_TOOL_MAX_DESCRIPTION_LEN,
     BackgroundClientTool,
+    BackgroundClientToolHandler,
     ClientTool,
+    ClientToolHandler,
 )
 from cosmo_ai.tools._jobs import ClientToolJob
 from cosmo_ai.tools._sdk_tools import SDK_TOOL_NAME_PREFIX, reserved_name_error
-from cosmo_ai._internal.schema import emit_model_schema, text_violation
+from cosmo_ai._internal.schema import (
+    build_tool_parameters,
+    emit_model_schema,
+    text_violation,
+)
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{2,63}$")
 
@@ -72,16 +84,17 @@ _TYPE_WORDS = {
     "none": "null",
 }
 
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
 _InlineFn = Callable[[Any], Awaitable[Any]]
 _BackgroundFn = Callable[[Any, ClientToolJob], Awaitable[None]]
 
 
-def _sanitize_issues(exc: ValidationError) -> list[dict[str, Any]]:
+def _sanitize_issues(exc: ValidationError) -> list[ToolInputIssue]:
     """Structured issues with submitted values redacted: path + constraint
     kind + allowlisted expected-shape context only."""
-    issues: list[dict[str, Any]] = []
+    issues: list[ToolInputIssue] = []
     for err in exc.errors(include_input=False, include_url=False):
-        issue: dict[str, Any] = {"loc": list(err["loc"]), "type": err["type"]}
+        raw: dict[str, Any] = {"loc": list(err["loc"]), "type": err["type"]}
         ctx = err.get("ctx") or {}
         safe_ctx = {
             key: value if isinstance(value, (str, int, float, bool)) else str(value)
@@ -89,8 +102,14 @@ def _sanitize_issues(exc: ValidationError) -> list[dict[str, Any]]:
             if key in _SAFE_CTX_KEYS
         }
         if safe_ctx:
-            issue["ctx"] = safe_ctx
-        issues.append(issue)
+            raw["ctx"] = safe_ctx
+        issues.append(
+            ToolInputIssue(
+                path=_issue_path(raw["loc"]),
+                code=err["type"],
+                constraint=_issue_constraint(raw),
+            )
+        )
     return issues
 
 
@@ -138,13 +157,13 @@ def _issue_constraint(issue: dict[str, Any]) -> str:
     return f"invalid ({kind})"
 
 
-def _format_invalid_input(tool_name: str, issues: list[dict[str, Any]]) -> str:
+def _format_invalid_input(tool_name: str, issues: list[ToolInputIssue]) -> str:
     header = f"INVALID_INPUT: {tool_name} rejected parameters:"
     footer = "Fix the input and retry."
     shown = min(len(issues), _MAX_ISSUE_LINES)
     while True:
         lines = [
-            f"- {_issue_path(issue['loc'])}: {_issue_constraint(issue)}"
+            f"- {issue.path}: {issue.constraint}"
             for issue in issues[:shown]
         ]
         hidden = len(issues) - shown
@@ -256,18 +275,23 @@ def _resolve_description(
         else inspect.cleandoc(fn.__doc__ or "").strip()
     )
     if not resolved:
-        raise ValueError(
-            f"@tool {tool_name!r} has no description: add a docstring or pass "
-            f"description=... — the description is model-facing and required"
+        raise ToolDefinitionError(
+            code=ToolDefinitionErrorCode.MISSING_DESCRIPTION,
+            message=f"@tool {tool_name!r} has no description: add a docstring or pass "
+            f"description=... — the description is model-facing and required",
         )
     if len(resolved) > _CLIENT_TOOL_MAX_DESCRIPTION_LEN:
-        raise ValueError(
-            f"@tool {tool_name!r} description is {len(resolved)} characters; "
-            f"the protocol limit is {_CLIENT_TOOL_MAX_DESCRIPTION_LEN}"
+        raise ToolDefinitionError(
+            code=ToolDefinitionErrorCode.DESCRIPTION_TOO_LONG,
+            message=f"@tool {tool_name!r} description is {len(resolved)} characters; "
+            f"the protocol limit is {_CLIENT_TOOL_MAX_DESCRIPTION_LEN}",
         )
     reason = text_violation(resolved, allow_newlines=True)
     if reason is not None:
-        raise ValueError(f"@tool {tool_name!r} description {reason}")
+        raise ToolDefinitionError(
+            code=ToolDefinitionErrorCode.INVALID_TEXT,
+            message=f"@tool {tool_name!r} description {reason}",
+        )
     return resolved
 
 
@@ -289,9 +313,10 @@ def _build_tool(
             )
     tool_name = name if name is not None else fn.__name__
     if not _NAME_RE.fullmatch(tool_name):
-        raise ValueError(
-            f"tool name {tool_name!r} must match {_NAME_RE.pattern}; pass "
-            f"name=... to override the function name"
+        raise ToolDefinitionError(
+            code=ToolDefinitionErrorCode.INVALID_TOOL_NAME,
+            message=f"tool name {tool_name!r} must match {_NAME_RE.pattern}; pass "
+            f"name=... to override the function name",
         )
     # The friendlier, earlier half of the reservation; session-config assembly
     # re-checks it so a hand-built spec cannot slip past.
@@ -325,7 +350,7 @@ def _build_tool(
 
 
 @overload
-def tool(fn: _InlineFn, /) -> ClientTool: ...
+def tool(fn: _InlineFn, /) -> AgentTool: ...
 
 
 @overload
@@ -334,7 +359,7 @@ def tool(
     name: str | None = None,
     description: str | None = None,
     background: Literal[False] = False,
-) -> Callable[[_InlineFn], ClientTool]: ...
+) -> Callable[[_InlineFn], AgentTool]: ...
 
 
 @overload
@@ -343,7 +368,7 @@ def tool(
     name: str | None = None,
     description: str | None = None,
     background: Literal[True],
-) -> Callable[[_BackgroundFn], BackgroundClientTool]: ...
+) -> Callable[[_BackgroundFn], AgentTool]: ...
 
 
 def tool(
@@ -384,3 +409,209 @@ def tool(
         )
 
     return decorate
+
+
+def _checked_raw_parameters(
+    *, name: str, description: str, parameters: dict[str, Any]
+) -> dict[str, Any]:
+    """The checks ``@tool`` runs, for a hand-written declaration.
+
+    Without these a bad name, an empty description or an off-dialect schema
+    would construct fine and be refused at session start instead, which is
+    exactly what the raw path exists to avoid.
+    """
+    if not _NAME_RE.fullmatch(name):
+        raise ToolDefinitionError(
+            code=ToolDefinitionErrorCode.INVALID_TOOL_NAME,
+            message=f"tool name {name!r} must match {_NAME_RE.pattern}",
+        )
+    if name.startswith(SDK_TOOL_NAME_PREFIX):
+        raise reserved_name_error(name)
+    if not description.strip():
+        raise ToolDefinitionError(
+            code=ToolDefinitionErrorCode.MISSING_DESCRIPTION,
+            message=f"tool {name!r} has no description",
+        )
+    if len(description) > _CLIENT_TOOL_MAX_DESCRIPTION_LEN:
+        raise ToolDefinitionError(
+            code=ToolDefinitionErrorCode.DESCRIPTION_TOO_LONG,
+            message=f"tool {name!r} description is {len(description)} characters; "
+            f"the protocol limit is {_CLIENT_TOOL_MAX_DESCRIPTION_LEN}",
+        )
+    reason = text_violation(description, allow_newlines=True)
+    if reason is not None:
+        raise ToolDefinitionError(
+            code=ToolDefinitionErrorCode.INVALID_TEXT,
+            message=f"tool {name!r} description: {reason}",
+        )
+    return build_tool_parameters(parameters, tool_name=name)
+
+
+def _input_form(
+    *, name: str, description: str, input: type[BaseModel]
+) -> tuple[str, dict[str, Any]]:
+    """The checks and schema emission ``@tool`` runs, for a model passed by
+    value rather than read off a decorated function's annotation."""
+    if not _NAME_RE.fullmatch(name):
+        raise ToolDefinitionError(
+            code=ToolDefinitionErrorCode.INVALID_TOOL_NAME,
+            message=f"tool name {name!r} must match {_NAME_RE.pattern}",
+        )
+    if name.startswith(SDK_TOOL_NAME_PREFIX):
+        raise reserved_name_error(name)
+    if not (description or "").strip():
+        raise ToolDefinitionError(
+            code=ToolDefinitionErrorCode.MISSING_DESCRIPTION,
+            message=f"tool {name!r} has no description",
+        )
+    if len(description) > _CLIENT_TOOL_MAX_DESCRIPTION_LEN:
+        raise ToolDefinitionError(
+            code=ToolDefinitionErrorCode.DESCRIPTION_TOO_LONG,
+            message=f"tool {name!r} description is {len(description)} characters; "
+            f"the protocol limit is {_CLIENT_TOOL_MAX_DESCRIPTION_LEN}",
+        )
+    reason = text_violation(description, allow_newlines=True)
+    if reason is not None:
+        raise ToolDefinitionError(
+            code=ToolDefinitionErrorCode.INVALID_TEXT,
+            message=f"tool {name!r} description: {reason}",
+        )
+    if not (isinstance(input, type) and issubclass(input, BaseModel)):
+        raise TypeError(
+            f"tool {name!r}: input= takes a Pydantic model class, got {input!r}; "
+            f"pass a hand-written schema as parameters= instead"
+        )
+    if input is BaseModel:
+        raise TypeError(
+            f"tool {name!r}: input= takes a BaseModel subclass (an empty one "
+            f"for a no-argument tool), not BaseModel itself"
+        )
+    return description, emit_model_schema(input, tool_name=name)
+
+
+def _one_input_form(name: str, input: object, parameters: object) -> None:
+    if (input is None) == (parameters is None):
+        raise TypeError(
+            f"tool {name!r}: pass exactly one of input= (a Pydantic model) or "
+            f"parameters= (a hand-written JSON Schema)"
+        )
+
+
+@overload
+def client_tool(
+    *,
+    name: str,
+    description: str,
+    input: type[_ModelT],
+    handler: Callable[[_ModelT], Awaitable[dict[str, Any] | None]],
+) -> AgentTool: ...
+
+
+@overload
+def client_tool(
+    *,
+    name: str,
+    description: str,
+    parameters: dict[str, Any],
+    handler: ClientToolHandler,
+) -> AgentTool: ...
+
+
+def client_tool(
+    *,
+    name: str,
+    description: str,
+    input: type[BaseModel] | None = None,
+    parameters: dict[str, Any] | None = None,
+    handler: Callable[..., Any],
+) -> AgentTool:
+    """Declare a client tool, from a Pydantic model or a hand-written schema.
+
+    ``input=`` is the typed form :func:`tool` applies to a decorated function,
+    for the cases a decorator cannot reach — a closure, a bound method, or a
+    tool built in a loop. The handler receives the validated model instance.
+
+    ``parameters=`` is the escape hatch, for a schema no model expresses; the
+    handler receives the raw argument dict. Either way the schema is checked
+    against the restricted dialect here, so one the server would refuse fails
+    at the call rather than as a ``ready.rejected_tools`` entry at connect.
+    """
+    _one_input_form(name, input, parameters)
+    if input is not None:
+        description, emitted = _input_form(
+            name=name, description=description, input=input
+        )
+        model = input
+
+        async def typed_handler(args: dict[str, Any]) -> dict[str, Any] | None:
+            result = await handler(_validate_args(model, args, tool_name=name))
+            return _checked_result(result, tool_name=name)
+
+        return ClientTool(
+            name=name, description=description, parameters=emitted, handler=typed_handler
+        )
+    return ClientTool(
+        name=name,
+        description=description,
+        parameters=_checked_raw_parameters(
+            name=name, description=description, parameters=parameters or {}
+        ),
+        handler=handler,
+    )
+
+
+@overload
+def background_client_tool(
+    *,
+    name: str,
+    description: str,
+    input: type[_ModelT],
+    handler: Callable[[_ModelT, ClientToolJob], Awaitable[None]],
+) -> AgentTool: ...
+
+
+@overload
+def background_client_tool(
+    *,
+    name: str,
+    description: str,
+    parameters: dict[str, Any],
+    handler: BackgroundClientToolHandler,
+) -> AgentTool: ...
+
+
+def background_client_tool(
+    *,
+    name: str,
+    description: str,
+    input: type[BaseModel] | None = None,
+    parameters: dict[str, Any] | None = None,
+    handler: Callable[..., Any],
+) -> AgentTool:
+    """Declare a background client tool, from a Pydantic model or a schema.
+
+    Same two forms as :func:`client_tool`; the handler additionally receives a
+    :class:`~cosmo_ai.tools.ClientToolJob` and delivers its result after the
+    ack rather than by returning it.
+    """
+    _one_input_form(name, input, parameters)
+    if input is not None:
+        description, emitted = _input_form(
+            name=name, description=description, input=input
+        )
+        model = input
+
+        async def typed_handler(args: dict[str, Any], job: ClientToolJob) -> None:
+            await handler(_validate_args(model, args, tool_name=name), job)
+
+        return BackgroundClientTool(
+            name=name, description=description, parameters=emitted, handler=typed_handler
+        )
+    return BackgroundClientTool(
+        name=name,
+        description=description,
+        parameters=_checked_raw_parameters(
+            name=name, description=description, parameters=parameters or {}
+        ),
+        handler=handler,
+    )

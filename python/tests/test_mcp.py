@@ -10,19 +10,31 @@ import pytest
 
 import cosmo_ai.mcp._engine as mcp_mod
 from cosmo_ai.mcp._engine import (
-    McpConfigError,
-    McpExtraNotInstalledError,
-    McpToolError,
+    McpError,
+    McpErrorCode,
     SkippedTool,
     McpStdioServer,
     _ConnectedServer,
     _exposed_name,
     _map_tool_result,
     _normalize_schema,
-    _parse_mcp_json,
     build_mcp_tools,
+    parse_mcp_config,
 )
 from cosmo_ai._internal.protocol import _TOOL_SPECS_MAX_COUNT
+from cosmo_ai.mcp._engine import _call_failure_code
+
+
+def _parse_mcp_json(payload: dict) -> tuple[list[McpStdioServer], list[str]]:
+    """The vast majority of parse tests describe the document structurally."""
+    return parse_mcp_config(json.dumps(payload))
+
+
+def mcp_error_code(fn) -> McpErrorCode:
+    """Run ``fn`` and return the code of the ``McpError`` it raises."""
+    with pytest.raises(McpError) as excinfo:
+        fn()
+    return excinfo.value.code
 
 
 def test_parse_stdio_server():
@@ -47,27 +59,69 @@ def test_parse_skips_remote_entries():
     assert sorted(skipped) == ["remote_type", "remote_url"]
 
 
+def test_parse_rejects_invalid_json():
+    # Distinct from an unreadable file, which the path arm codes cannot_read.
+    assert (
+        mcp_error_code(lambda: parse_mcp_config("{not json"))
+        is McpErrorCode.INVALID_JSON
+    )
+
+
 def test_parse_rejects_missing_mcp_servers():
-    with pytest.raises(McpConfigError):
-        _parse_mcp_json({"servers": {}})
+    assert (
+        mcp_error_code(lambda: _parse_mcp_json({"servers": {}}))
+        is McpErrorCode.MISSING_SERVERS
+    )
+
+
+def test_parse_rejects_non_object_server_entry():
+    assert (
+        mcp_error_code(lambda: _parse_mcp_json({"mcpServers": {"bad": 5}}))
+        is McpErrorCode.INVALID_SERVER_ENTRY
+    )
 
 
 def test_parse_rejects_server_without_command():
-    with pytest.raises(McpConfigError):
-        _parse_mcp_json({"mcpServers": {"bad": {"args": ["x"]}}})
+    assert (
+        mcp_error_code(lambda: _parse_mcp_json({"mcpServers": {"bad": {"args": ["x"]}}}))
+        is McpErrorCode.MISSING_COMMAND
+    )
 
 
 def test_parse_rejects_string_args():
     # A bare string would otherwise iterate per-character into argv.
-    with pytest.raises(McpConfigError, match="args"):
-        _parse_mcp_json({"mcpServers": {"bad": {"command": "npx", "args": "-y pkg"}}})
+    assert (
+        mcp_error_code(
+            lambda: _parse_mcp_json(
+                {"mcpServers": {"bad": {"command": "npx", "args": "-y pkg"}}}
+            )
+        )
+        is McpErrorCode.INVALID_ARGS
+    )
 
 
 def test_parse_rejects_non_scalar_args_elements():
-    with pytest.raises(McpConfigError, match="args"):
-        _parse_mcp_json(
-            {"mcpServers": {"bad": {"command": "npx", "args": [{"flag": True}]}}}
+    assert (
+        mcp_error_code(
+            lambda: _parse_mcp_json(
+                {"mcpServers": {"bad": {"command": "npx", "args": [{"flag": True}]}}}
+            )
         )
+        is McpErrorCode.INVALID_ARGS
+    )
+
+
+def test_parse_rejects_boolean_args_elements():
+    # `True` is an int subclass, so a naive scalar check would let it through
+    # and stringify it into argv.
+    assert (
+        mcp_error_code(
+            lambda: _parse_mcp_json(
+                {"mcpServers": {"bad": {"command": "npx", "args": [True]}}}
+            )
+        )
+        is McpErrorCode.INVALID_ARGS
+    )
 
 
 def test_parse_coerces_numeric_args():
@@ -78,12 +132,20 @@ def test_parse_coerces_numeric_args():
 
 
 def test_parse_rejects_malformed_env_and_cwd():
-    with pytest.raises(McpConfigError, match="env"):
-        _parse_mcp_json({"mcpServers": {"bad": {"command": "x", "env": "PATH=1"}}})
-    with pytest.raises(McpConfigError, match="env"):
-        _parse_mcp_json({"mcpServers": {"bad": {"command": "x", "env": {"A": 1}}}})
-    with pytest.raises(McpConfigError, match="cwd"):
-        _parse_mcp_json({"mcpServers": {"bad": {"command": "x", "cwd": 5}}})
+    codes = [
+        mcp_error_code(lambda: _parse_mcp_json(payload))
+        for payload in (
+            {"mcpServers": {"bad": {"command": "x", "env": "PATH=1"}}},
+            {"mcpServers": {"bad": {"command": "x", "env": {"A": 1}}}},
+        )
+    ]
+    assert codes == [McpErrorCode.INVALID_ENV, McpErrorCode.INVALID_ENV]
+    assert (
+        mcp_error_code(
+            lambda: _parse_mcp_json({"mcpServers": {"bad": {"command": "x", "cwd": 5}}})
+        )
+        is McpErrorCode.INVALID_CWD
+    )
 
 
 def _write_config(tmp_path: Path, payload: dict) -> Path:
@@ -108,15 +170,51 @@ def test_resolve_reads_a_config_file(tmp_path: Path):
 
 
 def test_resolve_missing_file_raises(tmp_path: Path):
-    with pytest.raises(McpConfigError, match="not a file"):
-        mcp_mod.resolve_mcp(tmp_path / "absent.json")
+    assert (
+        mcp_error_code(lambda: mcp_mod.resolve_mcp(tmp_path / "absent.json"))
+        is McpErrorCode.NOT_A_FILE
+    )
 
 
 def test_resolve_malformed_json_raises_with_path(tmp_path: Path):
     cfg = tmp_path / ".mcp.json"
     cfg.write_text("{not json")
-    with pytest.raises(McpConfigError, match=r"\.mcp\.json"):
+    with pytest.raises(McpError) as excinfo:
         mcp_mod.resolve_mcp(cfg)
+    # The re-wrap keeps the inner code and still names the file.
+    assert excinfo.value.code is McpErrorCode.INVALID_JSON
+    assert str(cfg) in excinfo.value.message
+
+
+def test_resolve_rewrap_preserves_inner_code(tmp_path: Path):
+    cfg = _write_config(tmp_path, {"mcpServers": {"bad": {}}})
+    with pytest.raises(McpError) as excinfo:
+        mcp_mod.resolve_mcp(cfg)
+    assert excinfo.value.code is McpErrorCode.MISSING_COMMAND
+    assert str(cfg) in excinfo.value.message
+
+
+def test_resolve_unreadable_config_raises_cannot_read(tmp_path: Path):
+    # `Path.is_file` only swallows ENOENT/ENOTDIR/EBADF/ELOOP, so before the
+    # probe moved inside the guard this escaped as a bare PermissionError.
+    walled = tmp_path / "walled"
+    walled.mkdir()
+    cfg = _write_config(walled, {"mcpServers": {}})
+    walled.chmod(0o000)
+    try:
+        assert (
+            mcp_error_code(lambda: mcp_mod.resolve_mcp(cfg)) is McpErrorCode.CANNOT_READ
+        )
+    finally:
+        walled.chmod(0o755)
+
+
+def test_resolve_non_utf8_config_is_cannot_read(tmp_path: Path):
+    # UnicodeDecodeError is a ValueError, not an OSError, so an unnamed
+    # decode failure escaped the McpError family entirely.
+    cfg = tmp_path / ".mcp.json"
+    cfg.write_bytes('{"mcpServers":{}}'.encode("utf-16"))
+    assert mcp_error_code(lambda: mcp_mod.resolve_mcp(cfg)) is McpErrorCode.CANNOT_READ
 
 
 def test_resolve_expands_path_elements_in_place(tmp_path: Path):
@@ -130,8 +228,12 @@ def test_resolve_expands_path_elements_in_place(tmp_path: Path):
 
 def test_resolve_duplicate_names_across_elements_raise(tmp_path: Path):
     cfg = _write_config(tmp_path, {"mcpServers": {"fs": {"command": "npx"}}})
-    with pytest.raises(McpConfigError, match="duplicate MCP server name"):
-        mcp_mod.resolve_mcp([McpStdioServer(name="fs", command="x"), cfg])
+    assert (
+        mcp_error_code(
+            lambda: mcp_mod.resolve_mcp([McpStdioServer(name="fs", command="x"), cfg])
+        )
+        is McpErrorCode.DUPLICATE_SERVER_NAME
+    )
 
 
 def test_resolve_rejects_non_server_non_path_elements():
@@ -297,7 +399,7 @@ def test_build_truncates_long_description():
     assert len(tools[0].description) == 2048
 
 
-# Tests for McpToolError and result mapping
+# Tests for the tool_error code and result mapping
 
 
 @dataclass
@@ -340,8 +442,10 @@ def test_map_empty_content():
 
 
 def test_map_is_error_raises():
-    with pytest.raises(McpToolError, match="boom"):
+    with pytest.raises(McpError) as excinfo:
         _map_tool_result(FakeResult(content=[TextBlock("boom")], isError=True))
+    assert excinfo.value.code is McpErrorCode.TOOL_ERROR
+    assert excinfo.value.message == "boom"
 
 
 # --- live connection tests ---
@@ -431,12 +535,26 @@ async def test_connect_reserved_names_force_collision(monkeypatch):
 @pytest.mark.asyncio
 async def test_connect_propagates_mcp_extra_not_installed(monkeypatch):
     async def _fail(server, stack):
-        raise McpExtraNotInstalledError("hint")
+        raise McpError(code=McpErrorCode.EXTRA_NOT_INSTALLED, message="hint")
 
     monkeypatch.setattr(mcp_mod, "_open_stdio_server", _fail)
     servers = [McpStdioServer("s", "x")]
-    with pytest.raises(McpExtraNotInstalledError):
+    with pytest.raises(McpError) as excinfo:
         await mcp_mod.connect_mcp(servers)
+    assert excinfo.value.code is McpErrorCode.EXTRA_NOT_INSTALLED
+
+
+@pytest.mark.asyncio
+async def test_connect_skips_a_server_whose_connection_failed(monkeypatch):
+    # Same exception type as the missing extra now, told apart only by code:
+    # one server failing to start is skipped, a missing extra is not.
+    async def _fail(server, stack):
+        raise McpError(code=McpErrorCode.CONNECTION_FAILED, message="boom")
+
+    monkeypatch.setattr(mcp_mod, "_open_stdio_server", _fail)
+    connected = await mcp_mod.connect_mcp([McpStdioServer("s", "x")])
+    assert connected.tools == []
+    await connected.aclose()
 
 
 @pytest.mark.asyncio
@@ -477,13 +595,26 @@ def test_public_surface():
     import cosmo_ai.mcp as mcp_facade
 
     assert mcp_facade.__all__ == [
-        "McpConfigError",
-        "McpExtraNotInstalledError",
+        "McpError",
+        "McpErrorCode",
         "McpInput",
         "McpStdioServer",
     ]
-    for name in ("McpStdioServer", "McpConfigError", "McpToolError", "ConnectedMcp"):
+    for name in ("McpStdioServer", "McpError", "McpErrorCode", "ConnectedMcp"):
         assert not hasattr(cr, name), name
+
+
+def test_every_mcp_failure_is_one_family():
+    # The point of collapsing McpConfigError and McpToolError into McpError:
+    # one except clause covers config, connection and call failures alike.
+    assert issubclass(McpError, cr.RealtimeError)
+    assert not issubclass(McpError, ValueError)
+
+
+def test_missing_extra_is_an_mcp_error_code():
+    # One error type for the concept: the missing extra is a code, not a
+    # second class a caller has to know about.
+    assert McpErrorCode.EXTRA_NOT_INSTALLED.value == "extra_not_installed"
 
 
 def test_module_imports_without_extra():
@@ -498,3 +629,52 @@ def test_module_imports_without_extra():
         if line.startswith("import mcp") or line.startswith("from mcp ")
     ]
     assert top_level == [], f"mcp imported at top level: {top_level}"
+
+
+# --- which runtime failure a live call hit ---
+
+
+class _ProtocolError(Exception):
+    """Stands in for mcp.shared.exceptions.McpError, which the engine reads
+    from the lazily-imported package rather than at module scope."""
+
+
+def test_json_rpc_error_is_server_error():
+    assert (
+        _call_failure_code(_ProtocolError("bad arg"), _ProtocolError)
+        is McpErrorCode.SERVER_ERROR
+    )
+
+
+def test_undecodable_reply_is_invalid_response():
+    from pydantic import BaseModel, ValidationError
+
+    class _M(BaseModel):
+        content: list[str]
+
+    try:
+        _M(content="not-a-list")  # type: ignore[arg-type]
+    except ValidationError as exc:
+        assert _call_failure_code(exc, _ProtocolError) is McpErrorCode.INVALID_RESPONSE
+    else:  # pragma: no cover
+        raise AssertionError("expected a ValidationError")
+
+
+def test_dead_subprocess_is_connection_failed():
+    # A server that has died reads as a closed stream, not as a server that
+    # answered with an error — the distinction a caller acts on.
+    for exc in (BrokenPipeError(), ConnectionResetError(), OSError("closed")):
+        assert (
+            _call_failure_code(exc, _ProtocolError) is McpErrorCode.CONNECTION_FAILED
+        ), exc
+
+
+def test_every_declared_code_is_reachable():
+    # The enum docstring claims the set is closed and wholly SDK-raised; a code
+    # nothing can produce makes that false.
+    import inspect
+
+    source = inspect.getsource(mcp_mod)
+    for code in McpErrorCode:
+        member = code.name
+        assert f"McpErrorCode.{member}" in source, member

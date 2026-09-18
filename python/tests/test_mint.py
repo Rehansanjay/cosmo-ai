@@ -12,12 +12,13 @@ import pytest
 
 from cosmo_ai import (
     RealtimeClient,
-    CredentialsNotFoundError,
+    CredentialsError,
     MintedToken,
     MintTokenError,
 )
 from cosmo_ai._internal.protocol import SDK_NAME, SDK_VERSION
-from cosmo_ai.client import _SESSION_START_TIMEOUT_S
+from cosmo_ai.client import _MINT_TOKEN_TIMEOUT_S
+from cosmo_ai.errors import MintTokenErrorCode
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -81,7 +82,7 @@ def test_mint_token_requires_api_key_credential() -> None:
 
     with pytest.raises(MintTokenError) as exc:
         asyncio.run(scenario())
-    assert exc.value.code == "no_api_key"
+    assert exc.value.code is MintTokenErrorCode.MISSING_API_KEY
 
 
 def test_mint_token_raises_on_server_rejection() -> None:
@@ -95,7 +96,8 @@ def test_mint_token_raises_on_server_rejection() -> None:
 
     with pytest.raises(MintTokenError) as exc:
         asyncio.run(scenario())
-    assert exc.value.code == "forbidden"
+    assert exc.value.code is MintTokenErrorCode.REQUEST_REJECTED
+    assert exc.value.server_code == "forbidden"
 
 
 def test_mint_token_raises_on_malformed_success_body() -> None:
@@ -107,7 +109,7 @@ def test_mint_token_raises_on_malformed_success_body() -> None:
 
     with pytest.raises(MintTokenError) as exc:
         asyncio.run(scenario())
-    assert exc.value.code == "invalid_response"
+    assert exc.value.code is MintTokenErrorCode.INVALID_RESPONSE
 
 
 def test_at_most_one_credential_allowed(
@@ -119,7 +121,7 @@ def test_at_most_one_credential_allowed(
     # resolve it raises the typed not-found error, not ValueError.
     monkeypatch.delenv("COSMO_API_KEY", raising=False)
     monkeypatch.setenv("COSMO_CREDENTIALS_FILE", str(tmp_path / "credentials"))
-    with pytest.raises(CredentialsNotFoundError):
+    with pytest.raises(CredentialsError):
         RealtimeClient()
 
 
@@ -192,7 +194,7 @@ def test_owned_http_client_is_closed_by_aclose() -> None:
     asyncio.run(scenario())
 
 
-def test_session_requests_use_sdk_timeout_even_with_a_short_client_default() -> None:
+def test_mint_uses_the_sdk_timeout_even_with_a_short_client_default() -> None:
     captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -202,8 +204,8 @@ def test_session_requests_use_sdk_timeout_even_with_a_short_client_default() -> 
         )
 
     async def scenario() -> None:
-        # An injected client with a 1s default must not shorten session-start /
-        # mint: the SDK pins its own timeout per request.
+        # An injected client with a 1s default must not shorten mint: the SDK
+        # pins its own timeout per request.
         injected = httpx.AsyncClient(timeout=1.0, transport=httpx.MockTransport(handler))
         client = RealtimeClient(api_key="sk", http_client=injected)
         await client.mint_token("user-1")
@@ -211,7 +213,7 @@ def test_session_requests_use_sdk_timeout_even_with_a_short_client_default() -> 
 
     asyncio.run(scenario())
     assert captured["timeout"] is not None
-    assert captured["timeout"]["read"] == _SESSION_START_TIMEOUT_S
+    assert captured["timeout"]["read"] == _MINT_TOKEN_TIMEOUT_S
 
 
 def test_credential_is_sent_as_bearer() -> None:
@@ -238,4 +240,4 @@ def test_mint_token_transport_failure_maps_to_transport_error() -> None:
 
     with pytest.raises(MintTokenError) as exc:
         asyncio.run(scenario())
-    assert exc.value.code == "transport_error"
+    assert exc.value.code is MintTokenErrorCode.REQUEST_FAILED

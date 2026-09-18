@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from cosmo_ai import AudioConfig, RealtimeClient, InterruptionSensitivity
+from cosmo_ai import AudioConfig, InterruptionSensitivity, NoiseCancellation, RealtimeClient
 from cosmo_ai._internal.protocol import SDK_NAME, SDK_VERSION, InlineAgentConfig
 from cosmo_ai.hooks import session_end
 
@@ -23,7 +23,7 @@ def test_all_fields_partition_into_agent_and_session_blocks() -> None:
         instructions="You are a support agent.",
         voice="Puck",
         interruption_sensitivity=InterruptionSensitivity.HIGH,
-        audio=AudioConfig(noise_cancellation=True),
+        audio=AudioConfig(noise_cancellation=NoiseCancellation.VOICE_FOCUS),
         resume_session_id="0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
     )
     assert _without_id(body) == {
@@ -34,7 +34,7 @@ def test_all_fields_partition_into_agent_and_session_blocks() -> None:
             "instructions": "You are a support agent.",
             "voice": {"name": "Puck"},
             "interruption_sensitivity": "high",
-            "audio": {"noise_cancellation": True},
+            "audio": {"noise_cancellation": "voice_focus"},
         },
         "session": {
             "experimental": {
@@ -50,8 +50,17 @@ def test_unset_audio_sends_no_block_and_opts_out_explicitly() -> None:
     # body stays compatible with a backend that predates any one of them.
     # The opt-out still has to reach the wire as a value.
     assert "audio" not in start_body()["agent"]
-    opted_out = start_body(audio=AudioConfig(noise_cancellation=False))
-    assert opted_out["agent"]["audio"] == {"noise_cancellation": False}
+    opted_out = start_body(audio=AudioConfig(noise_cancellation=NoiseCancellation.OFF))
+    assert opted_out["agent"]["audio"] == {"noise_cancellation": "off"}
+
+
+def test_noise_cancellation_modes_reach_the_wire() -> None:
+    # A shared microphone picks the mode that keeps every voice; the boolean
+    # spelling that predates the modes still selects the isolating one.
+    shared = start_body(audio=AudioConfig(noise_cancellation=NoiseCancellation.DENOISE))
+    assert shared["agent"]["audio"] == {"noise_cancellation": "denoise"}
+    legacy = start_body(audio=AudioConfig(noise_cancellation=NoiseCancellation.VOICE_FOCUS))
+    assert legacy["agent"]["audio"] == {"noise_cancellation": "voice_focus"}
 
 
 def test_catalog_launch_carries_no_audio_block() -> None:
@@ -69,12 +78,12 @@ def test_agents_open_independent_sessions() -> None:
         quiet = client.agent(
             instructions="shared persona",
             voice="Puck",
-            audio=AudioConfig(noise_cancellation=True),
+            audio=AudioConfig(noise_cancellation=NoiseCancellation.VOICE_FOCUS),
         ).start()
         loud = client.agent(
             instructions="shared persona",
             voice="Puck",
-            audio=AudioConfig(noise_cancellation=False),
+            audio=AudioConfig(noise_cancellation=NoiseCancellation.OFF),
         ).start()
         q_config = quiet._build_config(())
         l_config = loud._build_config(())
@@ -82,8 +91,8 @@ def test_agents_open_independent_sessions() -> None:
         assert isinstance(l_config.agent, InlineAgentConfig)
         assert q_config.agent.instructions == "shared persona"
         assert l_config.agent.instructions == "shared persona"
-        assert q_config.agent.audio.noise_cancellation is True
-        assert l_config.agent.audio.noise_cancellation is False
+        assert q_config.agent.audio.noise_cancellation is NoiseCancellation.VOICE_FOCUS
+        assert l_config.agent.audio.noise_cancellation is NoiseCancellation.OFF
 
     asyncio.run(scenario())
 

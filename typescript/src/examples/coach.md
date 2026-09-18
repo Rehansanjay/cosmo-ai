@@ -7,11 +7,11 @@ Cosmo Assistant is engaged so coaching can pull in workspace-specific
 rubrics and prior session notes.
 
 ```ts
-import { RealtimeClient } from 'cosmo-ai';
+import { RealtimeClient, examineImageTool, webSearchTool } from 'cosmo-ai';
 
 const client = new RealtimeClient();
 const agent = client.agent({
-  tools: [{ kind: 'web_search' }, { kind: 'examine_image' }],
+  tools: [webSearchTool(), examineImageTool()],
 });
 const session = await agent.start();
 

@@ -1,5 +1,5 @@
-import type { RealtimeTool } from 'cosmo-ai';
-import { tool } from 'cosmo-ai/tool';
+import type { AgentTool } from 'cosmo-ai';
+import { backgroundClientTool, clientTool } from 'cosmo-ai/tool';
 import { zodInput } from 'cosmo-ai/tool/zod';
 import * as z from 'zod/v4';
 
@@ -28,8 +28,8 @@ function formatDuration(seconds: number): string {
  * `guards.ts` and come back to the model as a reason it can act on. The
  * descriptions here state them in words for the same reason.
  */
-export function makeClientTools(store: CookStore): RealtimeTool[] {
-  const setRecipe = tool({
+export function makeClientTools(store: CookStore): AgentTool[] {
+  const setRecipe = clientTool({
     name: 'set_recipe',
     description:
       'Put a recipe on the card. Call this once the recipe is settled — from ' +
@@ -79,7 +79,7 @@ export function makeClientTools(store: CookStore): RealtimeTool[] {
     },
   });
 
-  const setStep = tool({
+  const setStep = clientTool({
     name: 'set_step',
     description:
       'Move the card to a step (0-based). Call it whenever the user starts, ' +
@@ -96,7 +96,7 @@ export function makeClientTools(store: CookStore): RealtimeTool[] {
     },
   });
 
-  const checkIngredient = tool({
+  const checkIngredient = clientTool({
     name: 'check_ingredient',
     description:
       'Tick an ingredient off the checklist when the user confirms they have ' +
@@ -110,7 +110,7 @@ export function makeClientTools(store: CookStore): RealtimeTool[] {
     },
   });
 
-  const scaleServings = tool({
+  const scaleServings = clientTool({
     name: 'scale_servings',
     description:
       'Rescale the card to a new serving count. Numeric quantities are ' +
@@ -129,7 +129,7 @@ export function makeClientTools(store: CookStore): RealtimeTool[] {
   // is running, so the chef keeps talking, and the real outcome is delivered
   // by `job.complete()` whenever the timer lands — which is what lets the
   // agent interrupt the cook unprompted.
-  const startTimer = tool({
+  const startTimer = backgroundClientTool({
     name: 'start_timer',
     description:
       'Start a named countdown between 5 seconds and 2 hours. You are told ' +
@@ -141,7 +141,6 @@ export function makeClientTools(store: CookStore): RealtimeTool[] {
         seconds: z.number().int(),
       }),
     ),
-    background: true,
     handler: async ({ label, seconds }, job) => {
       const rejection = store.startTimer(label, seconds, (outcome) => {
         // The countdown outlives the connection, so this can land on a session
@@ -167,7 +166,7 @@ export function makeClientTools(store: CookStore): RealtimeTool[] {
     },
   });
 
-  const cancelTimer = tool({
+  const cancelTimer = clientTool({
     name: 'cancel_timer',
     description: 'Stop a running timer by its label when the user asks.',
     input: zodInput(z.object({ label: z.string() })),

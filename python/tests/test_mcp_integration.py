@@ -6,13 +6,13 @@ import cosmo_ai.client as client_mod
 from cosmo_ai.client import RealtimeClient
 from cosmo_ai.mcp._engine import ConnectedMcp
 from cosmo_ai.mcp import McpStdioServer
-from cosmo_ai._internal.protocol import ClientTool, InlineAgentConfig, SessionConfig, SessionParams
+from cosmo_ai._internal.protocol import _sdk_info, ClientTool, InlineAgentConfig, SessionConfig, SessionParams
 from cosmo_ai.session import DisconnectReason, RealtimeSession
 
 
 def _bare_config():
     return SessionConfig(
-        agent=InlineAgentConfig(), session=SessionParams()
+        sdk=_sdk_info(),        agent=InlineAgentConfig(), session=SessionParams()
     )
 
 

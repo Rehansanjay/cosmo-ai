@@ -59,11 +59,11 @@ the code. For something smaller, read
 
 ```bash
 npm install
-cp .env.example .env   # then paste a Cosmo API key into VITE_COSMO_API_KEY
+cosmo init            # once — signs in and stores the credential /token mints with
 npm run dev
 ```
 
-The key needs the `realtime:use` scope (Developer platform → API keys in the
+The key needs the `realtime:start` scope (**Voice — start sessions** under Developer platform → API keys in the
 Cosmo web app). Open the Vite URL — ideally in a browser on the TV — click
 **Start game night**, allow the microphone, and tell the host who's playing.
 

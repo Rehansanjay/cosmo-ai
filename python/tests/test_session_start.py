@@ -7,24 +7,27 @@ quietly riding a different flow. These pin the URL.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import httpx
 import pytest
 
+from cosmo_ai._internal.protocol import ClientTool, DetectObjectsTool, EndCallTool, ExamineImageTool, PointAtObjectTool, WebSearchTool
 from cosmo_ai import (
-    DetectObjectsTool,
-    EndCallTool,
-    ExamineImageTool,
-    GeminiModelOptions,
-    PointAtObjectTool,
-    WebSearchTool,
+    GeminiModel,
+    RealtimeSession,
 )
-from cosmo_ai._internal.protocol import AgentTool
+from cosmo_ai._internal.protocol import AgentTool, SessionResponse
+from cosmo_ai._internal.transport import TransportCallbacks
 from cosmo_ai.hooks import EndCall, SilenceTimeout
-from cosmo_ai.tools import ClientTool
 
-from .fakes import START_RESPONSE_JSON, FakeSessionHarness, start_fake_session
+from .fakes import (
+    START_RESPONSE_JSON,
+    FakeSessionHarness,
+    FakeTransport,
+    start_fake_session,
+)
 
 _BASE = "https://api.test"  # pinned by conftest's COSMO_BASE_URL fixture
 START_URL = f"{_BASE}/api/v1/external/realtime/session/start"
@@ -98,11 +101,8 @@ def test_server_hook_config_posts_to_the_resolved_endpoint() -> None:
     assert harness.start_urls == [START_URL]
 
 
-def test_model_options_post_to_the_resolved_endpoint() -> None:
-    harness = _start(
-        model="cosmo-voice",
-        model_options=GeminiModelOptions(temperature=0.4),
-    )
+def test_model_block_posts_to_the_resolved_endpoint() -> None:
+    harness = _start(model=GeminiModel(model_id="cosmo-voice", temperature=0.4))
     assert harness.start_urls == [START_URL]
 
 
@@ -172,3 +172,66 @@ def test_server_timings_are_none_when_the_backend_omits_them() -> None:
     assert timings.server_timings is None
     # Client phases are still measured — they don't depend on the backend.
     assert timings.total_ms is not None
+
+
+# ── the marks the connect phases can't see ─────────────────────────────────
+
+
+READY_FRAME: dict[str, Any] = {"type": "ready", "session_id": "sess-test"}
+
+
+async def _deliver(session: RealtimeSession, *frames: dict[str, Any]) -> None:
+    for frame in frames:
+        await session._handle_payload(json.dumps(frame).encode("utf-8"))
+
+
+class _ReadyDuringJoinTransport(FakeTransport):
+    """Delivers ``ready`` from inside the room join, so it lands while
+    ``_start`` has yet to build the connect phases."""
+
+    async def connect(
+        self, response: SessionResponse, callbacks: TransportCallbacks
+    ) -> None:
+        await super().connect(response, callbacks)
+        self.simulate_frame(json.dumps(READY_FRAME).encode("utf-8"))
+        await asyncio.sleep(0)  # let the spawned decode run before the join returns
+
+
+def test_ready_is_measured_from_the_connect_origin() -> None:
+    async def scenario() -> None:
+        # ``start()`` resolves at ready, so the mark is already stamped when
+        # the session is handed back.
+        harness = await start_fake_session()
+        session = harness.session
+        assert session is not None
+
+        ready_ms = session.connect_timings.ready_ms
+        total_ms = session.connect_timings.total_ms
+        assert ready_ms is not None and total_ms is not None
+        # Same origin as ``ws_ms``: ready is the whole client-side wait, so it
+        # contains the phases rather than running alongside them.
+        assert ready_ms >= total_ms
+
+        # Only the first counts — a reconnect's repeated ready must not move
+        # a mark that already landed.
+        await asyncio.sleep(0.01)
+        await _deliver(session, READY_FRAME)
+        assert session.connect_timings.ready_ms == ready_ms
+
+    asyncio.run(scenario())
+
+
+def test_ready_arriving_before_the_phases_are_built_is_not_lost() -> None:
+    async def scenario() -> None:
+        harness = FakeSessionHarness(transport_cls=_ReadyDuringJoinTransport)
+        await start_fake_session(harness=harness)
+        session = harness.session
+        assert session is not None
+        timings = session.connect_timings
+        assert timings.total_ms is not None
+        # Stamped mid-join, so it predates the phases the fold writes beside
+        # it: the mark is folded in, not overwritten by the later object.
+        assert timings.ready_ms is not None and timings.ready_ms < timings.total_ms
+        assert timings.ws_ms is not None
+
+    asyncio.run(scenario())

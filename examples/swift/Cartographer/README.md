@@ -12,15 +12,26 @@ mutating on-screen state, and a hook enforcing an app-side limit.
 
 - macOS 14+. The SDK itself runs on macOS 13; this app's UI uses SwiftUI's
   `onChange(of:initial:_:)` and `defaultScrollAnchor`, which are macOS 14.
-- A credential with the `realtime:use` scope
+- A credential with the `realtime:start` scope
 
 ## Run
 
 ```bash
 pipx install cosmo-cli && cosmo login
 ./run.sh              # talk to it
-./run.sh --demo       # no mic: connects and types a seed idea for you
+./run.sh --demo       # no speaking: connects and types a seed idea for you
 ```
+
+Against the one-process local OSS server, select its WebSocket transport:
+
+```bash
+./run.sh --websocket
+./run.sh --websocket --demo  # fastest end-to-end check without speaking
+```
+
+This defaults to `http://localhost:8080` with the local developer bearer. Set
+`COSMO_BASE_URL` if the server uses another loopback port. Use headphones: the
+local WebSocket lane has no WebRTC echo-cancellation layer.
 
 `run.sh` builds the `.app` bundle via `bundle.sh` on first run, then launches
 it. `--demo` is the fastest way to see the pipeline end to end without
@@ -31,7 +42,7 @@ granting microphone access.
 | SDK surface | Where |
 | --- | --- |
 | `agent.start()` + the typed `events` stream | `Conductor.consume(_:)` |
-| Client tools with `Decodable` args (`AgentTool.define`) | `Conductor.mapTools()` |
+| Client tools with `Decodable` args (`clientTool`) | `Conductor.mapTools()` |
 | `preToolUse` deny and `sessionEnd` hooks | `Conductor.mapHooks()` |
 | Transcript append vs replace | `Conductor.append(_:_:isFinal:)` / `replace(_:_:)` |
 | `setMuted`, `send(text:)`, `end()` | `Conductor.toggleMute()` / `say(_:)` / `stop()` |

@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import CosmoRealtime
 
@@ -24,6 +25,20 @@ final class Conductor: ObservableObject {
         }
     }
 
+    enum ConfigurationError: LocalizedError {
+        case invalidTransport(String)
+        case microphoneDenied
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidTransport(let value):
+                return "COSMO_TRANSPORT must be livekit or websocket, not \(value)"
+            case .microphoneDenied:
+                return "Microphone access is required. Enable Cartographer in Privacy & Security settings."
+            }
+        }
+    }
+
     struct Line: Identifiable, Equatable {
         let id = UUID()
         var speaker: Speaker
@@ -37,12 +52,14 @@ final class Conductor: ObservableObject {
     @Published private(set) var toolFeed: [String] = []
     @Published private(set) var agentSpeaking = false
     @Published private(set) var youSpeaking = false
+    @Published private(set) var inputLevel: Float = 0
     @Published var muted = false
 
     let map: MindMap
 
     private var session: RealtimeSession?
     private var pump: Task<Void, Never>?
+    private var levelPump: Task<Void, Never>?
     /// Index of the still-open line per speaker, so streaming deltas append
     /// in place instead of spawning a new bubble per fragment.
     private var openLine: [Line.Speaker: Int] = [:]
@@ -54,31 +71,75 @@ final class Conductor: ObservableObject {
     // MARK: Session lifecycle
 
     func start() async {
-        guard case .idle = status else { return }
+        switch status {
+        case .idle, .ended, .failed:
+            break
+        case .connecting, .live:
+            return
+        }
+        muted = false
+        agentSpeaking = false
+        youSpeaking = false
+        inputLevel = 0
+        closeAll()
         status = .connecting
         note("connecting to Cosmo…")
 
         do {
-            // Zero-argument construction resolves COSMO_API_KEY, else the
-            // `cosmo login` credentials file. A bundled app launched from
-            // Finder inherits no environment, so the file is the route that
-            // works there.
-            let client = try RealtimeClient()
+            try await Self.requireMicrophoneAccess()
+            let transport = try Self.resolveTransport(
+                environment: ProcessInfo.processInfo.environment
+            )
+            let client = try RealtimeClient(
+                transport: transport
+            )
             let agent = try client.agent(
                 instructions: Self.instructions,
                 voice: VoiceConfig(name: "Puck"),
-                audio: AudioConfig(noiseCancellation: true),
+                audio: transport == .livekit
+                    ? AudioConfig(noiseCancellation: .voiceFocus)
+                    : nil,
                 tools: try mapTools(),
-                interruptionSensitivity: .high,
+                interruptionSensitivity: transport == .livekit ? .high : nil,
                 greeting: "Map's open. What are we thinking about?",
                 hooks: try mapHooks()
             )
             let session = try await agent.start()
             self.session = session
             pump = Task { [weak self] in await self?.consume(session) }
+            levelPump = Task { [weak self] in
+                for await level in session.inputLevels {
+                    self?.inputLevel = level
+                }
+            }
         } catch {
             status = .failed(Self.describe(error))
             note("start failed: \(error)")
+        }
+    }
+
+    private static func resolveTransport(
+        environment: [String: String]
+    ) throws -> RealtimeClient.Transport {
+        let value = environment["COSMO_TRANSPORT"]?.lowercased() ?? "livekit"
+        guard let transport = RealtimeClient.Transport(rawValue: value) else {
+            throw ConfigurationError.invalidTransport(value)
+        }
+        return transport
+    }
+
+    private static func requireMicrophoneAccess() async throws {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            return
+        case .notDetermined:
+            guard await AVCaptureDevice.requestAccess(for: .audio) else {
+                throw ConfigurationError.microphoneDenied
+            }
+        case .denied, .restricted:
+            throw ConfigurationError.microphoneDenied
+        @unknown default:
+            throw ConfigurationError.microphoneDenied
         }
     }
 
@@ -111,16 +172,15 @@ final class Conductor: ObservableObject {
     private func consume(_ session: RealtimeSession) async {
         do {
             for try await event in session.events {
-                // The `ready` frame can be lost to a race between the agent
-                // publishing it and our data channel being subscribed, so it
-                // is not safe to gate the UI on it. Anything arriving on this
-                // stream proves the session is live.
+                // `start(...)` already returned at ready, so the session is
+                // live before this loop runs; anything on the stream confirms
+                // it.
                 markLive()
 
                 switch event {
                 case .ready(let ready):
                     note("live — session \(ready.sessionId)")
-                    for rejected in ready.rejectedTools ?? [] {
+                    for rejected in ready.rejectedTools {
                         note("⚠︎ server rejected tool '\(rejected.name)'")
                     }
 
@@ -165,6 +225,9 @@ final class Conductor: ObservableObject {
             note("stream error: \(error)")
         }
         self.session = nil
+        levelPump?.cancel()
+        levelPump = nil
+        inputLevel = 0
         if case .live = status { status = .ended("") }
     }
 
@@ -180,7 +243,7 @@ final class Conductor: ObservableObject {
     private func mapTools() throws -> [AgentTool] {
         let map = self.map
 
-        let addIdea = try AgentTool.define(
+        let addIdea = try AgentTool.clientTool(
             name: "add_idea",
             description: """
             Put one idea on the visible mind map. Call this the moment the \
@@ -202,7 +265,7 @@ final class Conductor: ObservableObject {
             return ["id": .string(node.id), "placed": .bool(true)]
         }
 
-        let linkIdeas = try AgentTool.define(
+        let linkIdeas = try AgentTool.clientTool(
             name: "link_ideas",
             description: """
             Draw a labelled connection between two ideas already on the map \
@@ -224,7 +287,7 @@ final class Conductor: ObservableObject {
             return ["linked": .bool(ok)]
         }
 
-        let readMap = try AgentTool.define(
+        let readMap = try AgentTool.clientTool(
             name: "read_map",
             description: """
             Read back everything currently on the map. Call before \
@@ -238,7 +301,7 @@ final class Conductor: ObservableObject {
             return ["title": .string(title), "outline": .string(outline)]
         }
 
-        let titleMap = try AgentTool.define(
+        let titleMap = try AgentTool.clientTool(
             name: "title_map",
             description: "Name the map once its subject is clear. Call at most once or twice.",
             input: .object(

@@ -1,4 +1,4 @@
-import { tool } from 'cosmo-ai/tool';
+import { clientTool } from 'cosmo-ai/tool';
 import { zodInput } from 'cosmo-ai/tool/zod';
 import { z } from 'zod/v4';
 
@@ -17,7 +17,7 @@ function requireState(ref: StateRef): DocumentState {
 }
 
 export function makeDocumentTools(ref: StateRef) {
-  const getCurrentView = tool({
+  const getCurrentView = clientTool({
     name: 'get_current_view',
     description:
       'What the reader is looking at right now: the section they have scrolled to, its full text, and any text they have selected. Call this before answering anything about "this", "here", or "the current page".',
@@ -35,7 +35,7 @@ export function makeDocumentTools(ref: StateRef) {
     },
   });
 
-  const getSection = tool({
+  const getSection = clientTool({
     name: 'get_section',
     description:
       'Full text of one section by its zero-based index (for a PDF, index 0 is page 1). Use get_outline first if you need to know what the sections are.',
@@ -54,7 +54,7 @@ export function makeDocumentTools(ref: StateRef) {
     },
   });
 
-  const readDocument = tool({
+  const readDocument = clientTool({
     name: 'read_document',
     description:
       'The full text of the whole document, section by section. Use this for anything that needs the document as a whole — what it is, what it says overall, summarising it, or a question whose answer could be anywhere. Prefer it over reading sections one at a time.',
@@ -75,7 +75,7 @@ export function makeDocumentTools(ref: StateRef) {
     },
   });
 
-  const searchTool = tool({
+  const searchTool = clientTool({
     name: 'search_document',
     description:
       'Find where a phrase appears in the document. Returns matching snippets with their section indices, which you can then read in full with get_section. Matching is literal, so search for distinctive words rather than paraphrases.',
@@ -92,7 +92,7 @@ export function makeDocumentTools(ref: StateRef) {
     },
   });
 
-  const getOutline = tool({
+  const getOutline = clientTool({
     name: 'get_outline',
     description: 'The list of sections in the document, with their indices and labels. Cheap — no body text.',
     input: zodInput(z.object({})),

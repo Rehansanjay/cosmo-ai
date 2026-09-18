@@ -8,6 +8,8 @@ import json
 import httpx
 import pytest
 
+from cosmo_ai import SessionStartErrorCode
+
 from cosmo_ai.errors import SessionStartError
 from cosmo_ai.hooks import (
     SessionStartContext,
@@ -102,7 +104,7 @@ async def test_stop_fires_when_session_start_hook_fold_raises():
     with pytest.raises(SessionStartError) as exc_info:
         await start_fake_session(instructions="hi", hooks=[on_session_end, bad])
 
-    assert exc_info.value.code == "session_start_hook_failed"
+    assert exc_info.value.code is SessionStartErrorCode.CONFIG
     assert len(stops) == 1
     assert stops[0].reason == DisconnectReason.HANDSHAKE_FAILED
     assert stops[0].session_id is None

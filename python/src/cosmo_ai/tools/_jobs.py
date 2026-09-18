@@ -159,6 +159,10 @@ class ClientToolJob:
 
     @property
     def acked(self) -> bool:
+        """Whether the RPC reply has been released yet, by :meth:`ack` or by a
+        terminal call that answered without one. Lets a handler that may reach
+        completion either way avoid a redundant :meth:`ack`, which is ignored
+        anyway."""
         return self._ack.done()
 
     async def ack(self, note: str = "") -> None:
@@ -182,7 +186,14 @@ class ClientToolJob:
         summary: str | None = None,
     ) -> None:
         """Deliver a successful terminal result. Idempotent once delivered; a
-        failed publish raises and leaves the job retryable."""
+        failed publish raises and leaves the job retryable.
+
+        :param result: Structured data for your own records. Not currently
+            forwarded to the model — put anything it must act on in
+            ``summary``.
+        :param summary: Model-facing text: what the assistant is told came
+            back, and what it will speak from.
+        """
         await self._deliver(
             status="completed",
             result=result,
@@ -193,7 +204,11 @@ class ClientToolJob:
 
     async def fail(self, *, error: str) -> None:
         """Deliver a failed terminal result. Idempotent once delivered; a
-        failed publish raises and leaves the job retryable."""
+        failed publish raises and leaves the job retryable.
+
+        :param error: Model-facing text explaining the failure, so the
+            assistant can tell the user something useful.
+        """
         await self._deliver(
             status="failed",
             result=None,

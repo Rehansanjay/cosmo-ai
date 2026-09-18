@@ -1,0 +1,245 @@
+:root {
+  color-scheme: dark;
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+body {
+  margin: 0;
+  background: #0d1117;
+  color: #e6e6e6;
+}
+
+main {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 2rem 1rem 4rem;
+}
+
+h1 {
+  margin-bottom: 0.25rem;
+}
+
+header p {
+  max-width: 65ch;
+  line-height: 1.55;
+  color: #9aa4b2;
+}
+
+form label {
+  display: block;
+  margin-bottom: 0.35rem;
+  color: #9aa4b2;
+  font-size: 0.9rem;
+}
+
+.load-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+input[type='url'] {
+  flex: 1;
+  padding: 0.6rem 0.8rem;
+  border-radius: 8px;
+  border: 1px solid #30363d;
+  background: #161b22;
+  color: inherit;
+  font-size: 1rem;
+}
+
+button {
+  padding: 0.6rem 1.1rem;
+  border-radius: 8px;
+  border: 1px solid #30363d;
+  background: #1f6feb;
+  color: white;
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+button:disabled {
+  background: #21262d;
+  color: #8b949e;
+  cursor: default;
+}
+
+button:not(:disabled):hover {
+  filter: brightness(1.1);
+}
+
+button:focus-visible,
+input:focus-visible,
+summary:focus-visible {
+  outline: 3px solid rgba(88, 166, 255, 0.5);
+  outline-offset: 2px;
+}
+
+button.secondary {
+  background: #21262d;
+  color: #e6e6e6;
+}
+
+.hint {
+  color: #9aa4b2;
+  font-size: 0.9rem;
+}
+
+.error {
+  color: #ff7b72;
+}
+
+.stage {
+  margin-top: 2rem;
+}
+
+.stage h2 {
+  margin-bottom: 0.5rem;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.frame {
+  position: relative;
+}
+
+.embed {
+  aspect-ratio: 16 / 9;
+  border-radius: 12px;
+  overflow: hidden;
+  background: black;
+}
+
+.embed iframe,
+.embed > div {
+  width: 100%;
+  height: 100%;
+}
+
+/* The agent's one channel for words. Top of the player — YouTube's own
+ * controls and captions compete for the bottom. */
+.caption {
+  position: absolute;
+  left: 50%;
+  top: 4rem;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: calc(100% - 2rem);
+  padding: 0.4rem 0.9rem;
+  border-radius: 999px;
+  background: rgba(13, 17, 23, 0.92);
+  border: 1px solid #30363d;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.5);
+  font-size: 1.05rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.controls {
+  margin-top: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.status {
+  margin: 0;
+  color: #9aa4b2;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.dot {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  background: #8b949e;
+}
+
+.dot-starting {
+  background: #d29922;
+}
+
+.dot-live {
+  background: #3fb950;
+}
+
+.history {
+  margin-top: 1.75rem;
+  padding-top: 1rem;
+  border-top: 1px solid #21262d;
+}
+
+.history h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+  color: #9aa4b2;
+}
+
+.jumps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.jumps li {
+  margin-bottom: 0.35rem;
+}
+
+button.jump {
+  display: flex;
+  align-items: baseline;
+  gap: 0.7rem;
+  width: 100%;
+  text-align: left;
+  padding: 0.45rem 0.7rem;
+  background: #161b22;
+  color: #c9d1d9;
+  font-size: 0.95rem;
+}
+
+.jump-time {
+  color: #58a6ff;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.transcript {
+  margin-top: 1.5rem;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  padding: 0.6rem 0.9rem;
+}
+
+.transcript summary {
+  cursor: pointer;
+  color: #9aa4b2;
+}
+
+.transcript pre {
+  max-height: 20rem;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  font-size: 0.85rem;
+  color: #c9d1d9;
+}
+
+@media (max-width: 560px) {
+  .load-row {
+    flex-direction: column;
+  }
+
+  .load-row button {
+    width: 100%;
+  }
+
+  .caption {
+    top: 3rem;
+    max-width: calc(100% - 1rem);
+    font-size: 0.9rem;
+  }
+}

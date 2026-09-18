@@ -10,17 +10,13 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from cosmo_ai._internal.protocol import ClientTool, DetectObjectsTool, EndCallTool, ExamineImageTool, PointAtObjectTool, SpeakerLogTool, WebSearchTool
 from cosmo_ai import (
     RealtimeClient,
     CosmoVadConfig,
-    DetectObjectsTool,
-    EndCallTool,
-    ExamineImageTool,
-    GeminiModelOptions,
-    GrokModelOptions,
-    OpenAIModelOptions,
-    PointAtObjectTool,
-    WebSearchTool,
+    GeminiModel,
+    GrokModel,
+    OpenAIModel,
 )
 from cosmo_ai._internal.protocol import (
     SDK_NAME,
@@ -28,7 +24,6 @@ from cosmo_ai._internal.protocol import (
     CatalogAgentConfig,
     InlineAgentConfig,
 )
-from cosmo_ai.tools import ClientTool
 
 from .fakes import start_body
 
@@ -41,13 +36,12 @@ def test_minimal_config_sends_protocol_envelope_and_omits_absent_fields() -> Non
     body = start_body()
     assert body["type"] == "session-config"
     assert body["sdk"] == {"name": SDK_NAME, "version": SDK_VERSION}
-    assert isinstance(body["id"], str) and body["id"]
+    assert "id" not in body
     for absent in (
         "name",
         "inputs",
         "instructions",
         "model",
-        "model_options",
         "voice",
         "tools",
         # Unset stays off the wire — the server defaults apply.
@@ -58,115 +52,102 @@ def test_minimal_config_sends_protocol_envelope_and_omits_absent_fields() -> Non
     assert "experimental" not in body["session"]
 
 
-def test_model_serializes_under_agent_and_absent_when_unset() -> None:
+def test_model_string_serializes_under_agent_and_absent_when_unset() -> None:
     body = start_body(model="gemini-live")
     assert body["agent"]["model"] == "gemini-live"
     silent = start_body()
     assert "model" not in silent["agent"]
 
 
-def test_model_options_serialize_under_agent_and_absent_when_unset() -> None:
+def test_model_block_serializes_under_agent_and_absent_when_unset() -> None:
     body = start_body(
-        model="gemini",
-        model_options=GeminiModelOptions(
-            temperature=0.7, max_output_tokens=4096, thinking_level="high"
-        ),
+        model=GeminiModel(temperature=0.7, max_output_tokens=4096, thinking_level="high"),
     )
-    opts = body["agent"]["model_options"]
-    assert opts["provider"] == "gemini"
-    assert opts["temperature"] == 0.7
-    assert opts["max_output_tokens"] == 4096
-    assert opts["thinking_level"] == "high"
+    block = body["agent"]["model"]
+    assert block["provider"] == "gemini"
+    assert block["temperature"] == 0.7
+    assert block["max_output_tokens"] == 4096
+    assert block["thinking_level"] == "high"
     silent = start_body()
-    assert "model_options" not in silent["agent"]
+    assert "model" not in silent["agent"]
+
+
+def test_model_block_carries_the_concrete_model_id() -> None:
+    body = start_body(model=GeminiModel(model_id="gemini-live"))
+    assert body["agent"]["model"]["model_id"] == "gemini-live"
 
 
 def test_gemini_endpointing_knobs_serialize_under_their_wire_names() -> None:
     body = start_body(
-        model="gemini",
-        model_options=GeminiModelOptions(
+        model=GeminiModel(
             include_thoughts=False,
             end_of_speech_sensitivity="high",
             silence_duration_ms=200,
             prefix_padding_ms=100,
         ),
     )
-    opts = body["agent"]["model_options"]
-    assert opts["include_thoughts"] is False
-    assert opts["end_of_speech_sensitivity"] == "high"
-    assert opts["silence_duration_ms"] == 200
-    assert opts["prefix_padding_ms"] == 100
-    assert "temperature" not in opts
+    block = body["agent"]["model"]
+    assert block["include_thoughts"] is False
+    assert block["end_of_speech_sensitivity"] == "high"
+    assert block["silence_duration_ms"] == 200
+    assert block["prefix_padding_ms"] == 100
+    assert "temperature" not in block
 
 
 def test_gemini_server_vad_opt_out_serializes_and_default_stays_off_wire() -> None:
-    body = start_body(
-        model="gemini",
-        model_options=GeminiModelOptions(turn_detection="server_vad"),
-    )
-    assert body["agent"]["model_options"]["turn_detection"] == "server_vad"
-    default = start_body(model="gemini", model_options=GeminiModelOptions())
-    assert "model_options" not in default["agent"] or "turn_detection" not in (
-        default["agent"]["model_options"]
-    )
+    body = start_body(model=GeminiModel(turn_detection="server_vad"))
+    assert body["agent"]["model"]["turn_detection"] == "server_vad"
+    default = start_body(model=GeminiModel())
+    assert "turn_detection" not in default["agent"]["model"]
 
 
 def test_gemini_cosmo_vad_block_serializes_under_its_wire_names() -> None:
     body = start_body(
-        model="gemini",
-        model_options=GeminiModelOptions(
+        model=GeminiModel(
             turn_detection="cosmo_vad",
             cosmo_vad=CosmoVadConfig(pause_ms=250, prefix_ms=300, max_hold_ms=900),
         ),
     )
-    opts = body["agent"]["model_options"]
-    assert opts["turn_detection"] == "cosmo_vad"
-    assert opts["cosmo_vad"] == {
+    block = body["agent"]["model"]
+    assert block["turn_detection"] == "cosmo_vad"
+    assert block["cosmo_vad"] == {
         "pause_ms": 250,
         "prefix_ms": 300,
         "max_hold_ms": 900,
     }
-    assert "silence_duration_ms" not in opts
+    assert "silence_duration_ms" not in block
 
 
 def test_openai_turn_detection_knobs_serialize_under_their_wire_names() -> None:
-    body = start_body(
-        model="openai",
-        model_options=OpenAIModelOptions(
-            turn_detection="semantic_vad", eagerness="high"
-        ),
-    )
-    opts = body["agent"]["model_options"]
-    assert opts["provider"] == "openai"
-    assert opts["turn_detection"] == "semantic_vad"
-    assert opts["eagerness"] == "high"
-    assert "silence_duration_ms" not in opts
+    body = start_body(model=OpenAIModel(turn_detection="semantic_vad", eagerness="high"))
+    block = body["agent"]["model"]
+    assert block["provider"] == "openai"
+    assert block["turn_detection"] == "semantic_vad"
+    assert block["eagerness"] == "high"
+    assert "silence_duration_ms" not in block
 
 
 def test_grok_turn_detection_knobs_serialize_under_their_wire_names() -> None:
     body = start_body(
-        model="grok",
-        model_options=GrokModelOptions(
-            turn_detection="server_vad", silence_duration_ms=200, prefix_padding_ms=100
-        ),
+        model=GrokModel(turn_detection="server_vad", silence_duration_ms=200, prefix_padding_ms=100),
     )
-    opts = body["agent"]["model_options"]
-    assert opts["provider"] == "grok"
-    assert opts["turn_detection"] == "server_vad"
-    assert opts["silence_duration_ms"] == 200
-    assert opts["prefix_padding_ms"] == 100
+    block = body["agent"]["model"]
+    assert block["provider"] == "grok"
+    assert block["turn_detection"] == "server_vad"
+    assert block["silence_duration_ms"] == 200
+    assert block["prefix_padding_ms"] == 100
 
 
 def test_grok_block_has_no_semantic_pacing_knob() -> None:
     # xAI offers the silence window only, so eagerness has no home here.
     with pytest.raises(ValidationError):
-        GrokModelOptions(eagerness="high")  # type: ignore[call-arg]
+        GrokModel(eagerness="high")  # type: ignore[call-arg]
 
 
-def test_model_options_reject_cross_provider_knob() -> None:
+def test_model_block_rejects_cross_provider_knob() -> None:
     # thinking_level lives only on the Gemini block — the OpenAI block forbids it.
     with pytest.raises(ValidationError):
-        OpenAIModelOptions(thinking_level="high")  # type: ignore[call-arg]
+        OpenAIModel(thinking_level="high")  # type: ignore[call-arg]
 
 
 def test_greeting_serializes_under_agent_and_absent_when_unset() -> None:
@@ -224,6 +205,7 @@ def test_typed_server_opt_ins_serialize_as_bare_kinds() -> None:
             DetectObjectsTool(),
             PointAtObjectTool(),
             EndCallTool(),
+            SpeakerLogTool(),
         ]
     )
     assert body["agent"]["tools"] == [
@@ -232,6 +214,7 @@ def test_typed_server_opt_ins_serialize_as_bare_kinds() -> None:
         {"kind": "detect_objects"},
         {"kind": "point_at_object"},
         {"kind": "end_call"},
+        {"kind": "speaker_log"},
     ]
 
 
@@ -320,7 +303,7 @@ def test_client_tool_requires_a_handler() -> None:
 
 
 def test_background_client_tool_requires_a_handler() -> None:
-    from cosmo_ai.tools import BackgroundClientTool
+    from cosmo_ai._internal.protocol import BackgroundClientTool
 
     with pytest.raises(ValidationError):
         BackgroundClientTool(

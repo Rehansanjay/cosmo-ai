@@ -21,7 +21,7 @@ function emitRawRole(fake: FakeTransport, frame: Record<string, unknown>): void 
 
 async function connectedSession(): Promise<{ fake: FakeTransport; session: RealtimeSession }> {
   const fake = makeFakeTransport();
-  const client = new RealtimeClient({ transportFactory: () => fake });
+  const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
   const session = await client.agent().start();
   return { fake, session };
 }

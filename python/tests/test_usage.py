@@ -3,22 +3,22 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from types import SimpleNamespace
 from typing import Callable
 
 import httpx
 import pytest
 
+from cosmo_ai import UsageErrorCode
 from cosmo_ai import (
     RealtimeClient,
     SessionStatus,
     UsageError,
     UsageStatus,
     SessionUsage,
-    NotConnectedError,
+    SessionStateError,
 )
-from cosmo_ai._internal.protocol import SessionConfig
+from cosmo_ai._internal.protocol import _sdk_info, SessionConfig
 from cosmo_ai.session import RealtimeSession
 
 Handler = Callable[[httpx.Request], httpx.Response]
@@ -151,7 +151,8 @@ def test_get_session_usage_maps_server_slug_to_usage_error_code() -> None:
 
     with pytest.raises(UsageError) as exc:
         asyncio.run(scenario())
-    assert exc.value.code == "not_found"
+    assert exc.value.code is UsageErrorCode.REQUEST_REJECTED
+    assert exc.value.server_code == "not_found"
     assert "not found" in exc.value.message
 
 
@@ -164,7 +165,7 @@ def test_get_session_usage_maps_malformed_success_to_invalid_response() -> None:
 
     with pytest.raises(UsageError) as exc:
         asyncio.run(scenario())
-    assert exc.value.code == "invalid_response"
+    assert exc.value.code is UsageErrorCode.INVALID_RESPONSE
 
 
 def test_get_session_usage_maps_transport_failure() -> None:
@@ -176,13 +177,13 @@ def test_get_session_usage_maps_transport_failure() -> None:
 
     with pytest.raises(UsageError) as exc:
         asyncio.run(scenario())
-    assert exc.value.code == "transport_error"
+    assert exc.value.code is UsageErrorCode.REQUEST_FAILED
 
 
 def _started_session(get_usage) -> RealtimeSession:
     """A session past start() without joining LiveKit — enough to exercise
     usage(), which only needs the bound get_usage and the session id."""
-    session = RealtimeSession(config=SessionConfig(), get_usage=get_usage)
+    session = RealtimeSession(config=SessionConfig(sdk=_sdk_info()), get_usage=get_usage)
     session._response = SimpleNamespace(session_id="sess-42")  # type: ignore[assignment]
     return session
 
@@ -208,7 +209,8 @@ def test_usage_without_support_raises_usage_error() -> None:
 
     with pytest.raises(UsageError) as exc:
         asyncio.run(scenario())
-    assert exc.value.code == "not_supported"
+    assert exc.value.code is UsageErrorCode.INVALID_REQUEST
+    assert exc.value.server_code is None
 
 
 @pytest.mark.parametrize("supported", [True, False])
@@ -221,9 +223,9 @@ def test_usage_before_start_raises_not_connected(supported: bool) -> None:
 
     async def scenario() -> None:
         session = RealtimeSession(
-            config=SessionConfig(), get_usage=get_usage if supported else None
+            config=SessionConfig(sdk=_sdk_info()), get_usage=get_usage if supported else None
         )
         await session.usage()
 
-    with pytest.raises(NotConnectedError):
+    with pytest.raises(SessionStateError):
         asyncio.run(scenario())

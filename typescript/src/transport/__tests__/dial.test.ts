@@ -7,6 +7,7 @@
  * ``external_session_url.ts`` / its test.)
  */
 import { describe, expect, it } from 'vitest';
+import { ApiError } from '../../core/errors';
 
 import { DialError, validateE164 } from '../dial';
 import { parseErrorDetail } from '../error_detail';
@@ -31,7 +32,7 @@ describe('validateE164', () => {
     try {
       validateE164(input);
     } catch (err) {
-      expect((err as DialError).code).toBe('invalid_phone_number');
+      expect((err as DialError).code).toBe('invalid_request');
     }
   });
 });
@@ -81,14 +82,24 @@ describe('parseErrorDetail', () => {
 });
 
 describe('DialError', () => {
-  it('carries the slug as code and the reason as message', () => {
-    const err = new DialError('minute_limit_exceeded', 'Weekly limit reached.');
-    expect(err.code).toBe('minute_limit_exceeded');
+  it("carries the SDK's code and the server's slug apart", () => {
+    // The closed code says how far the attempt got; the server's own slug is
+    // an open set and rides on the ApiError base.
+    const err = new DialError({
+      code: 'request_rejected',
+      message: 'Weekly limit reached.',
+      serverCode: 'minute_limit_exceeded',
+    });
+    expect(err.code).toBe('request_rejected');
+    expect(err.serverCode).toBe('minute_limit_exceeded');
     expect(err.message).toBe('Weekly limit reached.');
     expect(err.name).toBe('DialError');
+    expect(err).toBeInstanceOf(ApiError);
   });
 
   it('falls back to the code as the error message when no reason is given', () => {
-    expect(new DialError('not_dialable', '').message).toBe('not_dialable');
+    expect(new DialError({ code: 'invalid_request', message: '' }).message).toBe(
+      'invalid_request',
+    );
   });
 });

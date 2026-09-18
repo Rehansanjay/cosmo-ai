@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import * as z from 'zod/v4';
 
-import { ToolSchemaError } from '../errors';
+import { ToolDefinitionError } from '../errors';
 import type { ToolInput } from '../input';
 import { zodInput } from '../zod';
 
@@ -57,7 +57,7 @@ describe('zodInput schema emission', () => {
   });
 
   it('rejects a non-object top level', () => {
-    expect(() => zodInput(z.string() as never)).toThrow(ToolSchemaError);
+    expect(() => zodInput(z.string() as never)).toThrow(ToolDefinitionError);
   });
 
   it('rejects a strict object (additionalProperties: false)', () => {
@@ -79,8 +79,8 @@ describe('zodInput schema emission', () => {
     } catch (err) {
       thrown = err;
     }
-    expect(thrown).toBeInstanceOf(ToolSchemaError);
-    expect((thrown as ToolSchemaError).code).toBe('forbidden_key');
+    expect(thrown).toBeInstanceOf(ToolDefinitionError);
+    expect((thrown as ToolDefinitionError).code).toBe('forbidden_key');
   });
 
   it('labels a dialect rejection with the name hint', () => {
@@ -93,13 +93,13 @@ describe('zodInput schema emission', () => {
 
   it('rejects a string format as a lossy construct', () => {
     expect(() => zodInput(z.object({ contact: z.email() }))).toThrow(
-      ToolSchemaError,
+      ToolDefinitionError,
     );
   });
 
   it('rejects an exclusive bound as a lossy construct', () => {
     expect(() => zodInput(z.object({ n: z.number().positive() }))).toThrow(
-      ToolSchemaError,
+      ToolDefinitionError,
     );
   });
 
@@ -110,8 +110,8 @@ describe('zodInput schema emission', () => {
     } catch (err) {
       thrown = err;
     }
-    expect(thrown).toBeInstanceOf(ToolSchemaError);
-    expect((thrown as ToolSchemaError).code).toBe('forbidden_key');
+    expect(thrown).toBeInstanceOf(ToolDefinitionError);
+    expect((thrown as ToolDefinitionError).code).toBe('forbidden_key');
   });
 
   it('nullable lowers to anyOf with null', () => {
@@ -162,7 +162,7 @@ describe('zodInput validation', () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
     const byPath = Object.fromEntries(
-      result.issues.map((issue) => [issue.path.join('.'), issue.constraint]),
+      result.issues.map((issue) => [issue.path, issue.constraint]),
     );
     expect(byPath).toEqual({
       city: 'required',

@@ -1,9 +1,9 @@
-import type { ClientToolSpec } from 'cosmo-ai';
+import type { AgentTool } from 'cosmo-ai';
 // The factories come from the leaf entry, not the barrel: the barrel pulls in
 // livekit-client, which nothing at module-evaluation time needs.
 import {
-  drawBox,
-  drawPoint,
+  drawBoxTool,
+  drawPointTool,
   notShown,
   shown,
   type DrawBoxRequest,
@@ -39,7 +39,7 @@ function draw(render: (surface: DrawSurface) => void): DrawOutcome {
   return shown;
 }
 
-export const DRAW_TOOLS: ClientToolSpec[] = [
-  drawBox((request) => draw((s) => s.showBox(request))),
-  drawPoint((request) => draw((s) => s.showPoint(request))),
+export const DRAW_TOOLS: AgentTool[] = [
+  drawBoxTool((request) => draw((s) => s.showBox(request))),
+  drawPointTool((request) => draw((s) => s.showPoint(request))),
 ];

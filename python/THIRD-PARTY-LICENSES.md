@@ -18,6 +18,7 @@ license review found no copyleft (GPL/AGPL/LGPL/MPL) components.
 | sounddevice | MIT | Matthias Geier | https://github.com/spatialaudio/python-sounddevice |
 | structlog | MIT OR Apache-2.0 | Hynek Schlawack | https://github.com/hynek/structlog |
 | tomli | MIT | Taneli Hukkinen | https://github.com/hukkin/tomli |
+| websockets | BSD-3-Clause | Aymeric Augustin and contributors | https://github.com/python-websockets/websockets |
 
 ## License texts
 

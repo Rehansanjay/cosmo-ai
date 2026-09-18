@@ -6,6 +6,7 @@
  * exactly one track claiming the voice.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { SDK_NAME, SDK_VERSION } from '../../constants';
 import { TextEncoder as NodeTextEncoder, TextDecoder as NodeTextDecoder } from 'util';
 
 if (typeof global.TextEncoder === 'undefined') {
@@ -15,9 +16,9 @@ if (typeof global.TextDecoder === 'undefined') {
   global.TextDecoder = NodeTextDecoder as typeof global.TextDecoder;
 }
 
-import { AudioPublishAlreadyActiveError } from '../../core/errors';
+import { SessionStateError } from '../../core/errors';
 import { LiveKitTransport } from '../livekit_transport';
-import type { SessionConfig } from '../../wire/types.gen';
+import type { SessionConfig } from '../../protocol';
 
 const { publishTrack, unpublishTrack, publishData, getTrackPublication, mockHandlers } = vi.hoisted(
   () => ({
@@ -79,6 +80,7 @@ function mediaStream(audioTracks: number): MediaStream {
 const START_URL = 'https://api.example.com/api/v1/external/realtime/session/start';
 
 const CONFIG: SessionConfig = {
+  sdk: { name: SDK_NAME, version: SDK_VERSION },
   type: 'session-config',
 };
 
@@ -181,7 +183,7 @@ describe('LiveKitTransport.startAudioStream', () => {
     await t.startAudioStream(mediaStream(1));
 
     await expect(t.startAudioStream(mediaStream(1))).rejects.toThrow(
-      AudioPublishAlreadyActiveError,
+      SessionStateError,
     );
     expect(publishTrack).toHaveBeenCalledTimes(1);
   });
@@ -231,7 +233,7 @@ describe('LiveKitTransport.startAudioStream', () => {
     await expect(t.startAudioStream(mediaStream(1))).rejects.toThrow();
 
     // The slot must be free — a failed start that held it would refuse every
-    // later attempt with AudioPublishAlreadyActiveError.
+    // later attempt with SessionStateError.
     publishTrack.mockResolvedValue({ trackSid: 'TR_retry', track: { id: 't2' } });
     await expect(t.startAudioStream(mediaStream(1))).resolves.toBeUndefined();
   });

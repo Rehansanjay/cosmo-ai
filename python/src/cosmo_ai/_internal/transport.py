@@ -17,8 +17,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Literal, Optional, Protocol
 
-from cosmo_ai._internal.protocol import SessionResponse
-from cosmo_ai.audio import AgentAudioFrame
+from cosmo_ai._internal.protocol import SessionStartTimings
+from cosmo_ai.audio import AgentAudioFrame, MicrophoneCapture
+
+
+TransportName = Literal["webrtc", "websocket", "livekit"]
+"""Which lane a session runs on. ``webrtc`` is what Cosmo serves and what a
+self-hosted deployment runs; ``websocket`` reaches a self-hosted
+``cosmo-server`` started with ``COSMO_TRANSPORT=websocket``, which holds the
+model session in the same process and needs no media server. ``livekit`` is a
+deprecated alias of ``webrtc``."""
 
 
 @dataclass(frozen=True)
@@ -51,6 +59,56 @@ class RpcMethodError(Exception):
 RpcHandler = Callable[[RpcInvocation], Awaitable[str]]
 """An inbound RPC method: given a vendor-free :class:`RpcInvocation`, returns
 the JSON-encoded ``{ok, result, error}`` reply envelope."""
+
+
+class StartedSession(Protocol):
+    """What a session start hands its transport, whichever server answered.
+
+    Each transport reads the fields only it needs — the LiveKit lane its room
+    and join token, the websocket lane its socket URL — so the session itself
+    depends on nothing beyond the three below. ``room_name`` is ``None`` on a
+    transport that has no room."""
+
+    @property
+    def session_id(self) -> str: ...
+
+    @property
+    def room_name(self) -> str | None: ...
+
+    @property
+    def timings(self) -> Optional[SessionStartTimings]: ...
+
+
+class MicSource(Protocol):
+    """The default input device, captured however its transport captures.
+
+    Constructed by the transport (:meth:`Transport.create_mic_source`),
+    because how the microphone is opened is a transport concern: WebRTC's
+    device module on the LiveKit lane, PortAudio on the websocket one."""
+
+    @property
+    def audio_source(self) -> Any:
+        """What to hand :meth:`Transport.publish_audio_source`. Valid only
+        between :meth:`start` and :meth:`stop`."""
+        ...
+
+    async def start(self) -> None:
+        """Open the device. Raises
+        :class:`~cosmo_ai.errors.AudioUnavailableError` when none is usable."""
+        ...
+
+    def set_level_source(self, track: Any) -> None:
+        """Name the published track :meth:`read_level` samples, for a capture
+        path that measures the level downstream of the publish."""
+        ...
+
+    async def read_level(self) -> float:
+        """Sample the capture level, 0…1."""
+        ...
+
+    async def stop(self) -> None:
+        """Stop capture and release the device promptly."""
+        ...
 
 
 class AgentAudioSink(Protocol):
@@ -96,13 +154,19 @@ class Transport(Protocol):
 
     async def connect(
         self,
-        response: SessionResponse,
+        started: StartedSession,
         callbacks: TransportCallbacks,
     ) -> None:
-        """Bring up the media transport against the join credentials in
-        ``response`` and wire ``callbacks`` for inbound frames and lifecycle.
+        """Bring up the media transport against what the session start
+        answered and wire ``callbacks`` for inbound frames and lifecycle.
         Returns once the transport is live; server frames then flow through
         ``callbacks.on_frame``. Raises on join failure."""
+        ...
+
+    def create_mic_source(self, capture: Optional[MicrophoneCapture]) -> MicSource:
+        """Build a capture source for the default input device, applying
+        ``capture``'s processor policy as far as this transport can. The
+        caller starts it, publishes its ``audio_source``, and stops it."""
         ...
 
     def is_connected(self) -> bool:
@@ -116,7 +180,7 @@ class Transport(Protocol):
 
     async def send_frame(self, payload: bytes) -> None:
         """Publish one serialized wire frame to the room's reliable data
-        channel. Raises :class:`~cosmo_ai.errors.NotConnectedError` when
+        channel. Raises :class:`~cosmo_ai.errors.SessionStateError` when
         the transport is not connected."""
         ...
 
@@ -130,7 +194,7 @@ class Transport(Protocol):
         the session speaks, on the shared data channel; this carries an
         out-of-band binary payload (a screen capture) large enough to warrant a
         stream and private enough to warrant explicit destinations. Raises
-        :class:`~cosmo_ai.errors.NotConnectedError` when the transport is not
+        :class:`~cosmo_ai.errors.SessionStateError` when the transport is not
         connected or no agent is present to receive it. Mirrors the sibling
         SDKs' ``sendBytes``."""
         ...
@@ -151,7 +215,7 @@ class Transport(Protocol):
         """Publish ``source`` (an opaque, caller-owned audio source) as the mic
         track and return an opaque publication handle for
         :meth:`unpublish_track`. Raises
-        :class:`~cosmo_ai.errors.NotConnectedError` when not connected."""
+        :class:`~cosmo_ai.errors.SessionStateError` when not connected."""
         ...
 
     async def unpublish_track(self, publication: Any) -> None:
@@ -188,7 +252,7 @@ class Transport(Protocol):
         """Create a non-screen video track (a camera, a file, any pixels-only
         source) and return its stream id. Same deferred-publish contract as
         :meth:`start_screen_share`. Raises
-        :class:`~cosmo_ai.errors.VideoPublishAlreadyActiveError` while any
+        :class:`~cosmo_ai.errors.SessionStateError` while any
         video publish — stream or share — is live."""
         ...
 

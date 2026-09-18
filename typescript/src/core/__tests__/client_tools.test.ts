@@ -6,7 +6,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { RpcInvocation } from '../../transport/types';
-import type { RealtimeTool } from '../agent';
+import type { AgentToolPayload } from '../agent';
 import {
   MAX_REPLY_BYTES,
   TRUNCATION_MARKER_KEY,
@@ -37,7 +37,7 @@ function makeRegistrar() {
     invoke(
       name: string,
       payload: string,
-      opts: { callerIsAgent?: boolean } = {},
+      opts: { callerIsAgent?: boolean; signal?: AbortSignal } = {},
     ): Promise<string> {
       const handler = methods.get(name);
       if (handler === undefined) throw new Error(`no rpc method ${name}`);
@@ -45,6 +45,7 @@ function makeRegistrar() {
         payload,
         callerIdentity: 'agent:sess-1',
         callerIsAgent: opts.callerIsAgent ?? true,
+        signal: opts.signal,
       });
     },
     methods,
@@ -52,7 +53,7 @@ function makeRegistrar() {
 }
 
 function registerOne(
-  tool: RealtimeTool,
+  tool: AgentToolPayload,
   opts: { hooks?: HookEngine; sessionId?: string | null } = {},
 ) {
   const registrar = makeRegistrar();
@@ -100,6 +101,42 @@ describe('plain client-tool dispatch', () => {
     const reply = await registrar.invoke('t', '');
     expect(seen).toEqual([{}]);
     expect(JSON.parse(reply)).toEqual({ ok: true, result: null, error: null });
+  });
+
+  it('passes RPC cancellation to the client-tool handler', async () => {
+    const controller = new AbortController();
+    let received: AbortSignal | undefined;
+    const registrar = registerOne({
+      kind: 'client',
+      name: 't',
+      description: 'd',
+      parameters: {},
+      handler: async (
+        _args: Record<string, unknown>,
+        signal?: AbortSignal,
+      ) => {
+        received = signal;
+        return null;
+      },
+    });
+    await registrar.invoke('t', '{}', { signal: controller.signal });
+    expect(received).toBe(controller.signal);
+  });
+
+  it('omits cancellation when the transport has no cancellation signal', async () => {
+    let received: AbortSignal | undefined;
+    const registrar = registerOne({
+      kind: 'client',
+      name: 't',
+      description: 'd',
+      parameters: {},
+      handler: async (_args: Record<string, unknown>, signal?: AbortSignal) => {
+        received = signal;
+        return null;
+      },
+    });
+    await registrar.invoke('t', '{}');
+    expect(received).toBeUndefined();
   });
 
   it('maps a handler throw to an error envelope', async () => {
@@ -314,10 +351,9 @@ describe('caller guard', () => {
 });
 
 describe('registration', () => {
-  it('registers only client tools that carry a handler', () => {
+  it('registers every client tool and passes server-tool opt-ins over', () => {
     const registrar = makeRegistrar();
     registerClientToolHandlers(registrar, [
-      { kind: 'client', name: 'declared_only', description: 'd', parameters: {} },
       {
         kind: 'client',
         name: 'runnable',
@@ -329,12 +365,13 @@ describe('registration', () => {
       {
         kind: 'client',
         background: true,
-        name: 'bg_declared_only',
+        name: 'bg_runnable',
         description: 'd',
         parameters: {},
+        handler: async () => {},
       },
     ]);
-    expect([...registrar.methods.keys()]).toEqual(['runnable']);
+    expect([...registrar.methods.keys()]).toEqual(['runnable', 'bg_runnable']);
   });
 
   it('the returned disposer unregisters every installed method', () => {

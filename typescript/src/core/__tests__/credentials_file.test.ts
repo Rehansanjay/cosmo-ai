@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { CredentialError } from '../auth';
+import { CredentialsError } from '../auth';
 import { resolveCredentialFromRuntime } from '../credentials_file';
 import { RealtimeClient } from '../realtime_client';
 
@@ -72,15 +72,26 @@ describe('resolveCredentialFromRuntime', () => {
     });
   });
 
-  it('returns null (credential-less mode) when nothing resolves', async () => {
+  it('throws no_credential naming every remedy when nothing resolves', async () => {
     process.env.COSMO_CREDENTIALS_FILE = join(dir, 'does-not-exist');
-    await expect(resolveCredentialFromRuntime()).resolves.toBeNull();
+    let thrown: unknown;
+    try {
+      await resolveCredentialFromRuntime();
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(CredentialsError);
+    expect((thrown as CredentialsError).code).toBe('no_credential');
+    for (const remedy of ['apiKey or token', 'COSMO_API_KEY', 'cosmo login']) {
+      expect((thrown as CredentialsError).message).toContain(remedy);
+    }
+    expect((thrown as CredentialsError).message).toContain(join(dir, 'does-not-exist'));
   });
 
   it('still throws on an unusable file — the user set up file auth', async () => {
     process.env.COSMO_CREDENTIALS_FILE = writeCredentials('version = 99\n');
     await expect(resolveCredentialFromRuntime()).rejects.toMatchObject({
-      name: 'CredentialError',
+      name: 'CredentialsError',
       code: 'file_invalid',
     });
   });
@@ -95,9 +106,9 @@ describe('resolveCredentialFromRuntime', () => {
     } catch (err) {
       thrown = err;
     }
-    expect(thrown).toBeInstanceOf(CredentialError);
-    expect((thrown as CredentialError).code).toBe('expired');
-    expect((thrown as CredentialError).message).toContain('cosmo login');
+    expect(thrown).toBeInstanceOf(CredentialsError);
+    expect((thrown as CredentialsError).code).toBe('expired');
+    expect((thrown as CredentialsError).message).toContain('cosmo login');
   });
 });
 
@@ -150,13 +161,28 @@ describe('RealtimeClient zero-argument construction', () => {
     expect(auth).toBe('Bearer cosmo_env_key');
   });
 
-  it('with nothing to resolve, mintToken still fails with no_api_key', async () => {
+  it('with nothing to resolve, the first authenticated call throws before any request', async () => {
     process.env.COSMO_CREDENTIALS_FILE = join(dir, 'does-not-exist');
     const client = new RealtimeClient({});
-    await expect(client.mintToken('user-1')).rejects.toMatchObject({
-      name: 'MintTokenError',
-      code: 'no_api_key',
-    });
+    const originalFetch = globalThis.fetch;
+    const seen: string[] = [];
+    globalThis.fetch = (async (url: RequestInfo | URL) => {
+      seen.push(String(url));
+      return new Response('{}', { status: 200 });
+    }) as typeof fetch;
+    try {
+      await expect(client.verify()).rejects.toMatchObject({
+        name: 'CredentialsError',
+        code: 'no_credential',
+      });
+      await expect(client.mintToken('user-1')).rejects.toMatchObject({
+        name: 'CredentialsError',
+        code: 'no_credential',
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    expect(seen).toEqual([]);
   });
 
   it('an explicit credential skips resolution entirely', async () => {

@@ -9,9 +9,8 @@ import json
 from typing import Any
 
 import pytest
-from cosmo_ai import WebSearchTool
+from cosmo_ai._internal.protocol import ClientTool, WebSearchTool
 from cosmo_ai.tools._dispatch import _invoke_handler
-from cosmo_ai.tools import ClientTool
 from cosmo_ai._internal.rpc import (
     MAX_REPLY_BYTES,
     TRUNCATION_MARKER_KEY,

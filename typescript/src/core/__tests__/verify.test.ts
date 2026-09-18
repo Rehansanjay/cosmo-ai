@@ -142,14 +142,15 @@ describe('RealtimeClient.verify', () => {
     const err = await client.verify().catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(VerifyError);
-    expect((err as VerifyError).code).toBe('auth_failed');
+    expect((err as VerifyError).code).toBe('request_rejected');
+    expect((err as VerifyError).serverCode).toBe('auth_failed');
   });
 
   it('maps a network failure to transport_error', async () => {
     fetchMock.mockRejectedValue(new TypeError('Failed to fetch'));
     const client = new RealtimeClient({ apiKey: 'sk-secret' });
 
-    await expect(client.verify()).rejects.toMatchObject({ code: 'transport_error' });
+    await expect(client.verify()).rejects.toMatchObject({ code: 'request_failed' });
   });
 
   it.each([

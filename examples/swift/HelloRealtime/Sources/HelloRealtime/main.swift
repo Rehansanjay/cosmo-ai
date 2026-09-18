@@ -7,7 +7,28 @@ struct WeatherArgs: Decodable, Sendable {
     enum Unit: String, Decodable, Sendable { case c, f }
 }
 
-let getWeather = try AgentTool.define(
+enum ExampleConfigurationError: LocalizedError {
+    case invalidTransport(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidTransport(let value):
+            return "COSMO_TRANSPORT must be livekit or websocket, not \(value)"
+        }
+    }
+}
+
+func resolveTransport(
+    environment: [String: String]
+) throws -> RealtimeClient.Transport {
+    let value = environment["COSMO_TRANSPORT"]?.lowercased() ?? "livekit"
+    guard let transport = RealtimeClient.Transport(rawValue: value) else {
+        throw ExampleConfigurationError.invalidTransport(value)
+    }
+    return transport
+}
+
+let getWeather = try AgentTool.clientTool(
     name: "get_weather",
     description: "Current weather for a city",
     input: .object(
@@ -23,12 +44,12 @@ let getWeather = try AgentTool.define(
     return ["temp": .double(unit == .c ? 21.5 : 70.7), "unit": .string(unit.rawValue)]
 }
 
-// A client holds the credential and the endpoint; an agent is the persona
-// configured on top of it. `start` opens one run: REST session-start + LiveKit
-// join, publishing the mic during the join. The external protocol scopes the
-// project from the API key server-side, so there is no project_id to pass here.
-print("Connecting…")
-let client = try RealtimeClient()
+// A client holds the credential, endpoint and transport; an agent is the
+// persona configured on top of it. The external protocol scopes the project
+// from the API key server-side, so there is no project_id to pass here.
+let transport = try resolveTransport(environment: ProcessInfo.processInfo.environment)
+print("Connecting via \(transport.rawValue)…")
+let client = try RealtimeClient(transport: transport)
 let agent = try client.agent(tools: [getWeather])
 let session = try await agent.start()
 

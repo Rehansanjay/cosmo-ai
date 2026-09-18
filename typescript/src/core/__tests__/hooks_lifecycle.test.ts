@@ -5,6 +5,10 @@
  *  ``tests/test_hooks_integration.py`` is the cross-SDK reference. */
 
 import { describe, expect, it, vi } from 'vitest';
+import {
+  sessionStartErrorFrom,
+  sessionStartRejectionFrom,
+} from '../../transport/session_start_error';
 import { TextEncoder as NodeTextEncoder, TextDecoder as NodeTextDecoder } from 'util';
 
 if (typeof global.TextEncoder === 'undefined') {
@@ -40,7 +44,7 @@ function flushMicrotasks(): Promise<void> {
 describe('SessionStart', () => {
   it('appends the hook context to the sent instructions', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     const hooks: Hook[] = [];
     hooks.push(sessionStart(() => ({ additionalContext: 'Caller is a VIP.' })));
 
@@ -53,7 +57,7 @@ describe('SessionStart', () => {
 
   it('becomes the sole instructions when the agent sets none', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     const hooks: Hook[] = [];
     hooks.push(sessionStart(() => ({ additionalContext: 'Context only.' })));
 
@@ -64,7 +68,7 @@ describe('SessionStart', () => {
 
   it('is not injected into a catalog agent — the stored config runs verbatim', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     const hooks: Hook[] = [];
     hooks.push(sessionStart(() => ({ additionalContext: 'Caller is a VIP.' })));
 
@@ -77,7 +81,7 @@ describe('SessionStart', () => {
 
   it('leaves the config untouched when no hook contributes context', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     const hooks: Hook[] = [];
     hooks.push(sessionStart(() => undefined));
 
@@ -88,7 +92,7 @@ describe('SessionStart', () => {
 
   it('fires SessionEnd once and rejects with session_start_hook_failed when the fold throws', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     const hooks: Hook[] = [];
     const stops: SessionEndContext[] = [];
     hooks.push(sessionEnd((ctx) => {
@@ -106,7 +110,7 @@ describe('SessionStart', () => {
 
     await expect(client.agent({ hooks }).start()).rejects.toMatchObject({
       name: 'SessionStartError',
-      detail: { code: 'session_start_hook_failed', message: 'fold exploded' },
+      detail: sessionStartRejectionFrom({ code: 'session_start_hook_failed', message: 'fold exploded' }),
     });
 
     expect(stops).toEqual([
@@ -118,7 +122,7 @@ describe('SessionStart', () => {
 describe('unified hooks list', () => {
   it('carries client hooks and server hooks in one list', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     const silence = {
       trigger: 'user.speech.timeout' as const,
       timeout_seconds: 45,
@@ -135,7 +139,7 @@ describe('unified hooks list', () => {
   });
 
   it('rejects a list element that is neither kind at agent build', () => {
-    const client = new RealtimeClient({ transportFactory: () => makeFakeTransport() });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => makeFakeTransport() });
     expect(() => client.agent({ hooks: [{ nonsense: true } as never] })).toThrow(
       /seam-factory Hooks or server hooks/,
     );
@@ -145,7 +149,7 @@ describe('unified hooks list', () => {
 describe('SessionEnd', () => {
   it('fires once with client_ended on a normal disconnect, even when ended twice', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     const hooks: Hook[] = [];
     const stops: SessionEndContext[] = [];
     hooks.push(sessionEnd((ctx) => {
@@ -163,12 +167,12 @@ describe('SessionEnd', () => {
 
   it('fires with handshake_failed when the session-start POST is rejected', async () => {
     const fake = makeFakeTransport({
-      connectError: new SessionStartError(422, 'Unprocessable', {
+      connectError: sessionStartErrorFrom(422, 'Unprocessable', sessionStartRejectionFrom({
         code: 'model_unavailable',
         message: 'no such model',
-      }),
+      })),
     });
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     const hooks: Hook[] = [];
     const stops: SessionEndContext[] = [];
     hooks.push(sessionEnd((ctx) => {
@@ -184,7 +188,7 @@ describe('SessionEnd', () => {
 
   it('fires with transport_error when the transport fails to connect', async () => {
     const fake = makeFakeTransport({ connectError: new Error('ice failed') });
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     const hooks: Hook[] = [];
     const stops: SessionEndContext[] = [];
     hooks.push(sessionEnd((ctx) => {
@@ -199,7 +203,7 @@ describe('SessionEnd', () => {
 
   it('fires with transport_error on an unsolicited transport close', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     const hooks: Hook[] = [];
     const stops: SessionEndContext[] = [];
     hooks.push(sessionEnd((ctx) => {
@@ -218,7 +222,7 @@ describe('SessionEnd', () => {
 
   it('completes an async SessionEnd hook before the terminal lifecycle publish on an unsolicited close', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     const hooks: Hook[] = [];
     const order: string[] = [];
     hooks.push(sessionEnd(async () => {
@@ -239,7 +243,7 @@ describe('SessionEnd', () => {
 
   it('fires with server_ended after a session-ended frame and the close that follows', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     const hooks: Hook[] = [];
     const stops: SessionEndContext[] = [];
     hooks.push(sessionEnd((ctx) => {
@@ -263,7 +267,7 @@ describe('SessionEnd', () => {
 
   it('fires with server_ended and a normalized detail on a bare deliberate server close', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     const hooks: Hook[] = [];
     const stops: SessionEndContext[] = [];
     hooks.push(sessionEnd((ctx) => {
@@ -287,9 +291,27 @@ describe('SessionEnd', () => {
     expect(lifecycles).toEqual(['server_ended:ROOM_DELETED']);
   });
 
+  it('fires with server_ended on a clean socket close without a session-ended frame', async () => {
+    const fake = makeFakeTransport();
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
+    const hooks: Hook[] = [];
+    const stops: SessionEndContext[] = [];
+    hooks.push(sessionEnd((ctx) => {
+      stops.push(ctx);
+    }));
+
+    await client.agent({ hooks }).start();
+    fake.emitClose({ code: '1000', reason: 'socket closed', serverEnded: true });
+    await flushMicrotasks();
+
+    expect(stops).toEqual([
+      { event: 'SessionEnd', reason: 'server_ended', detail: 'socket closed', sessionId: 'sess-fake' },
+    ]);
+  });
+
   it('close() fires client_closed and skips the wire end frame', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     const hooks: Hook[] = [];
     const stops: SessionEndContext[] = [];
     hooks.push(sessionEnd((ctx) => {
@@ -307,7 +329,7 @@ describe('SessionEnd', () => {
 
   it('end() still requests the graceful wire end frame', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
 
     const session = await client.agent({}).start();
     await session.end();
@@ -319,7 +341,7 @@ describe('SessionEnd', () => {
 describe('user-speech-timeout', () => {
   it('reaches the client as an event, not a hook seam', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     const events: unknown[] = [];
 
     const session = await client.agent({}).start();

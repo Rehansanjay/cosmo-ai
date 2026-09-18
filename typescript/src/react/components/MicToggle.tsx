@@ -5,12 +5,18 @@ import { useCallback } from 'react';
 import { useMediaState, useTransportState } from '../hooks';
 import { useRealtimeSessionContext } from '../RealtimeProvider';
 
+/** Props for ``<MicToggle />``. */
 export type MicToggleProps = {
   /** Optional className forwarded to the root ``<button>``. */
   className?: string;
   /** Override the rendered text. When omitted the button shows
    *  "Mute" / "Unmute" so the component stays usable with zero styling. */
-  label?: { muted: string; unmuted: string };
+  label?: {
+    /** Shown while the mic is muted — the label for unmuting. */
+    muted: string;
+    /** Shown while the mic is live — the label for muting. */
+    unmuted: string;
+  };
   /** Called when ``setMicMuted`` rejects (transport failure, session
    *  not ready). The SDK has already rolled back its optimistic
    *  state by the time this fires — use it to surface a toast or

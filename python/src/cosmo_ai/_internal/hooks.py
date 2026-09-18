@@ -26,7 +26,8 @@ Declare a hook with the seam's decorator — the decorated name becomes a
     agent = client.agent(..., hooks=[add_context, block_deletes])
 
 Observer-grade by default; the two client-controlled seams honor overrides —
-``SessionStart`` may inject ``additional_context`` into the instructions and
+``SessionStart`` may inject ``additional_context`` into an inline agent's
+instructions (a catalog agent drops it) and
 ``PreToolUse`` may deny or rewrite a local client-tool call. A throwing hook is
 isolated and never breaks the session. A malformed matcher raises at
 decoration, not at session start.
@@ -46,6 +47,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, Union, over
 import structlog
 
 from cosmo_ai._internal.logging import get_logger
+from cosmo_ai.errors import HookError, HookErrorCode
 from cosmo_ai._internal.protocol import ServerHook
 
 if TYPE_CHECKING:
@@ -60,12 +62,29 @@ class DisconnectReason(str, Enum):
     ``session`` facade re-exports it."""
 
     CLIENT_ENDED = "client_ended"
+    """This side called :meth:`RealtimeSession.end` — a graceful end that
+    told the server to tear down."""
     CLIENT_CLOSED = "client_closed"
+    """This side dropped the local half without telling the server — either
+    :meth:`RealtimeSession.close`, or a start that was cancelled before it
+    finished."""
     HANDSHAKE_FAILED = "handshake_failed"
+    """The start was refused rather than dropped — the server rejected the
+    session-start request, or a local pre-flight check did."""
     SERVER_ENDED = "server_ended"
+    """The server ended it — a duration or silence cap, or its own teardown."""
     TRANSPORT_ERROR = "transport_error"
+    """The media connection failed — either it dropped underneath a live
+    session, or the join never succeeded and the start raised. Do not read
+    ``session_id`` as the discriminator between the two: a prepared start
+    can already hold one when its join fails."""
 
 HookEventName = Literal["SessionStart", "PreToolUse", "PostToolUse", "SessionEnd"]
+"""The four points a hook can run at, and the name a hook registers under.
+``SessionStart`` and ``SessionEnd`` bracket the session; ``PreToolUse`` can
+deny or rewrite a tool call before it runs, and ``PostToolUse`` observes the
+outcome after. The same four names, spelled identically, exist in every Cosmo
+SDK."""
 
 # A hook runs in-process on the session's hot path (SessionStart blocks session
 # establishment; PreToolUse/PostToolUse are awaited inline in the tool-call RPC
@@ -81,19 +100,26 @@ _SLOW_HOOK_WARN_THRESHOLD_S = 0.2
 @dataclass(frozen=True)
 class ToolOk:
     result: dict[str, Any] | None
+    """What the handler returned, or ``None`` if it returned nothing."""
 
 
 @dataclass(frozen=True)
 class ToolError:
     message: str
+    """The exception text from the handler that raised."""
 
 
 @dataclass(frozen=True)
 class ToolDenied:
     reason: str
+    """Why a ``PreToolUse`` hook refused the call. The handler never ran."""
 
 
 ToolOutcome = Union[ToolOk, ToolError, ToolDenied]
+"""How a tool call finished, as ``PostToolUse`` sees it: :class:`ToolOk` with
+the handler's result, :class:`ToolError` when the handler raised, or
+:class:`ToolDenied` when a ``PreToolUse`` hook refused it and the handler never
+ran. Match on the class — a denial is not an error."""
 
 
 # ── Per-event contexts ─────────────────────────────────────────────────
@@ -104,31 +130,47 @@ class SessionStartContext:
     # session_id does not exist until the handshake completes; read ReadyEvent
     # off the event stream for the started id.
     event: Literal["SessionStart"] = "SessionStart"
+    """Names the seam, so one callback can serve several events."""
 
 
 @dataclass(frozen=True)
 class PreToolUseContext:
     tool_name: str
+    """The tool about to run — what a ``matcher`` is tested against."""
     arguments: "MappingProxyType[str, Any]"  # read-only; rewrite via PreToolUseResult
+    """The model's arguments, read-only. Rewrite them by returning
+    :attr:`PreToolUseResult.updated_arguments`, not by mutating this."""
     session_id: str
+    """The session the call belongs to."""
     event: Literal["PreToolUse"] = "PreToolUse"
+    """Names the seam, so one callback can serve several events."""
 
 
 @dataclass(frozen=True)
 class PostToolUseContext:
     tool_name: str
+    """The tool that ran."""
     arguments: dict[str, Any]
+    """The arguments it ran with, after any ``PreToolUse`` rewrite."""
     outcome: ToolOutcome
+    """How it finished — match on the class; a denial is not an error."""
     session_id: str
+    """The session the call belonged to."""
     event: Literal["PostToolUse"] = "PostToolUse"
+    """Names the seam, so one callback can serve several events."""
 
 
 @dataclass(frozen=True)
 class SessionEndContext:
     reason: DisconnectReason
+    """Why the session ended — who ended it, and whether cleanly."""
     detail: str | None
+    """Extra context on the ending when the server or transport supplied
+    any."""
     session_id: str | None
+    """The session that ended, or ``None`` if it never became live."""
     event: Literal["SessionEnd"] = "SessionEnd"
+    """Names the seam, so one callback can serve several events."""
 
 
 HookContext = Union[
@@ -145,13 +187,25 @@ HookContext = Union[
 @dataclass(frozen=True)
 class SessionStartResult:
     additional_context: str | None = None
+    """Text to add to the model's instructions before the session opens.
+    Several hooks returning context are concatenated in registration order.
+
+    Applies to an inline agent only. A catalog agent runs its stored config
+    verbatim, so context returned here is dropped with a warning rather than
+    injected."""
 
 
 @dataclass(frozen=True)
 class PreToolUseResult:
     permission: Literal["allow", "deny"] | None = None
+    """``"deny"`` blocks the call; ``"allow"`` states no objection. ``None``
+    abstains and leaves the decision to the other hooks. Any deny wins."""
     reason: str | None = None
+    """Why it was denied — surfaced to the model so it can say something
+    useful instead of retrying blindly."""
     updated_arguments: dict[str, Any] | None = None
+    """Replacement arguments for the call. ``None`` leaves them untouched;
+    the last hook to rewrite wins."""
 
 
 @dataclass(frozen=True)
@@ -173,8 +227,14 @@ class Hook:
     ``hooks=[...]`` — list order is fold order."""
 
     event: HookEventName
+    """Which seam this hook fires on."""
     callback: HookCallback
+    """What runs. It receives that event's context object and may be sync or
+    async; it runs inline on the session's hot path, so keep it quick."""
     matcher: str | None = None
+    """Which tools it applies to, for the tool-use events — a pattern tested
+    against ``tool_name``. ``None`` matches every tool, and the field is
+    meaningless on the session events."""
 
 
 def tool_name_matches(tool_name: str, pattern: str) -> bool:
@@ -207,8 +267,10 @@ def _validate_matcher(pattern: str) -> None:
             while j < n and pattern[j] != "]":
                 j += 1
             if j >= n:
-                raise ValueError(
-                    f"malformed hook matcher {pattern!r}: unterminated '[' at index {i}"
+                raise HookError(
+                    code=HookErrorCode.MALFORMED_MATCHER,
+                    message=f"malformed hook matcher {pattern!r}: "
+                    f"unterminated '[' at index {i}",
                 )
             i = j + 1
         else:
@@ -234,7 +296,8 @@ def session_start(fn: HookCallback) -> Hook: ...
 def session_start(fn: None = None) -> Callable[[HookCallback], Hook]: ...
 def session_start(fn: HookCallback | None = None) -> Any:
     """Declare a ``SessionStart`` hook — may return a
-    :class:`SessionStartResult` to inject ``additional_context``."""
+    :class:`SessionStartResult` to inject ``additional_context`` into an
+    inline agent's instructions. A catalog agent drops it."""
     return _seam("SessionStart", fn)
 
 
@@ -285,15 +348,17 @@ def resolve_hooks(
     for hook in hooks:
         if isinstance(hook, ServerHook):
             if not server_allowed:
-                raise TypeError(
-                    "a catalog agent runs its stored config verbatim — "
-                    "server hooks cannot ride along"
+                raise HookError(
+                    code=HookErrorCode.SERVER_HOOK_NOT_ALLOWED,
+                    message="a catalog agent runs its stored config verbatim — "
+                    "server hooks cannot ride along",
                 )
         elif not isinstance(hook, Hook):
-            raise TypeError(
-                "hooks elements must be Hook (declare with the seam "
+            raise HookError(
+                code=HookErrorCode.INVALID_HOOK,
+                message="hooks elements must be Hook (declare with the seam "
                 "decorators) or a server hook such as SilenceTimeout, "
-                f"got {type(hook).__name__}"
+                f"got {type(hook).__name__}",
             )
     return tuple(hooks)
 

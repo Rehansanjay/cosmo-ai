@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 import structlog
 
@@ -327,16 +327,21 @@ def make_rpc_handler(
     *,
     background: bool = False,
     hooks: HookEngine | None = None,
-    session_id: str | None = None,
+    session_id: str | Callable[[], str | None] | None = None,
     job_sink: ClientToolJobSink | None = None,
 ) -> RpcHandler:
     """Build the RPC method for one client tool: caller-guard, then decode →
     run → envelope. A ``background`` tool (a :class:`BackgroundClientTool`) is
     driven through the deferred path when a ``job_sink`` is available. Returns an
-    async ``(RpcInvocation) -> str`` for :meth:`Transport.register_rpc_method`."""
+    async ``(RpcInvocation) -> str`` for :meth:`Transport.register_rpc_method`.
+
+    ``session_id`` may be a resolver: the prepared start registers before its
+    session-start POST mints the id, so it is read per invocation — by the
+    time an agent can invoke a tool, the id exists."""
 
     async def rpc_method(invocation: RpcInvocation) -> str:
         ensure_agent_caller(invocation, method_name=tool_name)
+        sid = session_id() if callable(session_id) else session_id
         if background:
             if job_sink is None:
                 logger.error(
@@ -352,14 +357,14 @@ def make_rpc_handler(
                 tool_name=tool_name,
                 sink=job_sink,
                 hooks=hooks,
-                session_id=session_id,
+                session_id=sid,
             )
         return await _invoke_handler(
             handler,  # type: ignore[arg-type]
             invocation.payload,
             tool_name=tool_name,
             hooks=hooks,
-            session_id=session_id,
+            session_id=sid,
         )
 
     return rpc_method
@@ -370,7 +375,7 @@ def register_client_tool_handlers(
     tools: list[ClientTool],
     *,
     hooks: HookEngine | None = None,
-    session_id: str | None = None,
+    session_id: str | Callable[[], str | None] | None = None,
     job_sink: ClientToolJobSink | None = None,
 ) -> None:
     """Register one RPC method per client tool.

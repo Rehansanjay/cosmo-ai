@@ -20,7 +20,8 @@ from cosmo_ai._internal.hooks import (
     post_tool_use,
 )
 from cosmo_ai.tools._jobs import ClientToolJobSink
-from cosmo_ai.tools import BackgroundClientTool, ClientTool, ClientToolJob
+from cosmo_ai._internal.protocol import BackgroundClientTool, ClientTool
+from cosmo_ai.tools import ClientToolJob
 from cosmo_ai.tools._dispatch import (
     make_rpc_handler,
     register_client_tool_handlers,

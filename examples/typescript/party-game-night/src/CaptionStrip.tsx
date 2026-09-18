@@ -1,4 +1,4 @@
-import { useTranscript } from 'cosmo-ai';
+import { useTranscript } from 'cosmo-ai/react';
 
 // A turn is one transcript item however long it runs; keep the most recent
 // words, which are the ones being spoken now.

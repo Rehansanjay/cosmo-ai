@@ -1,4 +1,5 @@
 import type { AgentConfig } from 'cosmo-ai';
+import { detectObjectsTool, pointAtObjectTool } from 'cosmo-ai';
 
 import { DRAW_TOOLS } from './draw/draw_tools';
 import { INSTRUCTIONS, VOICE } from './persona';
@@ -20,7 +21,7 @@ export function gardenDoctorAgent(): AgentConfig {
     voice: VOICE,
     // Nothing here reads thought summaries, and leaving them on costs tokens
     // ahead of the answer.
-    modelOptions: { provider: 'gemini', includeThoughts: false },
-    tools: [{ kind: 'detect_objects' }, { kind: 'point_at_object' }, ...DRAW_TOOLS],
+    model: { provider: 'gemini', includeThoughts: false },
+    tools: [detectObjectsTool(), pointAtObjectTool(), ...DRAW_TOOLS],
   };
 }

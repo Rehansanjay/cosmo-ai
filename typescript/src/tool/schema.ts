@@ -4,7 +4,7 @@
  * ``type: "object"``, depth ≤ 6, ≤ 64 properties total). The TS port of the
  * reference SDK's strict builder pipeline (``_internal/schema.py``): inline
  * refs, silently drop only what doesn't change what the model should
- * produce, and throw {@link ToolSchemaError} at construction for anything
+ * produce, and throw {@link ToolDefinitionError} at construction for anything
  * the dialect cannot express — otherwise the model would keep producing
  * args that bounce at runtime.
  *
@@ -14,7 +14,7 @@
  * ``client-tool-schema-vectors.json``.
  */
 
-import { ToolSchemaError } from './errors';
+import { ToolDefinitionError } from './errors';
 
 const SCHEMA_ALLOWED_KEYS = new Set([
   'type',
@@ -55,9 +55,9 @@ const PROMPT_FENCE_RE = /^[ \t]*-{3,}.*$/m;
 /** First sanitization violation in ``value``, or ``null`` if clean. */
 export function textViolation(
   value: string,
-  opts: { allowNewlines: boolean },
+  options: { allowNewlines: boolean },
 ): string | null {
-  const controlRe = opts.allowNewlines
+  const controlRe = options.allowNewlines
     ? CONTROL_CHARS_EXCEPT_NEWLINE_RE
     : CONTROL_CHARS_RE;
   if (controlRe.test(value)) return 'contains a control character';
@@ -96,13 +96,13 @@ function inlineRefs(schema: Record<string, unknown>, toolName: string): unknown 
       delete out.$ref;
       const defName = ref.startsWith('#/$defs/') ? ref.slice('#/$defs/'.length) : ref;
       if (defName === ref || !(defName in defs)) {
-        throw new ToolSchemaError({
+        throw new ToolDefinitionError({
           code: 'forbidden_key',
           message: `${toolName}: unresolvable $ref '${ref}'`,
         });
       }
       if (stack.includes(defName)) {
-        throw new ToolSchemaError({
+        throw new ToolDefinitionError({
           code: 'recursive_schema',
           message:
             `${toolName}: recursive schema '${defName}' cannot be expressed ` +
@@ -139,7 +139,7 @@ function normalizeNode(node: unknown, toolName: string): unknown {
         value === false
           ? "'additionalProperties: false' (a strict/extra-forbid schema)"
           : "schema-valued 'additionalProperties' (a map type)";
-      throw new ToolSchemaError({
+      throw new ToolDefinitionError({
         code: 'additional_properties_forbidden',
         message:
           `${toolName}: ${detail} cannot be expressed in the tool-schema ` +
@@ -175,24 +175,24 @@ function isScalar(value: unknown): boolean {
 
 function checkNode(
   node: unknown,
-  opts: { depth: number; counts: { properties: number }; toolName: string },
+  options: { depth: number; counts: { properties: number }; toolName: string },
 ): void {
-  const { depth, counts, toolName } = opts;
+  const { depth, counts, toolName } = options;
   if (depth > SCHEMA_MAX_DEPTH) {
-    throw new ToolSchemaError({
+    throw new ToolDefinitionError({
       code: 'max_depth_exceeded',
       message: `${toolName}: schema nesting exceeds depth ${SCHEMA_MAX_DEPTH}`,
     });
   }
   if (!isRecord(node)) {
-    throw new ToolSchemaError({
+    throw new ToolDefinitionError({
       code: 'node_not_object',
       message: `${toolName}: schema node is not an object`,
     });
   }
   for (const [key, value] of Object.entries(node)) {
     if (!SCHEMA_ALLOWED_KEYS.has(key)) {
-      throw new ToolSchemaError({
+      throw new ToolDefinitionError({
         code: 'forbidden_key',
         message:
           `${toolName}: schema key '${key}' is not in the restricted ` +
@@ -201,56 +201,56 @@ function checkNode(
     }
     if (key === 'type') {
       if (typeof value !== 'string' || !SCHEMA_ALLOWED_TYPES.has(value)) {
-        throw new ToolSchemaError({
+        throw new ToolDefinitionError({
           code: 'forbidden_type',
           message: `${toolName}: schema type '${String(value)}' is not allowed`,
         });
       }
     } else if (key === 'description') {
       if (typeof value !== 'string') {
-        throw new ToolSchemaError({
+        throw new ToolDefinitionError({
           code: 'invalid_text',
           message: `${toolName}: schema description is not a string`,
         });
       }
       const reason = textViolation(value, { allowNewlines: true });
       if (reason !== null) {
-        throw new ToolSchemaError({
+        throw new ToolDefinitionError({
           code: 'invalid_text',
           message: `${toolName}: schema description ${reason}`,
         });
       }
     } else if (key === 'required') {
       if (!Array.isArray(value) || !value.every((item) => typeof item === 'string')) {
-        throw new ToolSchemaError({
+        throw new ToolDefinitionError({
           code: 'invalid_required',
           message: `${toolName}: schema 'required' is not a list of strings`,
         });
       }
     } else if (key === 'enum') {
       if (!Array.isArray(value) || !value.every(isScalar)) {
-        throw new ToolSchemaError({
+        throw new ToolDefinitionError({
           code: 'invalid_enum',
           message: `${toolName}: schema 'enum' is not a list of scalars`,
         });
       }
     } else if (key === 'properties') {
       if (!isRecord(value)) {
-        throw new ToolSchemaError({
+        throw new ToolDefinitionError({
           code: 'invalid_properties',
           message: `${toolName}: schema 'properties' is not an object`,
         });
       }
       counts.properties += Object.keys(value).length;
       if (counts.properties > SCHEMA_MAX_PROPERTIES) {
-        throw new ToolSchemaError({
+        throw new ToolDefinitionError({
           code: 'max_properties_exceeded',
           message: `${toolName}: schema exceeds ${SCHEMA_MAX_PROPERTIES} properties`,
         });
       }
       for (const [propName, propSchema] of Object.entries(value)) {
         if (textViolation(propName, { allowNewlines: false }) !== null) {
-          throw new ToolSchemaError({
+          throw new ToolDefinitionError({
             code: 'invalid_text',
             message: `${toolName}: schema property name is not a clean string`,
           });
@@ -261,7 +261,7 @@ function checkNode(
       checkNode(value, { depth: depth + 1, counts, toolName });
     } else if (key === 'anyOf') {
       if (!Array.isArray(value)) {
-        throw new ToolSchemaError({
+        throw new ToolDefinitionError({
           code: 'invalid_any_of',
           message: `${toolName}: schema 'anyOf' is not a list`,
         });
@@ -273,7 +273,7 @@ function checkNode(
       if (typeof value === 'string') {
         const reason = textViolation(value, { allowNewlines: false });
         if (reason !== null) {
-          throw new ToolSchemaError({
+          throw new ToolDefinitionError({
             code: 'invalid_text',
             message: `${toolName}: schema default ${reason}`,
           });
@@ -283,14 +283,14 @@ function checkNode(
         typeof value !== 'boolean' &&
         value !== null
       ) {
-        throw new ToolSchemaError({
+        throw new ToolDefinitionError({
           code: 'invalid_default',
           message: `${toolName}: schema 'default' must be a scalar`,
         });
       }
     } else if (SCHEMA_NUMERIC_KEYS.has(key)) {
       if (typeof value !== 'number') {
-        throw new ToolSchemaError({
+        throw new ToolDefinitionError({
           code: 'invalid_bound',
           message: `${toolName}: schema '${key}' is not a number`,
         });
@@ -299,11 +299,11 @@ function checkNode(
   }
 }
 
-/** Throw {@link ToolSchemaError} unless ``schema`` is a top-level object
+/** Throw {@link ToolDefinitionError} unless ``schema`` is a top-level object
  *  schema entirely within the restricted dialect. */
 export function checkSchemaDialect(schema: unknown, toolName: string): void {
   if (!isRecord(schema) || schema.type !== 'object') {
-    throw new ToolSchemaError({
+    throw new ToolDefinitionError({
       code: 'top_level_not_object',
       message: `${toolName}: parameters must declare top-level type 'object'`,
     });

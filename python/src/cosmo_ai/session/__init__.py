@@ -10,7 +10,7 @@ from cosmo_ai._internal.protocol import SessionStartTimings
 from cosmo_ai.session._engine import (
     RealtimeSession,
     SessionConnectTimings,
-    RealtimeSessionState,
+    SessionState,
     SessionStateKind,
 )
 from cosmo_ai.session._video import VideoStreamHandle
@@ -19,7 +19,7 @@ __all__ = [
     "DisconnectReason",
     "RealtimeSession",
     "SessionConnectTimings",
-    "RealtimeSessionState",
+    "SessionState",
     "SessionStartTimings",
     "SessionStateKind",
     "VideoStreamHandle",

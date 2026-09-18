@@ -16,8 +16,8 @@
  *     const agent = client.agent({
  *       instructions: 'help the user drive their machine',
  *       tools: [
- *         { kind: 'screen_locate', capture: () => grabScreen() },
- *         screenClickElement(({ element, action }) => {
+ *         screenLocateTool(request => grabScreen(request)),
+ *         screenClickElementTool(({ element, action }) => {
  *           if (!canControlTheDesktop()) return notClicked('I need accessibility access');
  *           press(element.frame, action);
  *           return clicked;
@@ -25,7 +25,7 @@
  *       ],
  *     });
  *
- * ``screenHighlightBox`` stands apart: its caller already has coordinates, so
+ * ``screenHighlightBoxTool`` stands apart: its caller already has coordinates, so
  * it skips capture and grounding and draws immediately.
  *
  * Platform-neutral: macOS clicks a mouse, iOS taps, a web client clicks the
@@ -34,17 +34,18 @@
  * ``sdk-client-tool-vectors.json``.
  */
 
-import type { ClientToolSpec } from '../core/agent';
-import { errorMessage } from '../core/client_tools';
+import { mintAgentTool } from '../core/agent';
+import type { AgentTool, ClientTool, ScreenLocateTool } from '../core/agent';
 import { log } from '../core/logger';
-import { bytesToBase64 } from '../transport/envelope';
 
 import { notShown, type NotShown } from './draw';
 import { markSdkClientTool } from './sdk_tool';
+import { captureCache } from './screen_capture_rpc';
 
 /** Which side of the target the tooltip sits on; ``auto`` picks the side with
  *  the most room. */
 export const SCREEN_PLACEMENTS = ['auto', 'top', 'bottom', 'left', 'right'] as const;
+/** One of ``SCREEN_PLACEMENTS``. */
 export type ScreenPlacement = (typeof SCREEN_PLACEMENTS)[number];
 
 /** Which glyph the highlight draws — the action being asked of the user. A
@@ -61,6 +62,7 @@ export const SCREEN_AFFORDANCES = [
   'press_hold',
   'inform',
 ] as const;
+/** One of ``SCREEN_AFFORDANCES``. */
 export type ScreenAffordance = (typeof SCREEN_AFFORDANCES)[number];
 
 /** Which button/gesture to click with: ``left`` is a left click on desktop /
@@ -70,7 +72,9 @@ export type ScreenClickButton = 'left' | 'right';
 /** How to click the located element: which button/gesture, and whether it's a
  *  double. Button and double are orthogonal axes rather than a flat enum. */
 export type ScreenClickAction = {
+  /** Which button or gesture to use. */
   button: ScreenClickButton;
+  /** Whether it is a double click. Orthogonal to ``button``. */
   double: boolean;
 };
 
@@ -78,11 +82,19 @@ export type ScreenClickAction = {
  *  0-based and contiguous within one {@link ScreenCapture}; ``frame`` is
  *  ``[x, y, w, h]`` in the platform's screen coordinates. */
 export type ScreenElement = {
+  /** Position in this capture's element list, 0-based and contiguous. The
+   *  model refers to an element by this. */
   index: number;
+  /** What kind of control it is, in the platform's own vocabulary — e.g.
+   *  ``button``, ``textfield``. */
   role: string;
+  /** ``[x, y, width, height]`` in the platform's screen coordinates. */
   frame: [number, number, number, number];
+  /** Its visible title, when it has one. */
   title?: string;
+  /** Its accessibility label, when it has one. */
   label?: string;
+  /** Its current value — the text in a field, a control's setting. */
   value?: string;
 };
 
@@ -91,8 +103,15 @@ export type ScreenElement = {
  *  at click time to validate freshness (e.g. the frontmost-app identity); the
  *  SDK never inspects it. */
 export type ScreenCapture = {
+  /** The screenshot the model reasons over, JPEG-encoded. */
   imageJpeg: Uint8Array;
+  /** The elements it may pick from. Empty when the capture did not gather
+   *  them — the locator grounds a handle against these, so returning none
+   *  leaves it nothing to resolve. */
   elements: ScreenElement[];
+  /** Opaque state you may stash and read back at click time — the SDK never
+   *  inspects it. Use it to check the capture is still current, e.g. that the
+   *  same app is still frontmost. */
   context?: unknown;
 };
 
@@ -105,9 +124,13 @@ export type ScreenCapture = {
  *  interchangeable, and mixing them draws a marker in the top-left one percent
  *  of the screen. */
 export type ScreenBox = {
+  /** Left edge, ``0``–``1`` across the shared surface. */
   x: number;
+  /** Top edge, ``0``–``1`` down the shared surface. */
   y: number;
+  /** Width as a fraction of the surface's width. */
   width: number;
+  /** Height as a fraction of the surface's height. */
   height: number;
 };
 
@@ -120,24 +143,36 @@ export type ScreenBox = {
  *  tooltip the highlight displays; the tooltip travels separately as
  *  ``label``. ``role`` disambiguates a title that appears more than once. */
 export type ScreenElementHint = {
+  /** What the model believes the target is called — its visible text, not
+   *  the tooltip. */
   title: string;
+  /** The kind of control, to disambiguate a repeated title. */
   role?: string;
 };
 
 /** What a click handler is asked to do: the element the handle resolved to,
  *  the capture it was picked from, and how to click it. */
 export type ScreenClickRequest = {
+  /** The element the handle resolved to. */
   element: ScreenElement;
+  /** The capture it was picked from — check ``context`` if you need to
+   *  confirm the screen has not moved on. */
   capture: ScreenCapture;
+  /** Which button, and whether it is a double. */
   action: ScreenClickAction;
 };
 
 /** What a highlight handler is asked to do, for a handle the locator minted. */
 export type ScreenHighlightRequest = {
+  /** The element to highlight. */
   element: ScreenElement;
+  /** The capture it was picked from. */
   capture: ScreenCapture;
+  /** Tooltip text to show beside the highlight. */
   label: string;
+  /** Which side of the element the tooltip sits on. */
   placement: ScreenPlacement;
+  /** Which glyph to draw — the action being asked of the user. */
   interaction: ScreenAffordance;
 };
 
@@ -145,10 +180,16 @@ export type ScreenHighlightRequest = {
  *  of a handle. ``elementGuess`` is a bonus signal, never a requirement — most
  *  apps expose no usable label. */
 export type ScreenHighlightBoxRequest = {
+  /** Where the model believes the target is. */
   box: ScreenBox;
+  /** What the model thinks the target is called, when it can guess — a bonus
+   *  signal for snapping the box onto a real control. */
   elementGuess?: ScreenElementHint;
+  /** Tooltip text to show beside the highlight. */
   label: string;
+  /** Which side of the target the tooltip sits on. */
   placement: ScreenPlacement;
+  /** Which glyph to draw — the action being asked of the user. */
   interaction: ScreenAffordance;
 };
 
@@ -160,7 +201,12 @@ export type ScreenHighlightBoxRequest = {
  *  happened, so a refusal carries a reason the agent can say out loud. */
 export type ScreenClickOutcome =
   | { clicked: true }
-  | { clicked: false; reason: string };
+  | {
+      clicked: false;
+      /** Why nothing was clicked — model-facing prose the agent says out
+       *  loud, not an error code. */
+      reason: string;
+    };
 
 /** The click landed. */
 export const clicked: ScreenClickOutcome = { clicked: true };
@@ -178,7 +224,15 @@ export function notClicked(reason: string): ScreenClickOutcome {
  *  {@link landedOnControl}, one that could only use the model's box answers
  *  {@link landedOnEstimate}, the model's cue to re-target through the
  *  locator. Refuse with {@link notShown}, shared with the camera renderers. */
-export type ScreenHighlightOutcome = { shown: true; exact: boolean } | NotShown;
+export type ScreenHighlightOutcome =
+  | {
+      shown: true;
+      /** Whether it landed on a real resolved control (``true``) or only
+       *  where the model estimated (``false``) — the model's cue to re-target
+       *  through the locator. */
+      exact: boolean;
+    }
+  | NotShown;
 
 /** The highlight is on a real control. The only honest answer from a handle
  *  the locator grounded; from a box, only once something confirmed it. */
@@ -188,13 +242,10 @@ export const landedOnControl: ScreenHighlightOutcome = { shown: true, exact: tru
  *  on the control. */
 export const landedOnEstimate: ScreenHighlightOutcome = { shown: true, exact: false };
 
-/** What the server wants out of this capture. The accessibility walk is the
- *  expensive half and only the grounding locator reads it, so a handler that
- *  can skip it when ``wantsElements`` is false answers materially faster.
- *  Ignoring it is always correct — the extra elements are dropped. */
-export type ScreenCaptureRequest = {
-  wantsElements: boolean;
-};
+/** The capture being asked for. It carries no options today; any future
+ *  capture option lands here, inside the parameter every handler already
+ *  accepts. */
+export type ScreenCaptureRequest = Record<string, never>;
 
 /** Snapshot the shared screen: the image the locator grounds against, plus
  *  the elements it may pick from. Rejecting (or returning no elements)
@@ -204,31 +255,21 @@ export type ScreenCaptureHandler = (
   request: ScreenCaptureRequest,
 ) => ScreenCapture | Promise<ScreenCapture>;
 
-/** Opt-in to the server-executed screen locator, ``cosmo_screen_locate``.
- *
- *  The other server-tool opt-ins are bare kinds because the server already has
- *  what they need. This one does not: it grounds against a screenshot and an
- *  element list only the client can produce, so seeing the screen is its
- *  configuration. It is not a client tool — the model never calls it, and the
- *  SDK answers the locator's capture RPC from ``capture`` instead. */
-export type ScreenLocateTool = {
-  kind: 'screen_locate';
-  /** Snapshot the screen the locator grounds against. The element list is an
-   *  allowlist by construction: the model can only ever be handed something
-   *  put in it, and an empty list resolves to no match. */
-  capture: ScreenCaptureHandler;
-};
+/** Locate UI elements against a screenshot ``capture`` produces. */
+export function screenLocateTool(capture: ScreenCaptureHandler): AgentTool {
+  return mintAgentTool({ kind: 'screen_locate', capture });
+}
 
-/** Wire name shipped in tool-call events; a rename is a wire break. */
+/** Wire name of the click tool as it appears in tool-call events; a rename
+ *  is a wire break. */
 export const SCREEN_CLICK_TOOL_NAME = 'cosmo_sdk_screen_click_element';
+/** Wire name of the element-highlight tool as it appears in tool-call
+ *  events; a rename is a wire break. */
 export const SCREEN_HIGHLIGHT_TOOL_NAME = 'cosmo_sdk_screen_highlight_element';
+/** Wire name of the box-highlight tool as it appears in tool-call events; a
+ *  rename is a wire break. */
 export const SCREEN_HIGHLIGHT_BOX_TOOL_NAME = 'cosmo_sdk_screen_highlight_box';
 
-/** RPC method + byte-stream topic the locator's capture step drives; must
- *  match the backend's ``SCREEN_CAPTURE_*`` constants and the sibling
- *  SDKs. */
-export const SCREEN_CAPTURE_RPC_METHOD = 'screen_capture';
-const SCREEN_CAPTURE_TOPIC = 'screen_capture';
 
 /** Joins the two halves inside a ``found_element`` handle; must match the
  *  backend's ``encode_found_element``. */
@@ -354,110 +395,12 @@ const SCREEN_HIGHLIGHT_BOX_PARAMETERS: Record<string, unknown> = {
   required: ['x', 'y', 'width', 'height', 'label'],
 };
 
-/** Pairs a capture with the handles minted from it, keyed by ``captureId``.
- *  Entries expire (``ttlMs``) and the count is bounded (``maxEntries``).
- *  @internal */
-export class ScreenCaptureCache {
-  private readonly entries = new Map<string, { at: number; capture: ScreenCapture }>();
-
-  constructor(
-    private readonly ttlMs = 30_000,
-    private readonly maxEntries = 4,
-    private readonly now: () => number = () => Date.now(),
-  ) {}
-
-  put(captureId: string, capture: ScreenCapture): void {
-    const t = this.now();
-    this.entries.set(captureId, { at: t, capture });
-    for (const [id, entry] of this.entries) {
-      if (t - entry.at >= this.ttlMs) this.entries.delete(id);
-    }
-    // Map preserves insertion order, so the oldest live entry is first.
-    while (this.entries.size > this.maxEntries) {
-      const oldest = this.entries.keys().next().value;
-      if (oldest === undefined) break;
-      this.entries.delete(oldest);
-    }
-  }
-
-  get(captureId: string): ScreenCapture | undefined {
-    const entry = this.entries.get(captureId);
-    if (entry === undefined || this.now() - entry.at >= this.ttlMs) return undefined;
-    return entry.capture;
-  }
-}
-
-/** The captures handles currently address. Module-scoped because the slots are
- *  built independently — the capture handler fills it and the renderers read
- *  it, with no object in between for the caller to thread. Capture ids are
- *  server-minted per call, so an entry is only ever read back by the handle it
- *  was created for. */
-const captureCache = new ScreenCaptureCache();
 
 /** Model-facing: a handle the cache can no longer resolve is a benign decline,
  *  not an error — the model's move is to locate again, not to retry. */
 const UNRESOLVABLE_HANDLE_REASON =
   'that found_element is no longer valid — call cosmo_screen_locate again for a fresh one';
 
-/** AX descriptor budgets, matching the backend's ``AXElement``. A descriptor is
- *  a *name* for a click target, so anything longer is a document the screenshot
- *  already shows; ``value`` is content rather than identity and is held tighter.
- *  The backend clamps too — capping here keeps the bytes off the wire rather
- *  than guarding validation. */
-const ROLE_MAX_CHARS = 64;
-const LABEL_MAX_CHARS = 512;
-const VALUE_MAX_CHARS = 256;
-
-/** Truncate to `limit` UTF-16 units without splitting a surrogate pair — half a
- *  pair encodes as U+FFFD and would corrupt the descriptor's last character. */
-function clampDescriptor(text: string, limit: number): string {
-  // An untyped-JS caller can hand us a null descriptor, which passed straight
-  // through before there was anything to clamp.
-  if (typeof text !== 'string' || text.length <= limit) return text;
-  const cut = text.slice(0, limit);
-  const last = cut.charCodeAt(limit - 1);
-  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
-}
-
-/** Encode a capture into the ``ScreenCapturePayload`` JSON bytes
- *  the byte stream carries. Absent descriptors are omitted. The list still
- *  rides as ``ax_elements``; the server also accepts ``elements``, and this
- *  SDK moves once every deployed backend reads both.
- *  @internal */
-export function screenCapturePayload(
-  captureId: string,
-  capture: ScreenCapture,
-  mimeType = 'image/jpeg',
-  includeElements = true,
-): Uint8Array {
-  const axElements = (includeElements ? capture.elements : []).map((element) => {
-    const obj: Record<string, unknown> = {
-      idx: element.index,
-      role: clampDescriptor(element.role, ROLE_MAX_CHARS),
-      frame: [element.frame[0], element.frame[1], element.frame[2], element.frame[3]],
-    };
-    if (element.title !== undefined)
-      obj.title = clampDescriptor(element.title, LABEL_MAX_CHARS);
-    if (element.label !== undefined)
-      obj.label = clampDescriptor(element.label, LABEL_MAX_CHARS);
-    // Carried only where it is the element's sole name: the grounder reads the
-    // screenshot, so a named element's content is a second copy of pixels it
-    // can already see. A blank descriptor names nothing.
-    const named = Boolean(
-      (obj.title as string | undefined)?.trim() || (obj.label as string | undefined)?.trim(),
-    );
-    if (element.value !== undefined && !named)
-      obj.value = clampDescriptor(element.value, VALUE_MAX_CHARS);
-    return obj;
-  });
-  const payload = {
-    capture_id: captureId,
-    image_b64: bytesToBase64(capture.imageJpeg),
-    mime_type: mimeType,
-    ax_elements: axElements,
-  };
-  return new TextEncoder().encode(JSON.stringify(payload));
-}
 
 /** Mint a handle the way the backend's ``encode_found_element`` does. The SDK
  *  never calls this in production — the locator is the only minter — but the
@@ -545,17 +488,26 @@ function parseElementHint(args: Record<string, unknown>): ScreenElementHint | un
 /** Decoded ``cosmo_sdk_screen_click_element`` arguments, before the handle is
  *  resolved. */
 export type ScreenClickArgs = {
+  /** The handle ``cosmo_screen_locate`` returned, passed back verbatim.
+   *  Resolve it against the capture it was issued for. */
   found_element: string;
+  /** Which mouse button; ``'right'`` opens context menus. */
   button: ScreenClickButton;
+  /** ``true`` for a double-click — open a file, select a word. */
   double: boolean;
 };
 
 /** Decoded ``cosmo_sdk_screen_highlight_element`` arguments, before the handle
  *  is resolved. */
 export type ScreenHighlightArgs = {
+  /** The handle ``cosmo_screen_locate`` returned, passed back verbatim.
+   *  Resolve it against the capture it was issued for. */
   found_element: string;
+  /** Tooltip text to show with the highlight. */
   label: string;
+  /** Where the tooltip sits relative to the highlighted element. */
   placement: ScreenPlacement;
+  /** The gesture the label suggests, which sets the affordance drawn. */
   interaction: ScreenAffordance;
 };
 
@@ -636,38 +588,6 @@ function highlightReply(outcome: ScreenHighlightOutcome): Record<string, unknown
   return { shown: true, exact: outcome.exact };
 }
 
-/** The ``screen_capture`` RPC body: take the snapshot, keep it
- *  for the handles the locator is about to mint, publish it, and ack. A handler
- *  that throws is answered as "no capture" rather than as an RPC error — the
- *  locator has its own typed answer for it.
- *  @internal — wired to the transport by ``RealtimeClient``. */
-export function screenCaptureRpc(
-  spec: ScreenLocateTool,
-  sendBytes: (data: Uint8Array, topic: string) => Promise<void>,
-): (args: Record<string, unknown>) => Promise<Record<string, unknown>> {
-  return async (args) => {
-    const captureId = args.capture_id;
-    if (typeof captureId !== 'string') return { captured: false };
-    // Absent means a server older than the hint, which only ever wanted both.
-    const wantsElements = args.want_elements !== false;
-    let capture: ScreenCapture;
-    try {
-      capture = await spec.capture({ wantsElements });
-    } catch (err) {
-      log.error('[realtime] screen capture failed', err);
-      // The message is what the locator says to the model when it cannot
-      // see the screen, so a handler that explains itself ("the user
-      // stopped sharing") reaches them rather than the generic fallback.
-      return { captured: false, message: errorMessage(err) };
-    }
-    captureCache.put(captureId, capture);
-    await sendBytes(
-      screenCapturePayload(captureId, capture, 'image/jpeg', wantsElements),
-      SCREEN_CAPTURE_TOPIC,
-    );
-    return { captured: true };
-  };
-}
 
 /** The click renderer, ready to add to an agent's ``tools`` alongside the
  *  ``screen_locate`` opt-in that feeds it. Your handler owns only the clicking —
@@ -675,12 +595,12 @@ export function screenCaptureRpc(
  *  surface to the model as the call's error without reaching your code, and a
  *  handle the capture cache can no longer resolve declines with a reason
  *  instead of clicking something else. */
-export function screenClickElement(
+export function screenClickElementTool(
   onClick: (
     request: ScreenClickRequest,
   ) => ScreenClickOutcome | Promise<ScreenClickOutcome>,
-): ClientToolSpec {
-  return markSdkClientTool({
+): AgentTool {
+  return mintAgentTool(markSdkClientTool({
     kind: 'client',
     name: SCREEN_CLICK_TOOL_NAME,
     description: SCREEN_CLICK_DESCRIPTION,
@@ -702,19 +622,19 @@ export function screenClickElement(
         })),
       };
     },
-  });
+  }));
 }
 
-/** The element highlight. Same handle contract as {@link screenClickElement},
+/** The element highlight. Same handle contract as {@link screenClickElementTool},
  *  reporting through the highlight outcome it shares with
- *  {@link screenHighlightBox} — a grounded handle is on a real control, so
+ *  {@link screenHighlightBoxTool} — a grounded handle is on a real control, so
  *  {@link landedOnControl} is the answer here. */
-export function screenHighlightElement(
+export function screenHighlightElementTool(
   onHighlight: (
     request: ScreenHighlightRequest,
   ) => ScreenHighlightOutcome | Promise<ScreenHighlightOutcome>,
-): ClientToolSpec {
-  return markSdkClientTool({
+): AgentTool {
+  return mintAgentTool(markSdkClientTool({
     kind: 'client',
     name: SCREEN_HIGHLIGHT_TOOL_NAME,
     description: SCREEN_HIGHLIGHT_DESCRIPTION,
@@ -740,19 +660,19 @@ export function screenHighlightElement(
         }),
       );
     },
-  });
+  }));
 }
 
 /** The box highlight: no capture, no locator, no cache — the model gives
  *  the box and your handler draws it. Answer {@link landedOnControl} only when
  *  something confirmed the highlight sits on a real control; {@link landedOnEstimate}
  *  is what tells the model to re-target through the locator. */
-export function screenHighlightBox(
+export function screenHighlightBoxTool(
   onHighlight: (
     request: ScreenHighlightBoxRequest,
   ) => ScreenHighlightOutcome | Promise<ScreenHighlightOutcome>,
-): ClientToolSpec {
-  return markSdkClientTool({
+): AgentTool {
+  return mintAgentTool(markSdkClientTool({
     kind: 'client',
     name: SCREEN_HIGHLIGHT_BOX_TOOL_NAME,
     description: SCREEN_HIGHLIGHT_BOX_DESCRIPTION,
@@ -767,7 +687,7 @@ export function screenHighlightBox(
       }
       return highlightReply(await onHighlight(request));
     },
-  });
+  }));
 }
 
 // Re-exported so a caller reaching for this entry point alone still has the

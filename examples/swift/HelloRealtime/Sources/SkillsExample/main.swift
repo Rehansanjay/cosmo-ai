@@ -25,12 +25,15 @@ time and keep replies short.
 """
 let skills = [try parseSkillMd(skillMarkdown, defaultName: "activate-card")]
 
-print("== resident menu (appended to instructions) ==")
-print(skillsMenuText(skills))
-print("==============================================\n")
+// The SDK folds a one-line menu entry per skill into the instructions at
+// start — name and description only. The body stays out until the model
+// calls cosmo_sdk_load_skill for it.
+for skill in skills {
+    print("resident menu entry: - \(skill.name): \(skill.description)")
+}
+print()
 
-let options = try RealtimeClient.Options()
-let client = RealtimeClient(options)
+let client = try RealtimeClient()
 // Skills fold into the persona: the menu above rides resident in the
 // instructions, and `cosmo_sdk_load_skill` joins the tool set at start.
 let agent = try client.agent(
@@ -38,7 +41,7 @@ let agent = try client.agent(
     skills: skills
 )
 
-print("connecting to \(options.baseURL.absoluteString)…")
+print("connecting…")
 let session = try await agent.start(micMuted: true)
 
 let pump = Task {
@@ -52,7 +55,7 @@ let pump = Task {
             case .modelText(let m):
                 print("  [model] \(m.text)")
             case .toolCall(let call):
-                let hit = call.name == loadSkillToolName ? "   ⟵ SKILL LOADED ✅" : ""
+                let hit = call.name == "cosmo_sdk_load_skill" ? "   ⟵ SKILL LOADED ✅" : ""
                 print("● TOOL CALL: \(call.name)\(hit)")
             case .toolResult(let r):
                 print("● TOOL RESULT: ok=\(r.ok)" + (r.summary.map { " — \($0)" } ?? ""))

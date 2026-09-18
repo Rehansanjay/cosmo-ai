@@ -15,7 +15,12 @@ from typing import Any, Callable
 
 import livekit.rtc as rtc
 import pytest
-from cosmo_ai.session._livekit import LiveKitTransport, _classify_disconnect
+from structlog.testing import capture_logs
+from cosmo_ai.session._livekit import (
+    READY_ATTRIBUTE,
+    LiveKitTransport,
+    _classify_disconnect,
+)
 from cosmo_ai._internal.transport import (
     RpcInvocation,
     RpcMethodError,
@@ -23,7 +28,7 @@ from cosmo_ai._internal.transport import (
     TransportClose,
 )
 from cosmo_ai._internal.protocol import SessionResponse
-from cosmo_ai.errors import NotConnectedError, VideoPublishAlreadyActiveError
+from cosmo_ai.errors import SessionStateError
 
 _AGENT_KIND = rtc.ParticipantKind.PARTICIPANT_KIND_AGENT
 _HUMAN_KIND = rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD
@@ -33,6 +38,7 @@ _HUMAN_KIND = rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD
 class _FakeParticipant:
     identity: str
     kind: Any
+    attributes: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -158,7 +164,7 @@ def test_send_frame_raises_when_not_connected() -> None:
     async def scenario() -> None:
         transport = LiveKitTransport()
         assert transport.is_connected() is False
-        with pytest.raises(NotConnectedError):
+        with pytest.raises(SessionStateError):
             await transport.send_frame(b"{}")
 
     asyncio.run(scenario())
@@ -206,6 +212,32 @@ def test_data_from_non_agent_participant_is_dropped() -> None:
     transport._callbacks = _callbacks(frames)
     transport._on_data_received(_FakeDataPacket(data=b'{"type":"pong"}', participant=human))
     assert frames == []
+
+
+def test_a_frame_arriving_after_the_room_is_released_is_not_called_a_stranger_s() -> None:
+    # ``disconnect()`` releases the room before the room itself comes down. A
+    # frame dispatched in that window has nowhere to resolve its sender, and
+    # used to log the agent as a stranger on the way out.
+    transport = _connected(_FakeParticipant("agent-1", _AGENT_KIND))
+    transport._room = None
+    agent = _FakeParticipant("agent-1", _AGENT_KIND)
+    with capture_logs() as logs:
+        transport._on_data_received(
+            _FakeDataPacket(data=b'{"type":"session-ended"}', participant=agent)
+        )
+    assert [entry for entry in logs if entry["event"] == "realtime.frame_from_non_agent_dropped"] == []
+
+
+def test_a_peer_s_frame_is_dropped_with_or_without_the_room() -> None:
+    transport = _connected(_FakeParticipant("agent-1", _AGENT_KIND))
+    transport._room = None
+    human = _FakeParticipant("human-1", _HUMAN_KIND)
+    frames: list[bytes] = []
+    transport._callbacks = _callbacks(frames)
+    with capture_logs() as logs:
+        transport._on_data_received(_FakeDataPacket(data=b'{"type":"pong"}', participant=human))
+    assert frames == []
+    assert [entry["event"] for entry in logs] == ["realtime.frame_from_non_agent_dropped"]
 
 
 def test_data_without_participant_is_forwarded() -> None:
@@ -685,14 +717,14 @@ def test_one_video_publish_at_a_time(monkeypatch: pytest.MonkeyPatch) -> None:
         _stub_screen_rtc(monkeypatch)
         transport = _connected()
         await transport.add_video_stream(width=640, height=480)
-        with pytest.raises(VideoPublishAlreadyActiveError):
+        with pytest.raises(SessionStateError):
             await transport.add_video_stream(width=640, height=480)
-        with pytest.raises(VideoPublishAlreadyActiveError):
+        with pytest.raises(SessionStateError):
             await transport.start_screen_share(width=640, height=480)
 
         transport._video_publish = None
         await transport.start_screen_share(width=640, height=480)
-        with pytest.raises(VideoPublishAlreadyActiveError):
+        with pytest.raises(SessionStateError):
             await transport.add_video_stream(width=640, height=480)
 
     asyncio.run(scenario())
@@ -853,3 +885,119 @@ def test_a_session_that_ends_before_its_threaded_publish_lands_never_publishes(
         assert room.local_participant.published_tracks == []
 
     asyncio.run(scenario())
+
+
+# ── the sign: readiness as a participant attribute ─────────────────────────
+
+_READY_JSON = '{"type": "ready", "session_id": "sess-test"}'
+
+
+def _agent_with_sign(sign: str = _READY_JSON) -> _FakeParticipant:
+    return _FakeParticipant("agent-1", _AGENT_KIND, {READY_ATTRIBUTE: sign})
+
+
+def test_sign_present_at_join_is_emitted_as_a_ready_frame() -> None:
+    # The agent came up before this client joined: its one-shot ready frame
+    # is long gone, but the attribute is room state the join delivers.
+    agent = _agent_with_sign()
+    transport = _connected(agent)
+    frames: list[bytes] = []
+    transport._callbacks = _callbacks(frames)
+
+    transport._maybe_emit_ready_attribute(agent)
+
+    assert frames == [_READY_JSON.encode("utf-8")]
+
+
+def test_sign_arriving_after_join_is_emitted_once() -> None:
+    agent = _agent_with_sign()
+    transport = _connected(agent)
+    frames: list[bytes] = []
+    transport._callbacks = _callbacks(frames)
+
+    # livekit-rtc emits ``(changed_attributes, participant)``; a signature
+    # change here would otherwise surface only as a late-join timeout.
+    transport._on_participant_attributes_changed(
+        {READY_ATTRIBUTE: _READY_JSON}, agent
+    )
+    # The data-channel broadcast still arrives; first delivery won.
+    transport._on_participant_attributes_changed(
+        {READY_ATTRIBUTE: _READY_JSON}, agent
+    )
+
+    assert frames == [_READY_JSON.encode("utf-8")]
+
+
+def test_a_non_agent_participant_cannot_post_the_sign() -> None:
+    human = _FakeParticipant("human-1", _HUMAN_KIND, {READY_ATTRIBUTE: _READY_JSON})
+    transport = _connected(human)
+    frames: list[bytes] = []
+    transport._callbacks = _callbacks(frames)
+
+    transport._maybe_emit_ready_attribute(human)
+
+    assert frames == []
+
+
+@pytest.mark.parametrize(
+    "sign",
+    ["", "not json", '{"type": "transcript", "text": "hi"}'],
+    ids=["empty", "not_json", "not_a_ready_frame"],
+)
+def test_an_unreadable_sign_is_refused(sign: str) -> None:
+    agent = _agent_with_sign(sign)
+    transport = _connected(agent)
+    frames: list[bytes] = []
+    transport._callbacks = _callbacks(frames)
+
+    transport._maybe_emit_ready_attribute(agent)
+
+    assert frames == []
+
+
+def test_reconnect_re_reads_the_sign() -> None:
+    # A recovery rebuilds participants with attributes already populated, so
+    # no attribute-change event fires; the rejoin is the only place to learn
+    # an agent that became ready during the outage.
+    agent = _agent_with_sign()
+    transport = _connected(agent)
+    frames: list[bytes] = []
+    transport._callbacks = _callbacks(frames)
+
+    transport._on_reconnected()
+    assert frames == [_READY_JSON.encode("utf-8")]
+
+    # Deduped: a session already ready re-emits nothing.
+    transport._on_reconnected()
+    assert frames == [_READY_JSON.encode("utf-8")]
+
+
+def test_a_disconnect_during_the_join_is_latched_not_dropped() -> None:
+    # Before ``_room`` is assigned the transport has nothing to report a
+    # close against, so it latches the reason: a room deleted while
+    # ``room.connect()`` is still negotiating is the only evidence a failed
+    # boot leaves, and the join's own error says nothing about why.
+    transport = LiveKitTransport()
+    frames: list[bytes] = []
+    transport._callbacks = _callbacks(frames)
+
+    transport._on_disconnected(None)
+
+    assert frames == []
+    assert transport._connect_lost is not None
+
+
+def test_a_disconnect_after_the_join_still_closes_the_session() -> None:
+    transport = _connected(_FakeParticipant("agent-1", _AGENT_KIND))
+    closes: list[TransportClose] = []
+    transport._callbacks = TransportCallbacks(
+        on_frame=lambda _payload: None,
+        on_closed=closes.append,
+        on_reconnecting=lambda: None,
+        on_reconnected=lambda: None,
+    )
+
+    transport._on_disconnected(None)
+
+    assert len(closes) == 1
+    assert transport._connect_lost is None

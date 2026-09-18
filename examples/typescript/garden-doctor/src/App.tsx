@@ -1,19 +1,20 @@
 import { useCallback, useEffect, useState } from 'react';
 
-import { RealtimeProvider, SessionBusyError, TokenSource, useRealtimeSession } from 'cosmo-ai';
+import { SessionStartError, TokenSource } from 'cosmo-ai';
+import { RealtimeProvider, useRealtimeSession } from 'cosmo-ai/react';
 
 import { gardenDoctorAgent } from './agent';
 import { useCamera } from './camera/use_camera';
 import { LiveView } from './LiveView';
 
-// Prefill from a gitignored .env for local dev convenience (see .env.example).
-// Never hardcode a key here — this file is committed.
-const API_KEY_DEFAULT = import.meta.env.VITE_COSMO_API_KEY ?? '';
+// No key in page code: /token mints short-lived tokens in both modes — the
+// vite.config tokenRoute plugin under `vite dev`, the deployed Function
+// otherwise.
 
-// A build with no key inlined is a deployed one: its key stays server-side in
-// the /token Function, so what the box collects is an access password the
-// page trades for short-lived end-user tokens.
-const HOSTED = API_KEY_DEFAULT === '';
+// A built bundle is a deployed one: its key stays server-side in the /token
+// Function, so what the box collects is an access password the page trades
+// for short-lived end-user tokens.
+const HOSTED = import.meta.env.PROD;
 
 // Same-origin by default. A build that doesn't ship next to its Function —
 // e.g. bundled into a native shell — names the deployed endpoint absolutely.
@@ -37,7 +38,7 @@ function mintHeaders(password: string): Record<string, string> {
 
 export function App() {
   const camera = useCamera();
-  const [credential, setCredential] = useState(API_KEY_DEFAULT);
+  const [credential, setCredential] = useState('');
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [cameraWarning, setCameraWarning] = useState<string | null>(null);
 
@@ -46,12 +47,14 @@ export function App() {
   // teardown. The camera stays this app's job.
   const { phase, session, start, end, error, warning, endedReason } = useRealtimeSession({
     makeAgent: (c) => c.agent(gardenDoctorAgent()),
-    // Hosted: the box held a password, traded for short-lived end-user tokens
-    // by this deployment's /token Function — TokenSource keeps one fresh.
-    // Local: the box held an API key, sent to the backend directly.
-    clientOptions: HOSTED
-      ? { token: TokenSource.endpoint(TOKEN_ENDPOINT, { headers: () => mintHeaders(credential) }) }
-      : { apiKey: credential },
+    // One path, either mode: /token mints, TokenSource keeps one fresh.
+    // Hosted sends the box's access password; dev sends only the visitor id.
+    clientOptions: {
+      token: TokenSource.endpoint(TOKEN_ENDPOINT, {
+        headers: () =>
+          HOSTED ? mintHeaders(credential) : { 'x-external-user-id': externalUserId() },
+      }),
+    },
   });
 
   // Whatever ended the session — End button, hangup tool, network loss —
@@ -62,7 +65,7 @@ export function App() {
   }, [phase, stopCamera]);
 
   const startVisit = useCallback(async () => {
-    if (!credential || phase !== 'idle') return;
+    if ((HOSTED && !credential) || phase !== 'idle') return;
     setCameraError(null);
     setCameraWarning(null);
 
@@ -80,14 +83,6 @@ export function App() {
       return;
     }
     const session = result.session;
-
-    // ``start()`` resolves while the transport is still connecting, and video
-    // can only publish on a live session.
-    try {
-      await session.waitUntilReady();
-    } catch {
-      return; // The session ended before it got going; teardown handles it.
-    }
     try {
       await camera.publish(session);
     } catch (err) {
@@ -116,7 +111,7 @@ export function App() {
   const startError =
     error === null
       ? null
-      : error instanceof SessionBusyError
+      : error instanceof SessionStartError && error.code === 'busy'
         ? 'The line is busy — try again in a minute.'
         : error.message;
 
@@ -142,7 +137,7 @@ export function App() {
       <button
         className="btn primary"
         onClick={() => void startVisit()}
-        disabled={!credential || phase !== 'idle'}
+        disabled={(HOSTED && !credential) || phase !== 'idle'}
       >
         {phase === 'starting' ? 'Connecting…' : 'Start the visit'}
       </button>

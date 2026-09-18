@@ -17,10 +17,17 @@
  *
  * The connection lifecycle is a formal state machine
  * (``idle → connecting → connected ↔ reconnecting → disconnected``) with
- * typed end reasons — see ``SessionLifecycleState`` in ``./state``.
+ * typed end reasons — see ``SessionState`` in ``./state``.
  */
 
 import { log } from './logger';
+import {
+  decodeStreamEvent,
+  type DecodedStreamEvent,
+  type StreamEvent,
+  type WireServerMessage,
+} from './wire_decode';
+import { SessionStateError } from './errors';
 import type { DialResult } from '../transport/dial';
 import { UsageError, type SessionUsage } from './usage';
 import type {
@@ -34,15 +41,40 @@ import type {
 
 import type { SessionEngine } from './session_engine';
 import type {
+  BotLlmStartedEvent,
+  BotLlmStoppedEvent,
+  BotStartedSpeakingEvent,
+  BotStoppedSpeakingEvent,
+  BotTtsStartedEvent,
+  BotTtsStoppedEvent,
+  ModelTextEvent,
+  PongEvent,
+  ReadyEvent,
   RealtimeEventMap,
   RealtimeEventName,
+  ReconnectingEvent,
+  SessionEndingSoonEvent,
+  SessionStateWriteEvent,
+  ToolCallEvent,
+  ToolDispatchStartedEvent,
+  ToolInvocationEvent,
+  ToolResultEvent,
+  TranscriptDeltaEvent,
+  TranscriptItem,
+  TranscriptUpdatedEvent,
+  TurnCompleteEvent,
   Unsubscribe,
+  UsageEvent,
+  UserSpeechTimeoutEvent,
+  UserStartedSpeakingEvent,
+  UserStoppedSpeakingEvent,
 } from './events';
+import type { ErrorEvent } from './types';
 import type {
   DisconnectReason,
   RealtimeSnapshot,
   SessionConnectTimings,
-  SessionLifecycleState,
+  SessionState,
 } from './state';
 import type { ScreenShareState } from './types';
 
@@ -52,9 +84,15 @@ import type { ScreenShareState } from './types';
  *  not decodable at all — ``rawText`` then carries it verbatim and
  *  ``payload`` is null. Never terminal. Mirrors Python's ``UnknownEvent``. */
 export type UnknownEvent = {
+  /** Always ``'unknown'`` — the discriminator that separates this from a
+   *  recognized wire frame. */
   type: 'unknown';
+  /** The wire ``type`` this SDK does not handle. ``null`` when the frame
+   *  carried no string ``type`` to read. */
   rawType: string | null;
+  /** The decoded frame, when it parsed as a JSON object. */
   payload: Record<string, unknown> | null;
+  /** The frame verbatim, when the bytes decoded as text. */
   rawText?: string;
 };
 
@@ -63,17 +101,23 @@ export type UnknownEvent = {
  *  the server's end slug when it hung up on purpose, else a default for
  *  the typed disconnect reason. */
 export type SessionEndedEventItem = {
-  type: 'session-ended';
+  /** Always ``'session_ended'`` — the terminal item's discriminator. */
+  type: 'session_ended';
+  /** Why the session ended. A server teardown carries its stable slug; an
+   *  ending the SDK synthesizes carries a short description of the
+   *  disconnect. ``null`` when neither was available. */
   reason: string | null;
 };
 
-/** Items yielded by ``for await (const event of session)``: external wire
- *  frames verbatim, ``unknown`` for unrecognized types, and the SDK-local
- *  terminal ``session-ended``. The wire ``session-ended`` frame itself is
- *  folded into the terminal item so "session-ended is always final" holds
- *  even when the server's notice races later frames. */
+/** Items yielded by ``for await (const event of session)``: the session's
+ *  own event types — the same values ``on()`` delivers — plus ``unknown``
+ *  for unrecognized types and the SDK-local terminal ``session-ended``.
+ *  Switch on ``type``. The wire ``session-ended`` frame itself is folded
+ *  into the terminal item so "session-ended is always final" holds even
+ *  when the server's notice races later frames. */
 export type RealtimeSessionEvent =
-  | Exclude<RealtimeServerMessage, { type: 'session-ended' }>
+  | DecodedStreamEvent
+  | StreamEvent<TranscriptUpdatedEvent, 'transcript_updated'>
   | SessionEndedEventItem
   | UnknownEvent;
 
@@ -87,6 +131,7 @@ const KNOWN_STREAM_TYPES: ReadonlySet<string> = new Set([
   'user-started-speaking',
   'user-stopped-speaking',
   'user-speech-timeout',
+  'delegation-created',
   'bot-started-speaking',
   'bot-stopped-speaking',
   'bot-llm-started',
@@ -126,9 +171,35 @@ export type RealtimeSessionInternal = {
   subscribeOutputAnalyser: (cb: (a: AnalyserNode | null) => void) => Unsubscribe;
 };
 
+/**
+ * One live run of an agent — the whole per-session surface.
+ *
+ * ```ts
+ * const session = await agent.start();
+ * session.on('transcript_updated', ({ items }) => render(items));
+ * await session.end();
+ * ```
+ *
+ * Returned by ``RealtimeAgent.start()``, never constructed directly. Owns
+ * its own transport and state, so sessions from one client are fully
+ * independent.
+ *
+ * Read what happened two ways: ``on(name, handler)`` for the normalized,
+ * UI-shaped events in ``RealtimeEventMap``, or ``for await (const event of
+ * session)`` for the wire-level stream, whose final item is always
+ * ``session-ended``. The current transcript and lifecycle state are also
+ * readable directly, at any time, from ``transcript`` and ``state``.
+ *
+ * ``start()`` resolves at ``ready``, so a session you have been handed is
+ * already usable and the first send needs no wait. ``waitUntilReady()``
+ * remains for a session obtained another way. Ending is ``end()``
+ * (graceful) or ``close()`` (abrupt); both are idempotent, and ``usage()``
+ * still works afterwards.
+ */
 export class RealtimeSession implements AsyncIterable<RealtimeSessionEvent> {
   private readonly engine: SessionEngine;
   private readonly queue: RealtimeSessionEvent[] = [];
+  private readonly pendingTranscriptUpdates: TranscriptUpdatedEvent[] = [];
   private pendingPull:
     | { resolve: (r: IteratorResult<RealtimeSessionEvent>) => void }
     | null = null;
@@ -138,7 +209,7 @@ export class RealtimeSession implements AsyncIterable<RealtimeSessionEvent> {
   /** Latched final lifecycle state. The engine's own machine settles back
    *  to ``idle`` after teardown, but THIS session stays ``disconnected``
    *  forever once it ends. */
-  private terminalState: SessionLifecycleState | null = null;
+  private terminalState: SessionState | null = null;
   /** Backend id of THIS run, bound once — to the first ``session_started``
    *  after construction, which is this session's own start. The engine
    *  drops its copy at teardown, so it is not a source that outlives the
@@ -159,6 +230,33 @@ export class RealtimeSession implements AsyncIterable<RealtimeSessionEvent> {
         this.onWireMessage(message);
       }),
     );
+    // The engine folds the transcript while dispatching a frame, which runs
+    // before that frame reaches this stream. Holding the folded value until
+    // the frame has been pushed keeps the order every SDK yields: the event,
+    // then the update it produced. The ``sendText`` echo folds with no frame
+    // behind it and nothing to wait for, so the microtask flushes it; the
+    // close that shuts an open turn is flushed by ``finishStream``, which
+    // has to place it ahead of the terminal item.
+    // ``on`` replays the current transcript to a new subscriber so a
+    // callback consumer needs no reconcile. That replay is state, not a
+    // fold, and putting it on the stream would open every session with an
+    // empty update before ``ready``. It fires synchronously inside the
+    // subscribe call, so the flag is still set while it runs.
+    let replayingTranscript = true;
+    this.unsubscribers.push(
+      engine.on('transcript_updated', (event) => {
+        if (replayingTranscript) return;
+        // A queue, not a slot: two folds can land before either flush runs —
+        // two ``sendText`` calls settling in one turn do exactly that — and
+        // each fold is its own event on the stream, as it is in Python and
+        // Swift.
+        this.pendingTranscriptUpdates.push(event);
+        queueMicrotask(() => {
+          this.flushTranscriptUpdates();
+        });
+      }),
+    );
+    replayingTranscript = false;
     this.unsubscribers.push(
       engine.on('session_started', ({ sessionId }) => {
         this.ownSessionId ??= sessionId;
@@ -173,6 +271,15 @@ export class RealtimeSession implements AsyncIterable<RealtimeSessionEvent> {
 
   // ── Events ───────────────────────────────────────────────────────────
 
+  /** Subscribe to one event; returns a function that unsubscribes.
+   *  ``RealtimeEventMap`` is the catalogue of names and payloads.
+   *
+   *  Three events replay their current value to a new subscriber, so
+   *  subscribing to them after ``start()`` resolves misses nothing:
+   *  ``lifecycle``, ``transcript_updated``, and ``ready`` once the session
+   *  is ready. Every other event — the three state axes among them — fires
+   *  on change only, so pair a late subscription with ``getSnapshot()`` to
+   *  avoid rendering a stale value until the next transition. */
   on<E extends RealtimeEventName>(
     event: E,
     handler: (payload: RealtimeEventMap[E]) => void,
@@ -180,6 +287,13 @@ export class RealtimeSession implements AsyncIterable<RealtimeSessionEvent> {
     return this.engine.on(event, handler);
   }
 
+  /** Iterate the wire-level event stream: ``for await (const event of
+   *  session)``. Intended for one consumer: every call returns a new
+   *  iterator over one shared queue, so a second concurrent iteration
+   *  splits the events between them and eventually rejects rather than
+   *  failing cleanly at the start. Unrecognized frames arrive as
+   *  ``unknown`` items and never end the stream; a ``session-ended`` item
+   *  is always the last one. */
   [Symbol.asyncIterator](): AsyncIterator<RealtimeSessionEvent> {
     return {
       next: (): Promise<IteratorResult<RealtimeSessionEvent>> => {
@@ -207,10 +321,13 @@ export class RealtimeSession implements AsyncIterable<RealtimeSessionEvent> {
   /** Formal connection state (``idle → connecting → connected ↔
    *  reconnecting → disconnected``) with the typed end reason once
    *  disconnected. */
-  get state(): SessionLifecycleState {
+  get state(): SessionState {
     return this.terminalState ?? this.engine.getLifecycleState();
   }
 
+  /** Server-minted id for this run, available from the moment the session
+   *  starts. ``null`` before that, and again once the session has ended —
+   *  capture it while the session is live if you need it afterwards. */
   get sessionId(): string | null {
     return this.engine.getSessionId();
   }
@@ -220,6 +337,15 @@ export class RealtimeSession implements AsyncIterable<RealtimeSessionEvent> {
    *  completes; dropped when the session ends. */
   get connectTimings(): SessionConnectTimings | null {
     return this.engine.getConnectTimings();
+  }
+
+  /** The coalesced conversation so far — one item per turn, folded by the
+   *  session from its own transcript stream. The array reference is stable
+   *  between changes; ``transcript_updated`` fires with the new value on
+   *  every change. Survives ``end()``, so the full conversation stays
+   *  readable after the session ends. */
+  get transcript(): readonly TranscriptItem[] {
+    return this.engine.getTranscript();
   }
 
   /** Gracefully end the session: the transport sends the ``end`` frame and
@@ -237,16 +363,30 @@ export class RealtimeSession implements AsyncIterable<RealtimeSessionEvent> {
     await this.engine.close();
   }
 
+  /** Resolve once the session is ready. ``agent.start()`` already resolves
+   *  at ready, so after a resolved start this is instant; it exists for
+   *  code holding a session from before the start settled (the
+   *  ``onSession`` callback). Rejects if the session ends first. */
   waitUntilReady(): Promise<void> {
     return this.engine.waitUntilReady();
   }
 
+  /** Every state axis read together at this instant. A one-shot read — to
+   *  re-render as state changes, subscribe with ``on()`` or use the React
+   *  hooks. */
   getSnapshot(): RealtimeSnapshot {
     return this.engine.getSnapshot();
   }
 
   // ── Sends / actions (delegates to this session's engine) ────────────
 
+  /** Send a text turn; the agent replies in the session's modality. Usable
+   *  the moment ``agent.start()`` resolves; throws ``SessionStateError`` once
+   *  the session has ended.
+   *
+   *  Takes a turn, so the text is filed as a user turn in the transcript
+   *  unless ``transcript: false``. To hand the agent context without asking
+   *  for a reply, use ``sendContext``. Blank content is a no-op. */
   sendText(
     content: string,
     options?: { transcript?: boolean },
@@ -267,10 +407,39 @@ export class RealtimeSession implements AsyncIterable<RealtimeSessionEvent> {
     return this.engine.sendContext(content);
   }
 
+  /** Give the voice model background it keeps to itself and draws on
+   *  when relevant. Answers a ``delegation_created`` event when
+   *  ``delegationId`` names it; without one it informs the session as a
+   *  whole. */
+  appendThinking(content: string, options?: { delegationId?: string }): Promise<void> {
+    return this.engine.appendDelegation('thinking', content, options);
+  }
+
+  /** Give the voice model something to say now, in its own words. Answers
+   *  a ``delegation_created`` event when ``delegationId`` names it. */
+  appendCommentary(content: string, options?: { delegationId?: string }): Promise<void> {
+    return this.engine.appendDelegation('commentary', content, options);
+  }
+
+  /** Change how the voice model behaves from here on. ``delegationId``
+   *  scopes it to one hand-off; without one it applies to the session. */
+  appendInstructions(content: string, options?: { delegationId?: string }): Promise<void> {
+    return this.engine.appendDelegation('instructions', content, options);
+  }
+
+  /** Send one image frame into the agent's vision input; for continuous
+   *  capture prefer ``startScreenShare`` / ``addVideoStream``. Throws
+   *  ``SessionStateError`` once the session has ended.
+   *
+   *  ``data`` is base64-encoded bytes, not raw bytes. ``mimeType`` defaults
+   *  to ``image/jpeg`` and ``streamId`` to ``video.input.default``; a
+   *  distinct ``streamId`` groups successive frames as one visual source. */
   sendImage(args: { data: string; mimeType?: string; streamId?: string }): Promise<void> {
     return this.engine.sendImage(args);
   }
 
+  /** Keep-alive; the server answers with a ``pong`` event. Throws
+   *  ``SessionStateError`` once the session has ended. */
   ping(): Promise<void> {
     return this.engine.sendPing();
   }
@@ -301,7 +470,7 @@ export class RealtimeSession implements AsyncIterable<RealtimeSessionEvent> {
   usage(): Promise<SessionUsage> {
     if (this.ownSessionId === null) {
       return Promise.reject(
-        new UsageError('not_started', 'usage requires a started session.'),
+        new UsageError({ code: 'invalid_request', message: 'usage requires a started session.' }),
       );
     }
     return this.engine.getUsage(this.ownSessionId);
@@ -314,18 +483,41 @@ export class RealtimeSession implements AsyncIterable<RealtimeSessionEvent> {
     return this.engine.setMicMuted(muted);
   }
 
+  /** Publish a screen capture as the session's video input (prompts for
+   *  permission). Usable the moment ``agent.start()`` resolves; throws
+   *  ``SessionStateError`` once the session has ended.
+   *
+   *  A no-op while a share is already active or being picked. A declined
+   *  picker sets the screen state to ``error`` and rethrows, so handle both
+   *  — progress is readable from ``getScreenShareState()`` and the
+   *  ``media_state`` event. */
   startScreenShare(): Promise<void> {
     return this.engine.startScreenShare();
   }
 
+  /** Stop sharing the screen and release the capture. Idempotent. */
   stopScreenShare(): Promise<void> {
     return this.engine.stopScreenShare();
   }
 
+  /** Where the screen share is in its lifecycle right now. */
   getScreenShareState(): ScreenShareState {
     return this.engine.getScreenShareState();
   }
 
+  /** The locally captured display stream while a share is active, for the
+   *  app to render its own "you are sharing this" preview. ``null`` when
+   *  nothing is being shared. The session owns the stream's lifecycle — do
+   *  not stop its tracks; call ``stopScreenShare`` instead. */
+  getScreenShareStream(): MediaStream | null {
+    return this.engine.getScreenShareStream();
+  }
+
+  /** Give the agent something to look at — a webcam, a canvas, any
+   *  ``MediaStream``. Returns the handle to pass back to
+   *  ``removeVideoStream``. Frames are sampled at a low rate suited to
+   *  vision input; raise it with ``options.fps``. Use ``startScreenShare``
+   *  for screen capture, which handles the picker for you. */
   addVideoStream(
     stream: MediaStream,
     options?: VideoStreamOptions,
@@ -333,6 +525,8 @@ export class RealtimeSession implements AsyncIterable<RealtimeSessionEvent> {
     return this.engine.addVideoStream(stream, options);
   }
 
+  /** Stop sending a video stream added with ``addVideoStream``. A handle
+   *  that is not published is a no-op. */
   removeVideoStream(streamId: VideoStreamHandle): Promise<void> {
     return this.engine.removeVideoStream(streamId);
   }
@@ -342,7 +536,7 @@ export class RealtimeSession implements AsyncIterable<RealtimeSessionEvent> {
    *  or a non-default input device. Declares this client the session's voice
    *  and clears the server-side mute gate. A session carries one voice, so the
    *  stream takes it from the microphone until ``stopAudioStream``; starting a
-   *  second one throws ``AudioPublishAlreadyActiveError``. */
+   *  second one throws ``SessionStateError``. */
   startAudioStream(stream: MediaStream): Promise<void> {
     return this.engine.startAudioStream(stream);
   }
@@ -353,6 +547,11 @@ export class RealtimeSession implements AsyncIterable<RealtimeSessionEvent> {
     return this.engine.stopAudioStream();
   }
 
+  /** Expose a raw RPC method the server can invoke on this client. The
+   *  low-level escape hatch beneath declared client tools — prefer
+   *  ``clientTool()`` on the agent, which handles schemas, validation and
+   *  hooks. ``handler`` takes and returns JSON strings. Returns a function
+   *  that unregisters it; throws ``SessionStateError`` with no live transport. */
   registerRpcMethod(
     name: string,
     handler: (payload: string) => Promise<string>,
@@ -360,10 +559,17 @@ export class RealtimeSession implements AsyncIterable<RealtimeSessionEvent> {
     return this.engine.registerRpcMethod(name, handler);
   }
 
+  /** Play the agent's voice through an ``<audio>`` element you own, instead
+   *  of the hidden one the SDK creates. Pass ``null`` to hand playback
+   *  back. Idempotent, and callable before or after the session connects.
+   *  React apps get this from ``<RealtimeAudio />``. */
   attachAudioElement(el: HTMLAudioElement | null): void {
     this.engine.attachAudioElement(el);
   }
 
+  /** Retry playback after a browser autoplay block. Call it from a user
+   *  gesture handler — that is what makes the retry succeed. ``<StartAudio
+   *  />`` is the React affordance for this. */
   resumeAudioPlayback(): Promise<void> {
     return this.engine.resumeAudioPlayback();
   }
@@ -384,7 +590,12 @@ export class RealtimeSession implements AsyncIterable<RealtimeSessionEvent> {
    *  Returned shape mirrors the wire output of the desktop adapter's
    *  ``get_current_screen`` tool so the dispatcher can pass it straight
    *  through to the model. */
-  getVisionInputStatus(): { captured: boolean; message: string } {
+  getVisionInputStatus(): {
+    /** Whether fresh frames are reaching the model's vision input. */
+    captured: boolean;
+    /** Model-facing explanation, phrased for the agent to act on. */
+    message: string;
+  } {
     return this.engine.getVisionInputStatus();
   }
 
@@ -433,19 +644,54 @@ export class RealtimeSession implements AsyncIterable<RealtimeSessionEvent> {
       });
       return;
     }
-    this.push(message as RealtimeSessionEvent);
+    this.push(decodeStreamEvent(message as WireServerMessage));
+    this.flushTranscriptUpdates();
   }
 
-  private finishStream(state: SessionLifecycleState): void {
+  /** Put the folded transcript on the stream, once, after the frame that
+   *  produced it. A no-op when nothing is pending. */
+  private flushTranscriptUpdates(options?: { terminal: boolean }): void {
+    if (this.pendingTranscriptUpdates.length === 0) return;
+    const pending = this.pendingTranscriptUpdates.splice(0);
+    for (const event of pending) {
+      const item = { ...event, type: 'transcript_updated' as const };
+      // The closing fold rides the terminal path: a consumer that stopped
+      // pulling should lose an older buffered event rather than the settled
+      // transcript, which is the last thing the stream has to say.
+      if (options?.terminal === true) this.pushBeforeTerminal(item);
+      else this.push(item);
+    }
+  }
+
+  /** Queue an item that must survive a full queue, without claiming the
+   *  terminal slot — the eviction half of ``pushTerminal``. */
+  private pushBeforeTerminal(event: RealtimeSessionEvent): void {
+    if (this.pendingPull !== null) {
+      const pull = this.pendingPull;
+      this.pendingPull = null;
+      pull.resolve({ value: event, done: false });
+      return;
+    }
+    if (this.queue.length >= MAX_QUEUED_EVENTS) this.queue.shift();
+    this.queue.push(event);
+  }
+
+  private finishStream(state: SessionState): void {
     if (this.streamEnded || this.terminalQueued) return;
     this.terminalState = state;
+    // A turn still open when the session ends is closed by the engine's
+    // fold. That update has to land before the terminal item — Python puts
+    // both through its terminal path in this order — so it is flushed here
+    // rather than left to the microtask, which would run after the stream
+    // has ended.
+    this.flushTranscriptUpdates({ terminal: true });
     // Handshake failures throw from ``agent.start()`` — the stream a
     // caller never received ends empty, mirroring Python.
     if (state.disconnectReason !== 'handshake_failed') {
       const reason =
         state.detail ??
         DEFAULT_ENDED_REASON[state.disconnectReason ?? 'transport_error'];
-      this.pushTerminal({ type: 'session-ended', reason });
+      this.pushTerminal({ type: 'session_ended', reason });
     }
     this.endStream();
     for (const unsubscribe of this.unsubscribers) unsubscribe();

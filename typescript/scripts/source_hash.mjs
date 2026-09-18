@@ -25,13 +25,17 @@ function walk(dir) {
   return out;
 }
 
+// Every Node script under scripts/ is a build input — the build runs them to
+// produce dist — so the whole directory is walked rather than named file by
+// file: a script the list forgot would let its edits ship without a repack.
 const files = [
   ...walk(join(root, 'src')),
+  ...walk(join(root, 'scripts')).filter((path) => path.endsWith('.mjs')),
   join(root, 'package.json'),
   join(root, 'package-lock.json'),
   join(root, 'tsconfig.json'),
+  join(root, 'tsconfig.build.json'),
   join(root, 'tsup.config.ts'),
-  join(root, 'scripts', 'source_hash.mjs'),
 ]
   .map((path) => relative(root, path))
   .filter((path) => !NON_SHIPPED.test(path))

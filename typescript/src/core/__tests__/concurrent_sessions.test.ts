@@ -15,14 +15,16 @@ if (typeof global.TextDecoder === 'undefined') {
 
 import { RealtimeClient } from '../realtime_client';
 import type { RealtimeSession } from '../session';
-import type { ErrorEvent } from '../types';
 import type { RealtimeServerMessage } from '../../transport/envelope';
 import {
   collect,
   drain,
   makeFakeTransport,
   fakeSessionResponse,
+  sentTurns,
   transcriptFrame,
+  transcriptEvent,
+  readyEvent,
   type FakeTransport,
 } from './test_helpers';
 
@@ -74,6 +76,7 @@ async function startTwoSessions(): Promise<{
   ];
   let next = 0;
   const client = new RealtimeClient({
+    apiKey: 'test-key',
     transportFactory: () => {
       const fake = fakes[next];
       if (fake === undefined) throw new Error('no fake transport left');
@@ -98,8 +101,8 @@ describe('concurrent sessions on one client', () => {
 
     const eventsA = await collect(sessionA, 2);
     const eventsB = await collect(sessionB, 2);
-    expect(eventsA).toEqual([READY_A, transcriptFrame('only for A')]);
-    expect(eventsB).toEqual([READY_B, transcriptFrame('only for B')]);
+    expect(eventsA).toEqual([readyEvent('sess-a'), transcriptEvent('only for A')]);
+    expect(eventsB).toEqual([readyEvent('sess-b'), transcriptEvent('only for B')]);
     expect(sessionA.sessionId).toBe('sess-a');
     expect(sessionB.sessionId).toBe('sess-b');
   });
@@ -126,12 +129,12 @@ describe('concurrent sessions on one client', () => {
     await sessionA.sendText('for A');
     await sessionB.sendText('for B');
 
-    expect(fakeA.sent).toEqual([{ type: 'send-text', content: 'for A' }]);
-    expect(fakeB.sent).toEqual([{ type: 'send-text', content: 'for B' }]);
+    expect(sentTurns(fakeA)).toEqual([{ type: 'send-text', content: 'for A' }]);
+    expect(sentTurns(fakeB)).toEqual([{ type: 'send-text', content: 'for B' }]);
   });
 
   it('ending one session leaves the other live, then finishes both streams independently', async () => {
-    const { sessionA, sessionB, fakeB } = await startTwoSessions();
+    const { sessionA, sessionB } = await startTwoSessions();
 
     await sessionA.end();
 
@@ -141,13 +144,16 @@ describe('concurrent sessions on one client', () => {
     });
     expect(sessionB.state.kind).toBe('connected');
     expect(await drain(sessionA)).toEqual([
-      { type: 'session-ended', reason: 'client ended' },
+      readyEvent('sess-a'),
+      { type: 'session_ended', reason: 'client ended' },
     ]);
 
-    fakeB.emitMessage(READY_B);
     await sessionB.end();
     const eventsB = await drain(sessionB);
-    expect(eventsB).toEqual([READY_B, { type: 'session-ended', reason: 'client ended' }]);
+    expect(eventsB).toEqual([
+      readyEvent('sess-b'),
+      { type: 'session_ended', reason: 'client ended' },
+    ]);
   });
 });
 
@@ -157,6 +163,7 @@ describe('engine lifecycle hardening', () => {
     let fail = true;
     const fakes: FakeTransport[] = [];
     const client = new RealtimeClient({
+      apiKey: 'test-key',
       transportFactory: () => {
         if (fail) throw new Error('no transport');
         const fake = makeFakeTransport({
@@ -176,43 +183,43 @@ describe('engine lifecycle hardening', () => {
     await session.end();
   });
 
-  it('restarting from the error handler opens a fresh connected session', async () => {
+  it('restarting from the session_ended handler opens a fresh connected session', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
     const fakes: FakeTransport[] = [];
     const client = new RealtimeClient({
+      apiKey: 'test-key',
       transportFactory: () => {
         const fake = makeFakeTransport();
         fakes.push(fake);
         return fake;
       },
     });
-    const errors: Array<ErrorEvent | null> = [];
+    const endings: string[] = [];
     let restarted: Promise<RealtimeSession> | null = null;
 
     const failed = await client.agent().start();
-    failed.on('error', (event) => {
-      errors.push(event);
-      if (event !== null && restarted === null) {
-        restarted = client.agent().start();
-      }
+    failed.on('session_ended', (event) => {
+      endings.push(event.reason);
+      if (restarted === null) restarted = client.agent().start();
     });
     fakes[0]?.emitClose({ reason: 'livekit:ICE failed' });
     await drain(failed);
-    if (restarted === null) throw new Error('error handler never fired');
+    if (restarted === null) throw new Error('session_ended handler never fired');
     const second: RealtimeSession = await restarted;
 
-    expect(errors[errors.length - 1]).toEqual({
-      code: 'transport_disconnect',
-      message: 'ICE failed',
-    });
+    expect(endings).toEqual(['ICE failed']);
     expect(second.state.kind).toBe('connected');
+    // A transport that drops mid-session is reported on the lifecycle axis,
+    // with the vendor prefix stripped from the close reason.
     expect(failed.state.disconnectReason).toBe('transport_error');
+    expect(failed.state.detail).toBe('ICE failed');
+    expect(failed.getSnapshot().error).toBeNull();
     await second.end();
   });
 
   it('session_ended fires once when end() and close() race', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     const session = await client.agent().start();
     const endings: Array<{ reason: string }> = [];
     session.on('session_ended', (event) => endings.push(event));

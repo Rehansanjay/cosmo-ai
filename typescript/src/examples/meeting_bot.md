@@ -7,11 +7,11 @@ The Cosmo Assistant is engaged so the bot can delegate drafting the
 post-meeting note.
 
 ```ts
-import { RealtimeClient } from 'cosmo-ai';
+import { RealtimeClient, webSearchTool } from 'cosmo-ai';
 
 const client = new RealtimeClient();
 const agent = client.agent({
-  tools: [{ kind: 'web_search' }],
+  tools: [webSearchTool()],
 });
 const session = await agent.start();
 

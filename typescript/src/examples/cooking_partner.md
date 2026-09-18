@@ -7,14 +7,14 @@ Cosmo Assistant handles the recipe knowledge graph; a `set_timer` tool lets
 the agent kick off countdowns without escalating the assistant on every turn.
 
 ```ts
-import { RealtimeClient } from 'cosmo-ai';
+import { RealtimeClient, webSearchTool } from 'cosmo-ai';
+import { clientTool } from 'cosmo-ai/tool';
 
 const client = new RealtimeClient();
 const agent = client.agent({
   tools: [
-    { kind: 'web_search' },
-    {
-      kind: 'client',
+    webSearchTool(),
+    clientTool({
       name: 'set_timer',
       description: 'Start a kitchen countdown timer.',
       parameters: {
@@ -23,7 +23,7 @@ const agent = client.agent({
         required: ['seconds'],
       },
       handler: async ({ seconds }) => startTimer(seconds as number),
-    },
+    }),
   ],
 });
 const session = await agent.start();

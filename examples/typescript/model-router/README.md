@@ -15,14 +15,13 @@ await client.agent(result.agentConfig).start();  // start with it
 
 Everything else in `src/App.tsx` is UI chrome for making that decision
 visible — the routing itself needs nothing more than the two lines above.
-Scoped to the 3 providers `ModelOptions` exposes today — `gemini`, `openai`,
-`openai_mini`.
+Scoped to 3 of the providers `RealtimeModelBlock` exposes — `gemini`,
+`openai`, `openai_mini`.
 
-The `openai`/`openai_mini` routes need the `realtime-openai-provider-enabled`
-feature flag on for your workspace — off (the default in most environments),
-a session started against one of those routes is rejected with
-`model_unavailable`. The Gemini routes (practice/brainstorm, and the
-fallback for anything unmatched) work regardless.
+The `openai`/`openai_mini` routes need the server to have an OpenAI API key
+configured — without one, a session started against one of those routes is
+rejected with `model_unavailable`. The Gemini routes (practice/brainstorm,
+and the fallback for anything unmatched) work regardless.
 
 ## Run it
 
@@ -31,9 +30,10 @@ npm install
 npm run dev
 ```
 
-Open the Vite URL, then paste a Cosmo API key with the `realtime:use` scope
-(Developer platform → API keys in the Cosmo web app) into the Connection box.
-`cp .env.example .env` to skip the pasting on every run.
+Open the Vite URL and speak an intent. No key needed: the dev server mints
+short-lived tokens from the credential `cosmo init` stored (run it once if
+you haven't). The Connection box appears only on a deployed build, where it
+collects the access password.
 
 Try "help me practice a speech" versus "quick question about my bill" —
 different provider badges, different turn-taking behavior.

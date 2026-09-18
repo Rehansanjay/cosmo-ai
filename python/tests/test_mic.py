@@ -139,7 +139,7 @@ def test_capture_policy_maps_field_by_field() -> None:
 def test_source_unavailable_before_start() -> None:
     mic = micmod.MicAudioSource()
     with pytest.raises(RuntimeError):
-        _ = mic.livekit_source
+        _ = mic.audio_source
 
 
 def test_unopenable_device_raises_and_leaks_no_handle() -> None:

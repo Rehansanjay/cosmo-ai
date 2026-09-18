@@ -6,6 +6,7 @@
  * agent-targeted byte-stream primitive.
  */
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
+import { SDK_NAME, SDK_VERSION } from '../../constants';
 import { TextEncoder as NodeTextEncoder, TextDecoder as NodeTextDecoder } from 'util';
 
 if (typeof global.TextEncoder === 'undefined') {
@@ -16,7 +17,7 @@ if (typeof global.TextDecoder === 'undefined') {
 }
 
 import { LiveKitTransport } from '../livekit_transport';
-import type { SessionConfig } from '../../wire/types.gen';
+import type { SessionConfig } from '../../protocol';
 
 type FakeParticipant = { identity: string; kind: string };
 
@@ -75,6 +76,7 @@ vi.mock('livekit-client', () => {
 const START_URL = 'https://api.example.com/api/v1/external/realtime/session/start';
 
 const CONFIG: SessionConfig = {
+  sdk: { name: SDK_NAME, version: SDK_VERSION },
   type: 'session-config',
   agent: { type: 'inline', voice: { name: 'Breezy' } },
 };

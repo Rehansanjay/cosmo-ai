@@ -30,12 +30,14 @@ built artifact for `cosmo_` before shipping.
 
 ## Gotchas
 
-- **A `cosmo login` CLI key cannot mint.** Minting needs the
-  `user_tokens:mint` scope — the **User tokens — mint** checkbox on a
-  dashboard-created key, unchecked by default. The right shape is a
-  **provisioning key** with only that scope: it can mint but cannot join
-  sessions, so a leaked minting credential grants no conversational
-  access.
+- **A `cosmo login` CLI key mints dev tokens only.** It carries
+  `user_tokens:mint` for the local loop, but its mints are budgeted and
+  the tokens clamped to one hour — fine under `TokenSource` refresh,
+  wrong for production. Deployments use a **provisioning key** with only
+  the `user_tokens:mint` scope (the **User tokens — mint** checkbox on a
+  dashboard-created key): it can mint but cannot join sessions, so a
+  leaked minting credential grants no conversational access. A CLI key
+  from before minting joined sign-in's grants 403s — `cosmo login` again.
 - **The mint endpoint must authenticate the caller** — minting spends the
   developer's workspace money. The template's `MINT_SECRET` mode is for
   server-to-server and closed betas only; a secret in a shipped binary

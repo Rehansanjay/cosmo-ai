@@ -12,18 +12,17 @@ from typing import Any, Callable
 
 import pytest
 
+from cosmo_ai._internal.protocol import BackgroundClientTool, ClientTool
 from cosmo_ai._internal.schema import check_schema_dialect
 from cosmo_ai.tools import (
     DRAW_BOX_TOOL_NAME,
     DRAW_POINT_TOOL_NAME,
-    BackgroundClientTool,
-    ClientTool,
     ClientToolJob,
     DrawBoxRequest,
     DrawOutcome,
     DrawPointRequest,
-    draw_box,
-    draw_point,
+    draw_box_tool,
+    draw_point_tool,
 )
 from cosmo_ai.tools._draw import _DRAW_BOX_PARAMETERS, _DRAW_POINT_PARAMETERS
 
@@ -59,7 +58,7 @@ def _shown(request: Any) -> DrawOutcome:
 
 
 def test_drawing_reports_shown_to_the_model() -> None:
-    assert _invoke(draw_box(_shown), _BOX_ARGS) == {
+    assert _invoke(draw_box_tool(_shown), _BOX_ARGS) == {
         "ok": True,
         "result": {"shown": True},
         "error": None,
@@ -72,7 +71,7 @@ def test_refusing_to_draw_tells_the_model_why() -> None:
     def on_draw(request: DrawBoxRequest) -> DrawOutcome:
         return DrawOutcome(shown=False, reason=reason)
 
-    assert _invoke(draw_box(on_draw), _BOX_ARGS) == {
+    assert _invoke(draw_box_tool(on_draw), _BOX_ARGS) == {
         "ok": True,
         "result": {"shown": False, "reason": reason},
         "error": None,
@@ -86,7 +85,7 @@ def test_malformed_arguments_reach_the_model_as_an_error_not_the_handler() -> No
         seen.append(request)
         return DrawOutcome(shown=True)
 
-    reply = _invoke(draw_box(on_draw), {"box": "over there"})
+    reply = _invoke(draw_box_tool(on_draw), {"box": "over there"})
 
     assert seen == []
     assert reply == {
@@ -103,7 +102,7 @@ def test_the_point_renderer_registers_and_replies_the_same_way() -> None:
     def on_draw(request: DrawPointRequest) -> DrawOutcome:
         return DrawOutcome(shown=False, reason="no preview is visible")
 
-    assert _invoke(draw_point(on_draw), _POINT_ARGS)["result"] == {
+    assert _invoke(draw_point_tool(on_draw), _POINT_ARGS)["result"] == {
         "shown": False,
         "reason": "no preview is visible",
     }
@@ -114,14 +113,14 @@ def test_an_async_handler_is_awaited() -> None:
         await asyncio.sleep(0)
         return DrawOutcome(shown=False, reason="the preview is behind another window")
 
-    assert _invoke(draw_box(on_draw), _BOX_ARGS)["result"] == {
+    assert _invoke(draw_box_tool(on_draw), _BOX_ARGS)["result"] == {
         "shown": False,
         "reason": "the preview is behind another window",
     }
 
 
 def test_the_sdks_own_tools_reach_the_wire_declaration() -> None:
-    body = start_body(tools=[draw_box(_shown), draw_point(_shown)])
+    body = start_body(tools=[draw_box_tool(_shown), draw_point_tool(_shown)])
     declared = {spec["name"]: spec for spec in body["agent"]["tools"]}
 
     assert set(declared) == {DRAW_BOX_TOOL_NAME, DRAW_POINT_TOOL_NAME}

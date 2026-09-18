@@ -1,7 +1,7 @@
 import type {
   InlineAgentConfig,
   SessionResponse,
-} from '../../wire/types.gen';
+} from '../../protocol';
 import type {
   RealtimeClientMessage,
   RealtimeServerMessage,
@@ -22,12 +22,16 @@ export type FakeTransport = RealtimeTransport & {
   sent: RealtimeClientMessage[];
   /** Feed one wire frame to the engine, as if it arrived off the data channel. */
   emitMessage: (message: RealtimeServerMessage) => void;
+  /** True once the engine subscribed ``onMessage`` — tests emitting frames
+   *  mid-start wait on this instead of guessing at scheduler timing. */
+  hasMessageListener: () => boolean;
   /** Fire an unsolicited transport close. */
   emitClose: (info?: RealtimeCloseInfo) => void;
   /** The opts of the last ``disconnect`` call, or null if never called. */
   lastDisconnectOpts: () => { sendEndFrame?: boolean } | null | undefined;
   emitReconnecting: () => void;
   emitReconnected: () => void;
+  emitOutputBlocked: (blocked: boolean) => void;
   /** RPC methods registered on the transport, by name. */
   rpcMethods: Map<string, (invocation: RpcInvocation) => Promise<string>>;
   /** Byte-stream payloads passed to ``sendBytes``, in order. */
@@ -45,7 +49,18 @@ export type FakeTransport = RealtimeTransport & {
  *  mic-publish flag — and every ``send``, and exposes ``emit*`` triggers so
  *  tests can feed wire frames and transport lifecycle events. */
 export function makeFakeTransport(
-  options: { connectError?: Error; sessionResponse?: SessionResponse } = {},
+  options: {
+    connectError?: Error;
+    sessionResponse?: SessionResponse;
+    connectGate?: Promise<void>;
+    /** ``start()`` resolves at ready, so the fake mirrors a healthy worker
+     *  and lands the handshake as part of ``connect``. Pass ``false`` when
+     *  the test drives ``ready`` itself (its timing, or its absence). */
+    readyOnConnect?: boolean;
+    /** Payload for the auto-emitted ``ready``; defaults to a minimal frame
+     *  carrying the response's session id. */
+    readyFrame?: RealtimeServerMessage;
+  } = {},
 ): FakeTransport {
   let captured: RealtimeConnectOptions | undefined;
   let disconnectOpts: { sendEndFrame?: boolean } | null | undefined;
@@ -86,6 +101,9 @@ export function makeFakeTransport(
       // Phase values are arbitrary — the real computation is pinned in the
       // transport's own suite. What matters here is that a started client
       // exposes timings at all, and that ``serverTimings`` rides through.
+      // Reported in the pre-marks shape and with no connect origin, so the
+      // engine suites all run against a transport written before either
+      // existed — the compatibility a published extension point owes.
       opts.onConnectTimings?.({
         wsMs: 1,
         roomMs: 2,
@@ -93,6 +111,12 @@ export function makeFakeTransport(
         totalConnectMs: 6,
         serverTimings: response.timings ?? null,
       });
+      await options.connectGate;
+      if (options.readyOnConnect !== false) {
+        const ready =
+          options.readyFrame ?? { type: 'ready', session_id: response.session_id };
+        for (const cb of messageListeners) cb(ready);
+      }
     },
     disconnect: async (opts?: { sendEndFrame?: boolean }): Promise<void> => {
       disconnectOpts = opts ?? null;
@@ -106,6 +130,8 @@ export function makeFakeTransport(
     setMicMuted: async (): Promise<void> => {},
     getInputStream: () => null,
     getOutputAudioElement: () => null,
+    getOutputStream: () => null,
+    onOutputStreamChanged: () => () => {},
     attachAudioElement: () => {},
     onMessage: (cb) => {
       messageListeners.add(cb);
@@ -139,6 +165,7 @@ export function makeFakeTransport(
     emitMessage: (message) => {
       for (const cb of messageListeners) cb(message);
     },
+    hasMessageListener: () => messageListeners.size > 0,
     emitClose: (info) => {
       for (const cb of closeListeners) cb(info);
     },
@@ -148,6 +175,7 @@ export function makeFakeTransport(
     emitReconnected: () => {
       for (const cb of reconnectedListeners) cb();
     },
+    emitOutputBlocked: (blocked) => captured?.onOutputBlocked?.(blocked),
   };
 }
 
@@ -172,6 +200,26 @@ export function transcriptFrame(text: string): RealtimeServerMessage {
   return { type: 'transcript', role: 'ASSISTANT', text, is_final: true };
 }
 
+
+/** The event a ``transcriptFrame`` becomes once the session has decoded it —
+ *  written out rather than run through the decoder, so the expectation is
+ *  independent of the code under test. */
+export function transcriptEvent(text: string): RealtimeSessionEvent {
+  return { type: 'transcript', role: 'assistant', text, isFinal: true };
+}
+
+/** The event a bare ``ready`` frame becomes, for a session with no rejected
+ *  tools, no duration cap and no registry agent. */
+export function readyEvent(sessionId: string): RealtimeSessionEvent {
+  return {
+    type: 'ready',
+    sessionId,
+    rejectedTools: [],
+    maxSessionSeconds: null,
+    agent: null,
+  };
+}
+
 /** Pull exactly ``count`` items off the session stream (fewer if it ends). */
 export async function collect(
   session: RealtimeSession,
@@ -192,6 +240,12 @@ export async function drain(session: RealtimeSession): Promise<RealtimeSessionEv
   const events: RealtimeSessionEvent[] = [];
   for await (const event of session) events.push(event);
   return events;
+}
+
+/** What the session sent on a caller's behalf: everything but the
+ *  ``connect-timings`` report the engine publishes once the agent is live. */
+export function sentTurns(fake: FakeTransport): RealtimeClientMessage[] {
+  return fake.sent.filter((message) => message.type !== 'connect-timings');
 }
 
 /** Narrow a captured session-config's agent block to the inline variant —

@@ -2,12 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  RealtimeProvider,
   RealtimeClient,
   TokenSource,
   type RealtimeClientOptions,
   type RealtimeSession,
 } from 'cosmo-ai';
+import {
+  RealtimeProvider,
+} from 'cosmo-ai/react';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 
 import { buildInstructions, greetingFor } from './agent/instructions';
@@ -19,9 +21,9 @@ import { AgentPanel } from './panel/AgentPanel';
 import { loadPdf } from './pdf/load';
 import { PdfViewer } from './pdf/PdfViewer';
 
-// Prefill from a gitignored .env for local dev convenience (see .env.example).
-// Never hardcode a key here — this file is committed.
-const API_KEY_DEFAULT = import.meta.env.VITE_COSMO_API_KEY ?? '';
+// No key in page code: /token mints short-lived tokens in both modes — the
+// vite.config tokenRoute plugin under `vite dev`, the deployed Function
+// otherwise. The settings key field stays as an override.
 
 // Display only — the SDK resolves its backend itself, from the
 // `cosmo-base-url` meta tag vite.config.ts injects when VITE_COSMO_BASE_URL
@@ -29,10 +31,10 @@ const API_KEY_DEFAULT = import.meta.env.VITE_COSMO_API_KEY ?? '';
 // answers wildcard CORS, so no proxy is involved in either mode.
 const SESSION_TARGET = import.meta.env.VITE_COSMO_BASE_URL || 'https://platform.askcosmo.ai';
 
-// A build with no key inlined is a deployed one: its key stays server-side in
-// the /token Function, so what the box collects is an access password the
-// page trades for short-lived end-user tokens.
-const HOSTED = API_KEY_DEFAULT === '';
+// A built bundle is a deployed one: its key stays server-side in the /token
+// Function, so what the box collects is an access password the page trades
+// for short-lived end-user tokens.
+const HOSTED = import.meta.env.PROD;
 
 /** Stable per-browser identity for hosted mode — Cosmo meters and scopes per
  *  this id, so each visitor gets their own auto-provisioned project. */
@@ -210,7 +212,7 @@ function OpenStep({
 export function App() {
   const [open, setOpen] = useState<OpenDoc | null>(null);
   const [sectionIndex, setSectionIndex] = useState(0);
-  const [apiKey, setApiKey] = useState(API_KEY_DEFAULT);
+  const [apiKey, setApiKey] = useState('');
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [session, setSession] = useState<RealtimeSession | null>(null);
@@ -267,17 +269,23 @@ export function App() {
   }, []);
 
   const handleConnect = useCallback(async () => {
-    if (!open || !apiKey) return;
+    if (!open || (HOSTED && !apiKey)) return;
     setConnecting(true);
     setError(null);
-    // Hosted: the box held a password, traded for short-lived end-user tokens
-    // by this deployment's /token Function — TokenSource keeps one fresh.
-    // Local: the box held an API key, sent to the backend directly.
-    const opts: RealtimeClientOptions = HOSTED
-      ? { token: TokenSource.endpoint('/token', { headers: () => mintHeaders(apiKey) }) }
-      : { apiKey };
+    // One path, either mode: /token mints, TokenSource keeps one fresh.
+    // Hosted sends the access password; dev sends only the visitor id
+    // (a pasted key overrides and talks to the backend directly).
+    const pastedKey = !HOSTED && apiKey.trim() !== '' ? apiKey.trim() : null;
+    const options: RealtimeClientOptions = pastedKey
+      ? { apiKey: pastedKey }
+      : {
+          token: TokenSource.endpoint('/token', {
+            headers: () =>
+              HOSTED ? mintHeaders(apiKey) : { 'x-external-user-id': externalUserId() },
+          }),
+        };
     try {
-      const client = new RealtimeClient(opts);
+      const client = new RealtimeClient(options);
       const started = await client
         .agent({
           instructions: buildInstructions(open.doc),
@@ -360,7 +368,7 @@ export function App() {
           )}
 
           {session ? (
-            <RealtimeProvider session={session} maxTranscriptLength={80}>
+            <RealtimeProvider session={session}>
               <AgentPanel onEnd={handleEnd} />
             </RealtimeProvider>
           ) : (
@@ -368,19 +376,25 @@ export function App() {
               <div className="panel-intro">
                 <h2>Cosmo</h2>
                 <p>Start a session and ask about the page you're on, out loud.</p>
-                <button className="btn btn-primary" onClick={() => void handleConnect()} disabled={connecting || !apiKey}>
+                <button
+                  className="btn btn-primary"
+                  onClick={() => void handleConnect()}
+                  disabled={connecting || (HOSTED && !apiKey)}
+                >
                   {connecting
                     ? 'Connecting…'
-                    : apiKey
-                      ? 'Start talking'
-                      : `Add ${HOSTED ? 'the password' : 'a key'} below to start`}
+                    : HOSTED && !apiKey
+                      ? 'Add the password below to start'
+                      : 'Start talking'}
                 </button>
               </div>
 
-              <details className="settings" open={!apiKey}>
+              <details className="settings" open={HOSTED && !apiKey}>
                 <summary>Connection</summary>
                 <div className="field">
-                  <label htmlFor="k">{HOSTED ? 'Access password' : 'API key'}</label>
+                  <label htmlFor="k">
+                    {HOSTED ? 'Access password' : 'API key (optional — /token is used when empty)'}
+                  </label>
                   <input
                     id="k"
                     type="password"
@@ -397,7 +411,8 @@ export function App() {
                     </>
                   ) : (
                     <>
-                      Sent to <code>{SESSION_TARGET}</code>. Change it with
+                      Empty, the page mints from its own <code>/token</code> route. Sessions go to{' '}
+                      <code>{SESSION_TARGET}</code> — change it with
                       <code> VITE_COSMO_BASE_URL</code> in <code>.env</code> and restart.
                     </>
                   )}

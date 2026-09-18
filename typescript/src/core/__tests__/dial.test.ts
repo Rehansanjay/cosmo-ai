@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
+import { SessionStateError } from '../errors';
 import { TextEncoder as NodeTextEncoder, TextDecoder as NodeTextDecoder } from 'util';
 
 if (typeof global.TextEncoder === 'undefined') {
@@ -10,9 +11,9 @@ if (typeof global.TextDecoder === 'undefined') {
 
 import { RealtimeClient } from '../realtime_client';
 import type { RealtimeSession } from '../session';
-import { NotReadyError } from '../types';
 import { DialError } from '../../transport/dial';
 import type { RealtimeConnectOptions, RealtimeTransport } from '../../transport/types';
+import type { RealtimeInboundMessage } from '../../transport/envelope';
 
 vi.mock('livekit-client', () => {
   class Room {
@@ -41,19 +42,29 @@ vi.mock('livekit-client', () => {
 
 /** Fake transport that publishes a server-minted session id on connect (the
  *  real transport fires this the instant the session-start POST returns) so
- *  ``dial()`` has a live session id to target. */
+ *  ``dial()`` has a live session id to target, and lands the ``ready``
+ *  handshake so ``start()`` resolves. */
 function makeFakeTransport(sessionId = 'sess-123'): RealtimeTransport {
+  const messageListeners = new Set<(msg: RealtimeInboundMessage) => void>();
   return {
     connect: async (opts: RealtimeConnectOptions): Promise<void> => {
       opts.onSessionStarted?.(sessionId);
+      for (const cb of messageListeners) cb({ type: 'ready', session_id: sessionId });
     },
     disconnect: async (): Promise<void> => {},
     send: async (): Promise<void> => {},
     setMicMuted: async (): Promise<void> => {},
     getInputStream: () => null,
     getOutputAudioElement: () => null,
+    getOutputStream: () => null,
+    onOutputStreamChanged: () => () => {},
     attachAudioElement: () => {},
-    onMessage: () => () => {},
+    onMessage: (cb) => {
+      messageListeners.add(cb);
+      return () => {
+        messageListeners.delete(cb);
+      };
+    },
     onClose: () => () => {},
     onReconnecting: () => () => {},
     onReconnected: () => () => {},
@@ -87,6 +98,7 @@ describe('RealtimeSession.dial', () => {
     options: ConstructorParameters<typeof RealtimeClient>[0] = {},
   ): Promise<RealtimeSession> {
     const client = new RealtimeClient({
+      getAuthHeaders: () => ({}),
       transportFactory: () => makeFakeTransport(),
       ...options,
     });
@@ -129,7 +141,7 @@ describe('RealtimeSession.dial', () => {
     const session = await connectedSession({});
 
     await expect(session.dial(NUMBER, '1234')).rejects.toMatchObject({
-      code: 'invalid_phone_number',
+      code: 'invalid_request',
     });
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -155,7 +167,7 @@ describe('RealtimeSession.dial', () => {
 
     const err = await session.dial(NUMBER).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(DialError);
-    expect((err as DialError).code).toBe('transport_error');
+    expect((err as DialError).code).toBe('request_failed');
     expect((err as DialError).message).toBe('Failed to fetch');
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
@@ -164,7 +176,7 @@ describe('RealtimeSession.dial', () => {
     const session = await connectedSession({});
 
     await expect(session.dial('1234')).rejects.toMatchObject({
-      code: 'invalid_phone_number',
+      code: 'invalid_request',
     });
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -179,7 +191,8 @@ describe('RealtimeSession.dial', () => {
 
     const err = await session.dial(NUMBER).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(DialError);
-    expect((err as DialError).code).toBe('phone_calls_disabled');
+    expect((err as DialError).code).toBe('request_rejected');
+    expect((err as DialError).serverCode).toBe('phone_calls_disabled');
     expect((err as DialError).message).toBe('Not enabled.');
   });
 
@@ -189,7 +202,7 @@ describe('RealtimeSession.dial', () => {
     );
     const session = await connectedSession({});
 
-    await expect(session.dial(NUMBER)).rejects.toMatchObject({ code: 'session_not_live' });
+    await expect(session.dial(NUMBER)).rejects.toMatchObject({ code: 'request_rejected', serverCode: 'session_not_live' });
   });
 
   it('raises invalid_response when a 200 body is missing dial_id', async () => {
@@ -204,7 +217,7 @@ describe('RealtimeSession.dial', () => {
     const session = await connectedSession({});
     await session.end();
 
-    await expect(session.dial(NUMBER)).rejects.toBeInstanceOf(NotReadyError);
+    await expect(session.dial(NUMBER)).rejects.toBeInstanceOf(SessionStateError);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });

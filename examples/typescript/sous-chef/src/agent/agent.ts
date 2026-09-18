@@ -1,4 +1,5 @@
-import type { AgentConfig, ModelOptions } from 'cosmo-ai';
+import type { AgentConfig, RealtimeModelBlock } from 'cosmo-ai';
+import { endCallTool, examineImageTool, webSearchTool } from 'cosmo-ai';
 
 import type { CookStore } from '../state/store';
 import { makeGuard } from './guards';
@@ -9,12 +10,11 @@ import { makeClientTools } from './tools';
  *  is provider-agnostic, which is rather the point. */
 export type CookProvider = 'gemini' | 'openai';
 
-/** `model` selects the provider and `modelOptions` carries that provider's own
- *  knobs — naming one without the other leaves the session on the workspace
- *  default. Each provider's endpointing is tuned the same way: a cook says
+/** One block per provider: it names the provider and carries that provider's
+ *  own knobs. Each provider's endpointing is tuned the same way: a cook says
  *  short, complete things and then waits, so close the turn promptly rather
  *  than sitting out a long silence window. */
-const MODEL_OPTIONS: Record<CookProvider, ModelOptions> = {
+const MODELS: Record<CookProvider, RealtimeModelBlock> = {
   // Thought summaries cost about a second before the first word, and nothing
   // here reads them.
   gemini: { provider: 'gemini', includeThoughts: false, endOfSpeechSensitivity: 'high' },
@@ -39,12 +39,11 @@ export function sousChefAgent(
   return {
     instructions: INSTRUCTIONS,
     voice: VOICE,
-    model: provider,
-    modelOptions: MODEL_OPTIONS[provider],
+    model: MODELS[provider],
     tools: [
-      { kind: 'web_search' },
-      { kind: 'examine_image' },
-      { kind: 'end_call' },
+      webSearchTool(),
+      examineImageTool(),
+      endCallTool(),
       ...makeClientTools(store),
     ],
     hooks: [

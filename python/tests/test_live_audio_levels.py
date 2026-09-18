@@ -153,7 +153,7 @@ def test_microphone_level_is_readable_from_the_device_module() -> None:
         )
         try:
             await mic.start()
-            track = rtc.LocalAudioTrack.create_audio_track("mic", mic.livekit_source)
+            track = rtc.LocalAudioTrack.create_audio_track("mic", mic.audio_source)
             publication = await room.local_participant.publish_track(track)
             mic.set_level_source(publication.track)
 

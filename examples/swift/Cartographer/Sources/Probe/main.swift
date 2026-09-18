@@ -19,7 +19,7 @@ struct Args: Decodable, Sendable {
     let parent: String?
 }
 
-let addIdea = try AgentTool.define(
+let addIdea = try AgentTool.clientTool(
     name: "add_idea",
     description: "Put one idea on the user's visible mind map. Call immediately for each idea.",
     input: .object(
@@ -35,13 +35,13 @@ let addIdea = try AgentTool.define(
     return ["id": .string(args.idea.lowercased().replacingOccurrences(of: " ", with: "-"))]
 }
 
-let options = try RealtimeClient.Options()
-say("connecting to \(options.baseURL.host ?? "?") …")
+let client = try RealtimeClient()
+say("connecting …")
 let t0 = Date()
 
 let audioOff = ProcessInfo.processInfo.environment["NO_AUDIO"] == "1"
 
-let agent = try RealtimeClient(options).agent(
+let agent = try client.agent(
     instructions: """
     You draw a mind map from what the user says. Call add_idea for every \
     idea, immediately, before replying. Then reply in one short sentence.
@@ -49,21 +49,19 @@ let agent = try RealtimeClient(options).agent(
     audio: AudioConfig(output: audioOff ? false : nil),
     tools: [addIdea]
 )
-let session = try await agent.start(micMuted: true)
-say("start() returned in \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
-
-let stateWatch = Task {
-    for await state in session.states {
-        say("  [state] \(state) @\(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
-    }
+@Sendable func reportState(_ state: SessionState) {
+    say("  [state] \(state) @\(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
 }
+
+let session = try await agent.start(micMuted: true, onStateChange: reportState)
+say("start() returned in \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
 
 let pump = Task {
     for try await event in session.events {
         switch event {
         case .ready(let r):
             say("ready at \(String(format: "%.2f", Date().timeIntervalSince(t0)))s — session \(r.sessionId)")
-            for rej in r.rejectedTools ?? [] { say("  ⚠︎ server rejected tool: \(rej.name)") }
+            for rej in r.rejectedTools { say("  ⚠︎ server rejected tool: \(rej.name)") }
             try await session.send(
                 text: "I'm thinking about a weekend trip: either Vermont for hiking, "
                     + "or Montreal for food. Budget is tight and I only have two days."
@@ -109,7 +107,6 @@ let watchdog = Task {
 }
 _ = try? await pump.value
 watchdog.cancel()
-stateWatch.cancel()
 
 say("\nideas captured: \(await collected.ideas)")
 await session.end()

@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
+from typing_extensions import assert_never
 
 from cosmo_ai import (
     RealtimeClient,
@@ -42,7 +43,16 @@ from cosmo_ai import (
     hooks,
     tool,
 )
-from cosmo_ai.hooks import PostToolUseContext, PreToolUseContext, PreToolUseResult, SessionEndContext
+from cosmo_ai.hooks import (
+    PostToolUseContext,
+    PreToolUseContext,
+    PreToolUseResult,
+    SessionEndContext,
+    ToolDenied,
+    ToolError,
+    ToolOk,
+    ToolOutcome,
+)
 
 AUDIT_LOG = Path("tool_audit.jsonl")
 
@@ -55,6 +65,22 @@ PHONE_RE = re.compile(r"(\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}")
 
 def redact_pii(text: str) -> str:
     return PHONE_RE.sub("[phone]", EMAIL_RE.sub("[email]", text))
+
+
+def outcome_kind(outcome: ToolOutcome) -> str:
+    """The audit column TypeScript reads off ``ctx.outcome.kind``. Narrowing
+    the union is how Python gets it, and ``assert_never`` keeps the audit log
+    honest: a fourth case stops type-checking instead of logging the wrong
+    thing."""
+    match outcome:
+        case ToolOk():
+            return "ok"
+        case ToolError():
+            return "error"
+        case ToolDenied():
+            return "denied"
+        case _:
+            assert_never(outcome)
 
 
 class CaseNoteInput(BaseModel):
@@ -109,7 +135,7 @@ def audit_trail(ctx: PostToolUseContext) -> None:
             k: redact_pii(v) if isinstance(v, str) else v
             for k, v in ctx.arguments.items()
         },
-        "outcome": type(ctx.outcome).__name__,
+        "outcome": outcome_kind(ctx.outcome),
     }
     with AUDIT_LOG.open("a") as f:
         f.write(json.dumps(record) + "\n")

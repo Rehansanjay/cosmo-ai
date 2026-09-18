@@ -3,6 +3,9 @@
 // Each rung resolves to a verbatim instruction string the caller forwards as
 // the session-config's ``agent.speaking_style``. The prompt text is tuned for Gemini Live.
 
+/** How free-flowing the agent's delivery should be, in increasing order:
+ *  ``warm`` (conversational), ``delivery`` (relaxed), ``human`` (loosest).
+ *  Pass one to ``naturalness()``. */
 export type NaturalnessRung = 'warm' | 'delivery' | 'human';
 
 /** Schema version of the catalog's prompt text. Bump on any wording change. */
@@ -11,7 +14,9 @@ export const NATURALNESS_VERSION = 1;
 /** The three rungs, in increasing order of free-flowing delivery. */
 export const NATURALNESS_RUNGS: readonly NaturalnessRung[] = ['warm', 'delivery', 'human'];
 
-// Verbatim delivery-style prompt text per rung. Gemini-tuned, v1.
+/** The verbatim delivery-style prompt each rung resolves to.
+ *  ``naturalness(rung)`` is the way to reach one; read this directly only to
+ *  inspect or adapt the text. */
 export const NATURALNESS_INSTRUCTIONS: Readonly<Record<NaturalnessRung, string>> = {
   warm: `You speak like a real human, not an assistant: contractions, casual register, the small "oh" or "yeah" that slips out naturally. You take what the person says at face value and meet them where they are.
 

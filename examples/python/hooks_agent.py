@@ -13,6 +13,8 @@ import asyncio
 
 import structlog
 
+from typing_extensions import assert_never
+
 from cosmo_ai import RealtimeClient, hooks
 from cosmo_ai.hooks import (
     PostToolUseContext,
@@ -21,6 +23,10 @@ from cosmo_ai.hooks import (
     SessionStartContext,
     SessionStartResult,
     SessionEndContext,
+    ToolDenied,
+    ToolError,
+    ToolOk,
+    ToolOutcome,
 )
 
 logger = structlog.get_logger(__name__)
@@ -36,9 +42,24 @@ def block_deletes(ctx: PreToolUseContext) -> PreToolUseResult:
     return PreToolUseResult(permission="deny", reason="destructive tools are disabled")
 
 
+def describe(outcome: ToolOutcome) -> str:
+    """Narrow the outcome to its case, the way Swift's ``switch`` and
+    TypeScript's ``kind`` do. ``assert_never`` is what makes it exhaustive:
+    add a fourth case to the union and this stops type-checking."""
+    match outcome:
+        case ToolOk(result=result):
+            return f"ok result={result}"
+        case ToolError(message=message):
+            return f"error {message}"
+        case ToolDenied(reason=reason):
+            return f"denied {reason}"
+        case _:
+            assert_never(outcome)
+
+
 @hooks.post_tool_use
 def log_outcome(ctx: PostToolUseContext) -> None:
-    logger.info("tool.done", tool=ctx.tool_name, outcome=type(ctx.outcome).__name__)
+    logger.info("tool.done", tool=ctx.tool_name, outcome=describe(ctx.outcome))
 
 
 @hooks.session_end

@@ -13,6 +13,8 @@ from unittest import mock
 
 import pytest
 import structlog.testing
+from cosmo_ai._internal.protocol import ClientTool
+from cosmo_ai import SessionStartErrorCode
 from cosmo_ai import (
     AudioUnavailableError,
     DisconnectReason,
@@ -20,15 +22,16 @@ from cosmo_ai import (
     ReadyEvent,
     RealtimeSession,
     SessionEndedEvent,
+    SessionEndingSoonEvent,
     TranscriptDeltaEvent,
+    TranscriptUpdatedEvent,
     SessionStateWriteEvent,
     TranscriptRole,
     UsageEvent,
-    SessionStartError,
-    RealtimeSessionState,
+    SessionState,
     SessionStateKind,
     UnknownEvent,
-    VersionMismatchError,
+    SessionStartError,
 )
 
 import httpx
@@ -38,9 +41,13 @@ from cosmo_ai.session._livekit import (
     _quiet_expected_livekit_streams,
 )
 
-from cosmo_ai.tools import ClientTool
 
-from .fakes import FakeSessionHarness, FakeTransport, start_fake_session
+from .fakes import (
+    START_RESPONSE_JSON,
+    FakeSessionHarness,
+    FakeTransport,
+    start_fake_session,
+)
 
 
 def _stream_ignore_record(verb: str, topic: str) -> logging.LogRecord:
@@ -59,6 +66,10 @@ READY_FRAME: dict[str, Any] = {
     "session_id": "sess-test",
 }
 
+#: Filler for queue-bound tests: any event that is neither deduped (as a
+#: second ``ready`` is) nor terminal.
+_PONG_FRAME: dict[str, Any] = {"type": "pong"}
+
 
 async def _inject(session: RealtimeSession, *frames: dict[str, Any] | str) -> None:
     for frame in frames:
@@ -72,12 +83,11 @@ async def _collect(session: RealtimeSession, count: int) -> list[Any]:
 
 def test_unknown_event_type_is_tolerated_and_stream_continues() -> None:
     async def scenario() -> None:
-        harness = await start_fake_session()
+        harness = await start_fake_session(settle_connect=False)
         session = harness.session
         assert session is not None
         await _inject(
             session,
-            READY_FRAME,
             {"type": "telemetry-snapshot", "metrics": {"rtt_ms": 42}},
             {"type": "transcript", "role": "ASSISTANT", "text": "Still here.", "is_final": True},
         )
@@ -96,12 +106,9 @@ def test_unknown_event_type_is_tolerated_and_stream_continues() -> None:
 
 def test_ready_parses_duration_cap_and_tolerates_retired_fields() -> None:
     async def scenario() -> None:
-        harness = await start_fake_session()
-        session = harness.session
-        assert session is not None
-        await _inject(
-            session,
-            {
+        harness = await start_fake_session(
+            settle_connect=False,
+            ready_frame={
                 **READY_FRAME,
                 "max_session_seconds": 1800,
                 # Retired block a backend that predates its removal may still
@@ -111,14 +118,46 @@ def test_ready_parses_duration_cap_and_tolerates_retired_fields() -> None:
                     "client_directives": {"audio_gating": "wake_word_window"},
                 },
             },
-            READY_FRAME,
         )
-        capped, plain = await _collect(session, 2)
+        session = harness.session
+        assert session is not None
+        # The second delivery of ``ready`` — the attribute and the frame both
+        # arriving — reaches no surface.
+        await _inject(session, READY_FRAME, {"type": "pong"})
+        capped, pong = await _collect(session, 2)
         assert isinstance(capped, ReadyEvent)
         assert capped.max_session_seconds == 1800
         assert not hasattr(capped, "cosmo")
-        assert isinstance(plain, ReadyEvent)
-        assert plain.max_session_seconds is None
+        assert not isinstance(pong, ReadyEvent)
+
+    asyncio.run(scenario())
+
+
+def test_ready_rejected_tools_warn_once_per_entry() -> None:
+    # Each server-dropped tool gets one warning at ready; the duplicate
+    # delivery of ``ready`` re-logs nothing.
+    async def scenario() -> None:
+        rejected_ready = {
+            **READY_FRAME,
+            "rejected_tools": [
+                {"name": "web_search", "reason": "not enabled for this workspace"},
+                {"name": "lookup", "reason": "capability unavailable"},
+            ],
+        }
+        with structlog.testing.capture_logs() as logs:
+            harness = await start_fake_session(ready_frame=rejected_ready)
+            session = harness.session
+            assert session is not None
+            await _inject(session, rejected_ready)
+        warnings = [
+            (log["tool"], log["reason"])
+            for log in logs
+            if log["event"] == "realtime.tool_spec_rejected"
+        ]
+        assert warnings == [
+            ("web_search", "not enabled for this workspace"),
+            ("lookup", "capability unavailable"),
+        ]
 
     asyncio.run(scenario())
 
@@ -193,6 +232,27 @@ def test_usage_event_decodes_to_typed_model() -> None:
         assert event.total_tokens == 58
         # Absent counters are zero, not unset.
         assert event.input_cached_tokens == 0
+
+    asyncio.run(scenario())
+
+
+def test_session_ending_soon_event_decodes_to_typed_model() -> None:
+    async def scenario() -> None:
+        harness = await start_fake_session()
+        session = harness.session
+        assert session is not None
+        await _inject(
+            session,
+            {
+                "type": "session-ending-soon",
+                "seconds_remaining": 45,
+                "reason": "max_session_duration",
+            },
+        )
+        (event,) = await _collect(session, 1)
+        assert isinstance(event, SessionEndingSoonEvent)
+        assert event.seconds_remaining == 45
+        assert event.reason == "max_session_duration"
 
     asyncio.run(scenario())
 
@@ -415,7 +475,7 @@ def test_event_queue_drops_excess_events_without_raising() -> None:
         session._queue = asyncio.Queue(maxsize=2)
         # A slow consumer can't keep up: events past the bound are dropped, not
         # raised, so the inbound data-channel handler never blows up.
-        await _inject(session, READY_FRAME, READY_FRAME, READY_FRAME)
+        await _inject(session, _PONG_FRAME, _PONG_FRAME, _PONG_FRAME)
         assert session._queue.qsize() == 2
 
     asyncio.run(scenario())
@@ -427,7 +487,7 @@ def test_terminal_items_survive_a_full_queue() -> None:
         session = harness.session
         assert session is not None
         session._queue = asyncio.Queue(maxsize=2)
-        await _inject(session, READY_FRAME, READY_FRAME)  # fill to capacity
+        await _inject(session, _PONG_FRAME, _PONG_FRAME)  # fill to capacity
         assert session._queue.full()
         await session.end()
         # The ended event must still be delivered and the stream must finish
@@ -470,7 +530,7 @@ def test_session_start_transport_failure_raises_typed_error() -> None:
 
         with pytest.raises(SessionStartError) as exc:
             await start_fake_session(respond=respond)
-        assert exc.value.code == "transport_error"
+        assert exc.value.code is SessionStartErrorCode.TRANSPORT
 
     asyncio.run(scenario())
 
@@ -516,7 +576,9 @@ def test_session_start_with_malformed_2xx_body_raises_typed_error() -> None:
 
         with pytest.raises(SessionStartError) as exc:
             await start_fake_session(respond=respond)
-        assert exc.value.code == "invalid_response"
+        # The server answered 2xx, so a session may exist — not `TRANSPORT`,
+        # whose contract is that nothing happened server-side.
+        assert exc.value.code is SessionStartErrorCode.INVALID_RESPONSE
 
     asyncio.run(scenario())
 
@@ -556,7 +618,7 @@ def test_post_connect_failure_tears_the_room_down() -> None:
     # A handshake that fails AFTER the room connected (e.g. RPC registration)
     # must disconnect the transport, not leak a live room.
     async def scenario() -> None:
-        states: list[RealtimeSessionState] = []
+        states: list[SessionState] = []
         harness = FakeSessionHarness(transport_cls=_RegistrationFailingTransport)
         with pytest.raises(SessionStartError) as exc:
             await start_fake_session(
@@ -564,7 +626,7 @@ def test_post_connect_failure_tears_the_room_down() -> None:
                 on_state_change=states.append,
                 tools=[_probe_tool()],
             )
-        assert exc.value.code == "room_join_failed"
+        assert exc.value.code is SessionStartErrorCode.JOIN_FAILED
         assert harness.transport.disconnected is True
         assert states[-1].kind is SessionStateKind.DISCONNECTED
         assert states[-1].disconnect_reason is DisconnectReason.TRANSPORT_ERROR
@@ -576,7 +638,7 @@ def test_start_cancelled_mid_connect_tears_the_room_down() -> None:
     # Cancelling start() while the transport is connecting is a BaseException
     # path — the room must still come down and the state must land DISCONNECTED.
     async def scenario() -> None:
-        states: list[RealtimeSessionState] = []
+        states: list[SessionState] = []
         harness = FakeSessionHarness(transport_cls=_HangingConnectTransport)
         task = asyncio.ensure_future(
             start_fake_session(harness=harness, on_state_change=states.append)
@@ -600,12 +662,11 @@ def test_server_sent_session_ended_latches_reason_for_the_terminal() -> None:
     # teardown. The frame never surfaces mid-stream; its reason is latched and
     # carried by the terminal sentinel once the transport then drops.
     async def scenario() -> None:
-        harness = await start_fake_session()
+        harness = await start_fake_session(settle_connect=False)
         session = harness.session
         assert session is not None
         await _inject(
             session,
-            READY_FRAME,
             {"type": "session-ended", "reason": "max_session_duration"},
             {"type": "transcript", "role": "ASSISTANT", "text": "still here", "is_final": True},
         )
@@ -617,9 +678,11 @@ def test_server_sent_session_ended_latches_reason_for_the_terminal() -> None:
 
         harness.transport.simulate_closed("SIGNAL_CLOSE")
         events = [event async for event in session]
-        assert len(events) == 1
-        assert isinstance(events[0], SessionEndedEvent)
-        assert events[0].reason == "max_session_duration"
+        # The transcript's fold notification precedes the terminal item;
+        # the ended event stays the stream's final item.
+        assert isinstance(events[0], TranscriptUpdatedEvent)
+        assert isinstance(events[-1], SessionEndedEvent)
+        assert events[-1].reason == "max_session_duration"
         assert session.state.disconnect_reason is DisconnectReason.SERVER_ENDED
 
     asyncio.run(scenario())
@@ -681,7 +744,7 @@ def test_close_synthesizes_client_closed_terminal_without_end_frame() -> None:
 
 def test_end_sends_end_frame_and_synthesizes_terminal_event() -> None:
     async def scenario() -> None:
-        states: list[RealtimeSessionState] = []
+        states: list[SessionState] = []
         harness = await start_fake_session(on_state_change=states.append)
         session = harness.session
         assert session is not None
@@ -713,7 +776,74 @@ def test_send_methods_emit_external_wire_shapes() -> None:
         assert mute["muted"] is True
         assert ping["type"] == "ping"
         for frame in harness.frames:
-            assert isinstance(frame["id"], str) and frame["id"]
+            assert "id" not in frame
+
+    asyncio.run(scenario())
+
+
+SERVER_TIMINGS: dict[str, int] = {
+    "version_check_ms": 0,
+    "project_check_ms": 0,
+    "provider_resolve_ms": 0,
+    "db_insert_ms": 41,
+    "mint_tokens_ms": 18,
+    "dispatch_ms": 12,
+    "total_ms": 96,
+    "resolve_ms": 25,
+}
+
+
+def _respond_with_server_timings(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, json={**START_RESPONSE_JSON, "timings": SERVER_TIMINGS})
+
+
+def test_connect_timings_report_is_sent_once_when_the_agent_is_ready() -> None:
+    async def scenario() -> None:
+        harness = await start_fake_session(
+            respond=_respond_with_server_timings, settle_connect=False
+        )
+        session = harness.session
+        assert session is not None
+
+        # The report is fire-and-forget, released by the connect's ready.
+        await asyncio.sleep(0)
+        # A repeat ready (the attribute/frame double delivery) adds nothing.
+        await _inject(session, READY_FRAME)
+        await asyncio.sleep(0)
+        assert [frame["type"] for frame in harness.frames] == ["connect-timings"]
+
+        (frame,) = harness.frames
+        # The server's own breakdown rides back verbatim: the worker that
+        # records the session never saw the start response.
+        assert frame["server"] == SERVER_TIMINGS
+        # Whole milliseconds of the same phases the session reports.
+        timings = session.connect_timings
+        assert timings.ws_ms is not None and timings.ready_ms is not None
+        assert frame["request_ms"] == round(timings.ws_ms)
+        assert frame["room_ms"] == round(timings.room_ms or 0.0)
+        assert frame["ready_ms"] == round(timings.ready_ms)
+        assert frame["ready_ms"] >= frame["request_ms"]
+        # ``extra=forbid`` on the worker: no local id, no unmeasured phase.
+        assert set(frame) == {"type", "request_ms", "room_ms", "ready_ms", "server"}
+
+    asyncio.run(scenario())
+
+
+def test_agent_speech_releases_no_further_report() -> None:
+    async def scenario() -> None:
+        # Readiness is room state now (participant attribute + frame), so the
+        # report is released by the handshake alone — the agent speaking is
+        # no longer a readiness signal and adds no second report.
+        harness = await start_fake_session(settle_connect=False)
+        session = harness.session
+        assert session is not None
+        await asyncio.sleep(0)
+        assert [frame["type"] for frame in harness.frames] == ["connect-timings"]
+
+        await _inject(session, {"type": "bot-started-speaking"})
+        await asyncio.sleep(0)
+        assert [frame["type"] for frame in harness.frames] == ["connect-timings"]
+        assert session.connect_timings.ready_ms is not None
 
     asyncio.run(scenario())
 
@@ -748,11 +878,12 @@ def test_version_mismatch_rejection_raises_typed_error() -> None:
                 },
             )
 
-        states: list[RealtimeSessionState] = []
-        with pytest.raises(VersionMismatchError) as excinfo:
+        states: list[SessionState] = []
+        with pytest.raises(SessionStartError) as excinfo:
             await start_fake_session(respond=respond, on_state_change=states.append)
         assert "version_mismatch" in str(excinfo.value)
-        assert excinfo.value.code == "version_mismatch"
+        assert excinfo.value.code is SessionStartErrorCode.VERSION_MISMATCH
+        assert excinfo.value.server_code == "version_mismatch"
         assert [state.kind for state in states] == [
             SessionStateKind.CONNECTING,
             SessionStateKind.DISCONNECTED,
@@ -832,7 +963,7 @@ def test_send_bind_input_emits_frame_and_marks_bound() -> None:
         assert session._input_bound is True
         (frame,) = harness.frames
         assert frame["type"] == "bind-input"
-        assert isinstance(frame["id"], str) and frame["id"]
+        assert "id" not in frame
 
     asyncio.run(scenario())
 

@@ -21,7 +21,8 @@ export type BoardPositionResult = {
 
 export type BoardVisionConfig = {
   baseUrl: string;
-  apiKey: string;
+  /** Bearer for each read — a pasted API key, or a token off /token. */
+  getBearer: () => Promise<string>;
 };
 
 const ENDPOINT_PATH = '/api/v1/external/chess/board-position';
@@ -47,7 +48,7 @@ export async function readBoardPosition(
   const res = await fetch(`${config.baseUrl.replace(/\/$/, '')}${ENDPOINT_PATH}`, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${config.apiKey}`,
+      Authorization: `Bearer ${await config.getBearer()}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({

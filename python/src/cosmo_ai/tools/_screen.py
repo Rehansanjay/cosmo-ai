@@ -3,7 +3,7 @@ locator, and the three renderers that act on what it finds —
 ``cosmo_sdk_screen_click_element``, ``cosmo_sdk_screen_highlight_element`` and
 ``cosmo_sdk_screen_highlight_box``.
 
-The ``screen_locate`` opt-in declares the server-side locator
+The ``screen_locate_tool`` opt-in declares the server-side locator
 (``cosmo_screen_locate``) and answers the capture RPC it drives, which is why it
 carries a ``capture`` handler where the other opt-ins are bare kinds. The server
 grounds the model's description against the screenshot and the accessibility
@@ -15,8 +15,8 @@ back to the element it addresses::
         ScreenCapture,
         ScreenClickTarget,
         ScreenClickOutcome,
-        screen_click_element,
-        screen_locate,
+        screen_click_element_tool,
+        screen_locate_tool,
     )
 
     def grab() -> ScreenCapture:
@@ -29,9 +29,9 @@ back to the element it addresses::
         press(target.element.frame, target.action)
         return ScreenClickOutcome(clicked=True)
 
-    agent = client.agent(tools=[screen_locate(grab), screen_click_element(on_click)])
+    agent = client.agent(tools=[screen_locate_tool(grab), screen_click_element_tool(on_click)])
 
-:func:`screen_highlight_box` stands apart: its caller already has coordinates,
+:func:`screen_highlight_box_tool` stands apart: its caller already has coordinates,
 so it skips capture and grounding and draws immediately.
 
 Platform-neutral: macOS clicks a mouse, iOS taps, a web client clicks the DOM —
@@ -43,7 +43,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from cosmo_ai._internal.protocol import ClientTool, ScreenLocateTool
+from cosmo_ai._internal.protocol import AgentTool, ScreenLocateTool
 from cosmo_ai.tools._sdk_tools import _SdkClientTool
 from cosmo_ai.tools._screen_capture import (
     SCREEN_CLICK_TOOL_NAME,
@@ -87,10 +87,10 @@ from cosmo_ai.tools._screen_types import (
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def screen_locate(capture: ScreenCaptureHandler) -> ScreenLocateTool:
+def screen_locate_tool(capture: ScreenCaptureHandler) -> AgentTool:
     """Opt in to the server-executed screen locator, ready to add to ``tools=``
     alongside the renderers that act on what it finds
-    (:func:`screen_click_element`, :func:`screen_highlight_element`).
+    (:func:`screen_click_element_tool`, :func:`screen_highlight_element_tool`).
 
     Unlike the other tools it is never advertised: the model cannot call it,
     ``cosmo_screen_locate`` does. Declaring it is what asks for the locator, and
@@ -100,9 +100,9 @@ def screen_locate(capture: ScreenCaptureHandler) -> ScreenLocateTool:
     return ScreenLocateTool(capture=capture)
 
 
-def screen_click_element(on_click: ScreenClickHandler) -> ClientTool:
+def screen_click_element_tool(on_click: ScreenClickHandler) -> AgentTool:
     """The click renderer, ready to add to ``tools=`` alongside the
-    :func:`screen_locate` opt-in that feeds it. Your handler owns only the
+    :func:`screen_locate_tool` opt-in that feeds it. Your handler owns only the
     clicking — and the honest answer about whether it happened. Malformed
     arguments surface to the model as the call's error without reaching your
     handler, and a handle the capture cache can no longer resolve declines with a
@@ -112,7 +112,7 @@ def screen_click_element(on_click: ScreenClickHandler) -> ClientTool:
     policy that defaults off, so a session that cannot run it starts without it
     and echoes the drop on :class:`~cosmo_ai.ReadyEvent`'s ``rejected_tools``.
     A dropped renderer is simply never invoked; the locator and
-    :func:`screen_highlight_element` are ungated and keep working."""
+    :func:`screen_highlight_element_tool` are ungated and keep working."""
 
     async def handler(args: dict[str, Any]) -> dict[str, Any]:
         request = parse_screen_click_request(args)
@@ -148,8 +148,8 @@ def screen_click_element(on_click: ScreenClickHandler) -> ClientTool:
     )
 
 
-def screen_highlight_element(on_highlight: ScreenHighlightHandler) -> ClientTool:
-    """The element highlight. Same handle contract as :func:`screen_click_element`,
+def screen_highlight_element_tool(on_highlight: ScreenHighlightHandler) -> AgentTool:
+    """The element highlight. Same handle contract as :func:`screen_click_element_tool`,
     reporting through the :class:`ScreenHighlightOutcome` both highlights share —
     a grounded handle is on a real control, so ``exact=True`` is the answer here.
     Visual only — it never clicks."""
@@ -188,7 +188,7 @@ def screen_highlight_element(on_highlight: ScreenHighlightHandler) -> ClientTool
     )
 
 
-def screen_highlight_box(on_highlight: ScreenHighlightBoxHandler) -> ClientTool:
+def screen_highlight_box_tool(on_highlight: ScreenHighlightBoxHandler) -> AgentTool:
     """The box highlight: no capture, no locator, no cache — the model gives the
     box and your handler draws it. Answer ``exact=True`` only when something
     confirmed the highlight sits on a real control; ``exact=False`` is what tells

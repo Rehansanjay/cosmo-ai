@@ -36,13 +36,10 @@ client = RealtimeClient(token=TokenSource.endpoint(
 
 ```swift
 // Swift
-let session = try await RealtimeSession.start(
-  .init(credential: .tokenSource(.endpoint(
-    URL(string: "https://your-deploy.example.com/token")!,
-    headers: ["Authorization": "Bearer \(mintSecret)", "X-External-User-Id": userId]
-  ))),
-  config: config
-)
+let client = RealtimeClient(tokenSource: try .endpoint(
+  URL(string: "https://your-deploy.example.com/token")!,
+  headers: ["Authorization": "Bearer \(mintSecret)", "X-External-User-Id": userId]
+))
 ```
 
 The SDKs cache the token and re-fetch as expiry nears; your app never

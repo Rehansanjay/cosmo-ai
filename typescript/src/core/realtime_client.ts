@@ -13,35 +13,42 @@
  */
 
 import { SDK_NAME, SDK_VERSION } from '../constants';
-import type { SessionConfig } from '../wire/types.gen';
+import type { SessionConfig } from '../protocol';
 
 import {
   RealtimeAgent,
   type AgentConfig,
   type CatalogAgentOptions,
-  type BackgroundClientToolSpec,
-  type ClientToolSpec,
+  type BackgroundClientTool,
+  type ClientTool,
   type SessionStartOptions,
 } from './agent';
-import type { ScreenLocateTool } from '../tool/screen';
+import type { ScreenLocateTool } from './agent';
 import type { HookEngine } from './hooks';
+import { log } from './logger';
 
 import { LiveKitTransport } from '../transport/livekit_transport';
+import { unsupportedTransportCapability } from '../transport/session_start_error';
+import { WebSocketTransport } from '../transport/websocket_transport';
+import type { PreparedRoomRef } from '../transport/prepared_room';
 import type { RealtimeTransport } from '../transport/types';
 import {
   assertSupportedBaseUrl,
   composeDialUrl,
   composeMintTokenUrl,
+  composePrepareRoomUrl,
   composeStartUrl,
+  composeWebSocketStartUrl,
   composeUsageUrl,
   composeVerifyUrl,
 } from '../transport/external_session_url';
+import { assertNotApiKeyInTokenSlot } from './credential_guard';
 import { resolveCredentialFromRuntime } from './credentials_file';
 import { getVerify, type CredentialInfo } from './verify';
 import { getUsage, type SessionUsage } from './usage';
 import {
   postMintToken,
-  CredentialError,
+  CredentialsError,
   MintTokenError,
   type MintedToken,
 } from './auth';
@@ -51,6 +58,9 @@ import { SessionEngine } from './session_engine';
 import { RealtimeSession } from './session';
 import type { Unsubscribe } from './events';
 
+/** How a ``RealtimeClient`` is configured: its credential, and how its
+ *  sessions travel. Every field is optional — a client constructed with none
+ *  resolves a credential from the environment. */
 export type RealtimeClientOptions = {
   /** Workspace-scoped API key — a server-side secret. Can mint end-user
    *  tokens (``mintToken``) and open sessions.
@@ -74,13 +84,44 @@ export type RealtimeClientOptions = {
    *  ``token``) is also configured, its ``Authorization`` header wins
    *  over one returned here. */
   getAuthHeaders?: () => Record<string, string> | Promise<Record<string, string>>;
+  /** How session media travels. ``webrtc`` is the managed/default lane;
+   *  ``websocket`` is the single-socket lane served by a local OSS server.
+   *  ``livekit`` is a deprecated alias of ``webrtc``. */
+  transport?: TransportName;
   /** Factory used to construct the underlying ``RealtimeTransport`` per
    *  session start. Defaults to ``LiveKitTransport``. */
   transportFactory?: () => RealtimeTransport;
 };
 
+/** How session media travels. ``webrtc`` is the default managed lane;
+ *  ``websocket`` is the single-socket lane served by a local OSS server.
+ *  ``livekit`` is a deprecated alias of ``webrtc``. */
+type TransportName = 'webrtc' | 'websocket' | 'livekit';
+type ResolvedTransportName = 'webrtc' | 'websocket';
+
+/**
+ * Entry point of the SDK — construct one, then build agents from it.
+ *
+ * ```ts
+ * const client = new RealtimeClient({ apiKey });
+ * const session = await client.agent({ instructions: 'Be brief.' }).start();
+ * ```
+ *
+ * The client owns what outlives any one session: the credential, the
+ * resolved base URL, and the agent factories. It also carries the
+ * credential-scoped calls that are not about a single run — ``verify()``,
+ * ``mintToken()``, ``getSessionUsage()``.
+ *
+ * Each ``agent.start()`` opens an independent session, so one client can run
+ * any number of them concurrently. Everything scoped to one run — events,
+ * sends, media controls, ending — lives on the ``RealtimeSession`` that
+ * ``start()`` returns.
+ */
 export class RealtimeClient {
-  private readonly options: Omit<RealtimeClientOptions, 'apiKey' | 'token'>;
+  private readonly options: Omit<
+    RealtimeClientOptions,
+    'apiKey' | 'token' | 'transport'
+  >;
   // ECMAScript #private (not TS ``private``) so the secret is invisible to
   // JSON.stringify / spread / Object.entries — the closest TS gets to the
   // backend's ``SecretStr`` masking convention.
@@ -95,6 +136,7 @@ export class RealtimeClient {
    *  credential (or ``getAuthHeaders``) was configured explicitly. */
   #credentialResolution: Promise<void> | null = null;
   #needsCredentialResolution: boolean;
+  readonly #transportName: ResolvedTransportName;
 
   /** The Cosmo API origin this client talks to. Resolved at construction;
    *  a zero-argument client whose key came from the ``cosmo login``
@@ -104,9 +146,18 @@ export class RealtimeClient {
   }
 
   constructor(options: RealtimeClientOptions = {}) {
-    const { apiKey, token, ...rest } = options;
+    const { apiKey, token, transport, ...rest } = options;
     if (apiKey !== undefined && token !== undefined) {
-      throw new CredentialError('Provide at most one of apiKey or token, not both.');
+      throw new CredentialsError({
+        code: 'conflicting_credentials',
+        message: 'Provide at most one of apiKey or token, not both.',
+      });
+    }
+    if (transport !== undefined && rest.transportFactory !== undefined) {
+      throw new Error('Provide transport or transportFactory, not both.');
+    }
+    if (typeof token === 'string') {
+      assertNotApiKeyInTokenSlot(token);
     }
     this.#tokenSource = token instanceof TokenSource ? token : null;
     this.#credential = apiKey ?? (typeof token === 'string' ? token : null);
@@ -114,19 +165,78 @@ export class RealtimeClient {
     this.#needsCredentialResolution =
       apiKey === undefined && token === undefined && rest.getAuthHeaders === undefined;
     this.#baseUrl = resolveBaseUrl();
+    this.#transportName =
+      rest.transportFactory === undefined ? resolveTransportName(transport) : 'webrtc';
     this.options = rest;
+  }
+
+  /** @internal — whether sessions from this client run in rooms the
+   *  backend can reserve ahead of a start (the default ``webrtc`` lane). */
+  get _canPrepareRooms(): boolean {
+    return this.#transportName === 'webrtc' && this.options.transportFactory === undefined;
+  }
+
+  /** @internal — ``POST session/prepare-room``, the reservation behind
+   *  ``agent.prepareSession()``. Best-effort by design: a failure logs and
+   *  resolves ``null``, leaving the start on the ordinary path. */
+  async _prepareRoom(): Promise<PreparedRoomRef | null> {
+    try {
+      // Credential resolution can move ``baseUrl``; the reservation must
+      // land on the backend the start will use.
+      await this.#ensureCredentialResolved();
+      const headers = {
+        ...(await this.resolveAuthHeaders()),
+        'Content-Type': 'application/json',
+      };
+      // Bounded like the Python SDK's reservation: a prepared start awaits
+      // this, and an accelerator must never hang the start it accelerates.
+      const abort = new AbortController();
+      const timer = setTimeout(() => abort.abort(), PREPARE_ROOM_TIMEOUT_MS);
+      let response: Response;
+      try {
+        response = await fetch(composePrepareRoomUrl(this.#baseUrl), {
+          method: 'POST',
+          headers,
+          body: '{}',
+          signal: abort.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!response.ok) {
+        log.debug(`[realtime] prepare-room rejected (${response.status})`);
+        return null;
+      }
+      const body = (await response.json()) as {
+        livekit_url: string;
+        token: string;
+        room_name: string;
+        room_grant: string;
+      };
+      return {
+        roomName: body.room_name,
+        roomGrant: body.room_grant,
+        token: body.token,
+        livekitUrl: body.livekit_url,
+        preparedAt: Date.now(),
+      };
+    } catch (err) {
+      log.debug('[realtime] prepare-room failed', err);
+      return null;
+    }
   }
 
   /** Run the zero-argument resolution chain (``COSMO_API_KEY``, then the
    *  ``cosmo login`` credentials file) exactly once, before the first
-   *  request. Off Node, or with nothing to resolve, the client stays
-   *  credential-less — the pre-chain behavior. A file credential brings its
-   *  own ``base_url``, so this must complete before any URL is composed. */
+   *  request. With nothing to resolve it throws ``CredentialsError``
+   *  (``no_credential``) — the first authenticated call fails before any
+   *  request goes out, the outcome the Python and Swift constructors
+   *  produce. A file credential brings its own ``base_url``, so this must
+   *  complete before any URL is composed. */
   async #ensureCredentialResolved(): Promise<void> {
     if (!this.#needsCredentialResolution) return;
     this.#credentialResolution ??= (async () => {
       const resolved = await resolveCredentialFromRuntime();
-      if (resolved === null) return;
       this.#credential = resolved.apiKey;
       this.#canMint = true;
       if (resolved.baseUrl !== null) {
@@ -200,27 +310,28 @@ export class RealtimeClient {
    *  ``client.agent({...}).start()``. Idempotent per ``(workspace,
    *  externalUserId)`` — the same
    *  external user maps to the same auto-provisioned project on repeat calls.
-   *  ``opts.ttlSeconds`` (60–86400) shortens the 24-hour default lifetime.
+   *  ``options.ttlSeconds`` (60–86400) shortens the 24-hour default lifetime.
    *
    *  Throws ``MintTokenError`` if this client has no ``apiKey`` (a
    *  token- or cookie-credentialed client cannot mint) or the server rejects
    *  it. */
   async mintToken(
     externalUserId: string,
-    opts: { ttlSeconds?: number } = {},
+    options: { ttlSeconds?: number } = {},
   ): Promise<MintedToken> {
     await this.#ensureCredentialResolved();
     if (!this.#canMint) {
-      throw new MintTokenError(
-        'no_api_key',
+      throw new MintTokenError({
+        code: 'missing_api_key',
+        message:
         'mintToken requires an apiKey credential — pass apiKey, set ' +
           'COSMO_API_KEY, or sign in with `cosmo login`. A minted token cannot mint.',
-      );
+      });
     }
     return postMintToken({
       mintUrl: composeMintTokenUrl(this.baseUrl),
       externalUserId,
-      ttlSeconds: opts.ttlSeconds,
+      ttlSeconds: options.ttlSeconds,
       getAuthHeaders: () => this.resolveAuthHeaders(),
     });
   }
@@ -237,13 +348,13 @@ export class RealtimeClient {
    *  accepted (``CatalogAgentOptions``) — no persona parameters except
    *  ``voice``, the one cosmetic override; anything else stored-config is a
    *  type error. */
-  catalogAgent(name: string, opts: CatalogAgentOptions = {}): RealtimeAgent {
+  catalogAgent(name: string, options: CatalogAgentOptions = {}): RealtimeAgent {
     return new RealtimeAgent(this, {
       name,
-      inputs: opts.inputs,
-      tools: opts.tools,
-      voice: opts.voice,
-      hooks: opts.hooks,
+      inputs: options.inputs,
+      tools: options.tools,
+      voice: options.voice,
+      hooks: options.hooks,
     });
   }
 
@@ -252,8 +363,13 @@ export class RealtimeClient {
       createTransport: () =>
         this.options.transportFactory
           ? this.options.transportFactory()
-          : new LiveKitTransport(),
-      startUrl: () => composeStartUrl(this.baseUrl),
+          : this.#transportName === 'websocket'
+            ? new WebSocketTransport()
+            : new LiveKitTransport(),
+      startUrl: () =>
+        this.#transportName === 'websocket'
+          ? composeWebSocketStartUrl(this.baseUrl)
+          : composeStartUrl(this.baseUrl),
       dialUrl: (sessionId) => composeDialUrl(this.baseUrl, sessionId),
       usageUrl: (sessionId) => composeUsageUrl(this.baseUrl, sessionId),
       resolveAuthHeaders: () => this.resolveAuthHeaders(),
@@ -265,20 +381,32 @@ export class RealtimeClient {
     });
   }
 
-  /** @internal — the session factory behind ``RealtimeAgent.start()``:
-   *  creates a fresh engine per call, so concurrent starts yield
-   *  independent sessions. Takes the prebuilt external ``session-config``
-   *  body; the public way to open a session is
+  /** @internal — the session factory behind ``RealtimeAgent.start()`` and
+   *  ``PreparedSession.start()``: creates a fresh engine per call, so
+   *  concurrent starts yield independent sessions. Takes the prebuilt
+   *  external ``session-config`` body and, on the prepared path, the
+   *  reserved room; the public way to open a session is
    *  ``client.agent({...}).start()``. */
-  async _startSession(opts: {
+  async _startSession(options: {
     config: SessionConfig;
     publishMicrophone: boolean;
     onStateChange?: SessionStartOptions['onStateChange'];
     onSession?: SessionStartOptions['onSession'];
-    clientTools?: readonly (ClientToolSpec | BackgroundClientToolSpec)[];
+    clientTools?: readonly (ClientTool | BackgroundClientTool)[];
     screenLocate?: ScreenLocateTool;
     hooks?: HookEngine;
+    prepared?: PreparedRoomRef;
+    connectStartedAt?: number;
   }): Promise<RealtimeSession> {
+    if (
+      this.#transportName === 'websocket' &&
+      options.clientTools?.some((tool) => tool.background === true)
+    ) {
+      throw unsupportedTransportCapability(
+        'background_tools_unsupported',
+        'Background client tools are not supported by the websocket transport.',
+      );
+    }
     // Credential resolution runs before the engine starts — a file
     // credential can move ``baseUrl``, and the engine composes its
     // session-start URL from it.
@@ -288,19 +416,36 @@ export class RealtimeClient {
     // full state prefix from ``idle`` (``engine.on`` replays the current
     // state at subscribe time).
     let stateUnsub: Unsubscribe | null = null;
-    if (opts.onStateChange !== undefined) {
-      stateUnsub = engine.on('lifecycle', opts.onStateChange);
+    if (options.onStateChange !== undefined) {
+      stateUnsub = engine.on('lifecycle', options.onStateChange);
     }
     const session = new RealtimeSession(engine, stateUnsub);
     // Before the connect: a caller wiring callbacks here sees every event
     // the connect itself produces.
-    opts.onSession?.(session);
+    options.onSession?.(session);
     try {
-      await engine.start(opts);
+      await engine.start(options);
     } catch (err) {
       stateUnsub?.();
       throw err;
     }
     return session;
   }
+}
+
+const PREPARE_ROOM_TIMEOUT_MS = 40_000;
+
+function resolveTransportName(given: TransportName | undefined): ResolvedTransportName {
+  const fromEnvironment =
+    typeof process === 'undefined' ? undefined : process.env?.COSMO_TRANSPORT;
+  const environmentName = fromEnvironment?.trim().toLowerCase();
+  const name = (given ?? environmentName) || 'webrtc';
+  if (name !== 'webrtc' && name !== 'websocket' && name !== 'livekit') {
+    throw new Error(`transport must be webrtc or websocket, got ${JSON.stringify(name)}`);
+  }
+  if (name === 'livekit') {
+    log.warn('[realtime] transport "livekit" is deprecated; use "webrtc"');
+    return 'webrtc';
+  }
+  return name;
 }

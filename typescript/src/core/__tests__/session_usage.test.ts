@@ -158,7 +158,8 @@ describe('RealtimeClient.getSessionUsage', () => {
     const err = await client.getSessionUsage('sess-1').catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(UsageError);
-    expect((err as UsageError).code).toBe('not_found');
+    expect((err as UsageError).code).toBe('request_rejected');
+    expect((err as UsageError).serverCode).toBe('not_found');
     expect((err as UsageError).message).toContain('not found');
   });
 
@@ -179,7 +180,7 @@ describe('RealtimeClient.getSessionUsage', () => {
     const err = await client.getSessionUsage('sess-1').catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(UsageError);
-    expect((err as UsageError).code).toBe('transport_error');
+    expect((err as UsageError).code).toBe('request_failed');
   });
 });
 
@@ -273,7 +274,7 @@ describe('RealtimeSession.usage', () => {
     const err = await session.usage().catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(UsageError);
-    expect((err as UsageError).code).toBe('not_started');
+    expect((err as UsageError).code).toBe('invalid_request');
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });

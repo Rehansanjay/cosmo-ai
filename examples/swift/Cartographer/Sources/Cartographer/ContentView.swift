@@ -88,6 +88,11 @@ struct ContentView: View {
             Text(conductor.status.caption)
                 .font(.system(size: 11.5, weight: .medium, design: .rounded))
                 .foregroundStyle(.white.opacity(0.6))
+            if case .live = conductor.status {
+                Text("mic \(Int(conductor.inputLevel * 1_000))")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.4))
+            }
         }
         .padding(.horizontal, 11)
         .padding(.vertical, 6)

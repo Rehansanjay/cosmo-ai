@@ -16,7 +16,7 @@ export const HAND_SIZE = 25;
 /** Rules + a freshly dealt hand from the bank, as the one skill the agent
  *  carries per game. */
 export function assembleGameSkill(skillMd: string, bankMd: string, defaultName: string): Skill {
-  const skill = parseSkillMd(skillMd, { defaultName });
+  const skill = parseSkillMd(skillMd, defaultName);
   return { ...skill, body: `${skill.body}\n\n${shuffledQuestionBank(bankMd, HAND_SIZE)}` };
 }
 

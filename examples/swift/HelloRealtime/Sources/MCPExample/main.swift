@@ -18,24 +18,32 @@ let prompt = ProcessInfo.processInfo.environment["COSMO_MCP_PROMPT"]
     ?? "Please use your echo tool to repeat the phrase 'hello from mcp' back to me, then tell me what it returned."
 
 let configURL = URL(fileURLWithPath: configPath)
-guard FileManager.default.fileExists(atPath: configURL.path) else {
-    fputs("error: no MCP config at \(configURL.path) — run from Examples/HelloRealtime or set COSMO_MCP_CONFIG\n", stderr)
-    exit(1)
-}
 
 print("== loading MCP servers from \(configURL.path) ==")
-let registry = try McpRegistry.fromConfigFile(configURL)
+let servers: [McpStdioServer]
+do {
+    servers = try [McpStdioServer].configFile(configURL)
+} catch let error as McpError {
+    // `code` tells the failures apart; the message is for the human reading it.
+    let hint = error.code == .notAFile
+        ? " — run from Examples/HelloRealtime or set COSMO_MCP_CONFIG"
+        : ""
+    fputs("error: \(error.code.rawValue): \(error.message)\(hint)\n", stderr)
+    exit(1)
+}
+for server in servers {
+    print("  \(server.name): \(server.command) \(server.args.joined(separator: " "))")
+}
 
-let options = try RealtimeClient.Options()
-let client = RealtimeClient(options)
-// The registry rides the agent: its servers are connected at `start`, and the
-// session owns them from there — ending it tears the subprocesses down.
+let client = try RealtimeClient()
+// The servers ride the agent: each is connected at `start`, and the session
+// owns them from there — ending it tears the subprocesses down.
 let agent = try client.agent(
     instructions: "You are a concise assistant. When a tool can answer, call it.",
-    mcp: registry
+    mcp: servers
 )
 
-print("connecting to \(options.baseURL.absoluteString) (spawning MCP subprocess)…")
+print("connecting (spawning MCP subprocess)…")
 let session = try await agent.start(micMuted: true)
 
 var sawMcpCall = false

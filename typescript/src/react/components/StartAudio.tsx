@@ -6,6 +6,8 @@ import { useCallback, type ReactNode } from 'react';
 import { useMediaState } from '../hooks';
 import { useRealtimeAudioElementRef, useRealtimeSessionContext } from '../RealtimeProvider';
 
+/** What ``<StartAudio />`` passes to a ``children`` render prop, for
+ *  building your own unlock affordance. */
 export type StartAudioRenderArgs = {
   /** ``true`` when the browser is currently blocking remote audio
    *  autoplay (or any other downstream gate the SDK signals via
@@ -17,11 +19,14 @@ export type StartAudioRenderArgs = {
   start: () => Promise<void>;
 };
 
+/** Props for ``<StartAudio />``. */
 export type StartAudioProps = {
   /** Custom affordance. Omit it to get the default button. */
   children?: (args: StartAudioRenderArgs) => ReactNode;
   /** Label on the default button. Ignored when ``children`` is supplied. */
   label?: string;
+  /** Class applied to the default button. Ignored when ``children`` is
+   *  supplied. */
   className?: string;
 };
 

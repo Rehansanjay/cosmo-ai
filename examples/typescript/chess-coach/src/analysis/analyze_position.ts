@@ -5,7 +5,7 @@
  * in a web worker on this machine; no backend round-trip.
  */
 
-import { tool } from 'cosmo-ai/tool';
+import { clientTool } from 'cosmo-ai/tool';
 import { zodInput } from 'cosmo-ai/tool/zod';
 import { z } from 'zod/v4';
 
@@ -14,7 +14,7 @@ import type { UciEngine } from './engine';
 import { analysisEngine } from './stockfish_transport';
 
 export function makeAnalyzePositionTool(getEngine: () => UciEngine = analysisEngine) {
-  return tool({
+  return clientTool({
     name: 'analyze_position',
     description:
       "Get the chess engine's strongest moves for a position you already read " +

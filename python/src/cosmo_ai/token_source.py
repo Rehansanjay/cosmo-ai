@@ -18,11 +18,10 @@ from urllib.parse import urlparse
 
 import httpx
 import structlog
-from pydantic import ValidationError
 
 from cosmo_ai._internal.logging import get_logger
-from cosmo_ai._internal.protocol import MintedToken
-from cosmo_ai.errors import MintTokenError
+from cosmo_ai._internal.protocol import MintedToken, parse_minted_token
+from cosmo_ai.errors import CredentialsError, CredentialsErrorCode, TokenSourceError, TokenSourceErrorCode
 
 logger: structlog.stdlib.BoundLogger = get_logger(__name__)
 
@@ -43,11 +42,10 @@ HeadersInput = Union[
 cookie rides automatically only same-origin; a bearer or custom header goes
 here). Static, or a (possibly async) callback resolved per fetch."""
 
-FetchToken = Callable[[], Awaitable[Union[MintedToken, Mapping[str, object]]]]
-"""What ``TokenSource.custom`` takes: an async callable resolving with a
-:class:`MintedToken`, or a mapping carrying ``jwt`` and ``expires_at`` (a
-:class:`~datetime.datetime`, or the RFC 3339 string straight off a mint
-response)."""
+FetchToken = Callable[[], Awaitable[MintedToken]]
+"""What ``TokenSource.custom`` takes: an async callable resolving with the
+:class:`MintedToken` to use — the same shape
+:meth:`~cosmo_ai.RealtimeClient.mint_token` returns."""
 
 
 class TokenSource:
@@ -65,12 +63,18 @@ class TokenSource:
       ``{jwt, expires_at}`` (the shape :meth:`~cosmo_ai.RealtimeClient.mint_token`
       responses already have; any backend that forwards ``POST auth/token``
       qualifies).
-    * :meth:`custom` — any async callable resolving with ``{jwt, expires_at}``
-      — full control over transport and auth.
+    * :meth:`custom` — any async callable resolving with a
+      :class:`MintedToken` — full control over transport and auth.
     """
 
     def __init__(self, fetch_token: Callable[[], Awaitable[MintedToken]]) -> None:
-        self._fetch_token = fetch_token
+        """Prefer :meth:`endpoint` or :meth:`custom` — the constructors every
+        SDK shares. Direct construction behaves exactly like :meth:`custom`."""
+
+        async def fetch() -> MintedToken:
+            return _normalize_fetched(await fetch_token())
+
+        self._fetch_token = fetch
         self._cached: MintedToken | None = None
         self._inflight: asyncio.Task[MintedToken] | None = None
 
@@ -79,24 +83,20 @@ class TokenSource:
         """A source that POSTs ``url`` (empty JSON body) and reads
         ``{jwt, expires_at}`` from the response — the wire shape of
         ``POST /api/v1/external/auth/token`` and of the token-server
-        template. Rejections surface as :class:`MintTokenError` carrying the
-        server's error slug when the body parses, else an ``http_<status>``
-        synthetic; local failures carry ``token_source_failed``. The URL must
-        be https (http only for localhost) — auth headers and JWTs must not
-        cross the network in the clear."""
+        template. Failures raise :class:`TokenSourceError`; on a rejection
+        its ``server_code`` carries the endpoint's own slug when the body
+        parses, else an ``http_<status>`` synthetic. The URL must be https
+        (http only for localhost) — auth headers and JWTs must not cross the
+        network in the clear."""
         _assert_supported_endpoint_url(url)
         return cls(lambda: _post_token_endpoint(url, headers))
 
     @classmethod
     def custom(cls, fetch_token: FetchToken) -> "TokenSource":
         """A source backed by ``fetch_token`` — called whenever a fresh token
-        is needed. Resolve with ``{jwt, expires_at}``; a malformed result
-        raises ``MintTokenError(code="token_source_failed")``."""
-
-        async def fetch() -> MintedToken:
-            return _normalize_fetched(await fetch_token())
-
-        return cls(fetch)
+        is needed. Resolve with a :class:`MintedToken`; an empty ``jwt``
+        raises ``TokenSourceError``."""
+        return cls(fetch_token)
 
     async def _get_jwt(self) -> str:
         """The JWT to send right now: cached while it has more than the
@@ -141,21 +141,16 @@ def _as_utc(expires_at: datetime) -> datetime:
     return expires_at
 
 
-def _normalize_fetched(fetched: MintedToken | Mapping[str, object]) -> MintedToken:
-    if isinstance(fetched, MintedToken):
-        minted = fetched
-    else:
-        try:
-            minted = MintedToken.model_validate(dict(fetched))
-        except (ValidationError, TypeError) as exc:
-            raise MintTokenError(
-                code="token_source_failed",
-                message="TokenSource.custom fetcher must return {jwt, expires_at}.",
-            ) from exc
+def _normalize_fetched(minted: MintedToken) -> MintedToken:
+    if not isinstance(minted, MintedToken):
+        raise TokenSourceError(
+            code=TokenSourceErrorCode.FETCHER_FAILED,
+            message="TokenSource.custom fetcher must return a MintedToken.",
+        )
     if not minted.jwt:
-        raise MintTokenError(
-            code="token_source_failed",
-            message="TokenSource.custom fetcher must return {jwt, expires_at}.",
+        raise TokenSourceError(
+            code=TokenSourceErrorCode.FETCHER_FAILED,
+            message="TokenSource.custom fetcher must return a non-empty jwt.",
         )
     return MintedToken(
         jwt=minted.jwt,
@@ -173,8 +168,10 @@ def _assert_supported_endpoint_url(url: str) -> None:
         return
     if parsed.scheme == "http" and parsed.hostname in _LOCAL_HOSTS:
         return
-    raise ValueError(
-        "TokenSource.endpoint must be an absolute https URL (http is allowed only for localhost)"
+    raise CredentialsError(
+        code=CredentialsErrorCode.INSECURE_BASE_URL,
+        message="TokenSource.endpoint must be an absolute https URL "
+        "(http is allowed only for localhost)",
     )
 
 
@@ -202,7 +199,25 @@ async def _post_token_endpoint(url: str, headers: HeadersInput | None) -> Minted
                 headers={**dict(extra), "Content-Type": "application/json"},
             )
     except httpx.HTTPError as exc:
-        raise MintTokenError(code="token_source_failed", message=str(exc)) from exc
+        raise TokenSourceError(
+            code=TokenSourceErrorCode.REQUEST_FAILED, message=str(exc)
+        ) from exc
+    if response.is_redirect:
+        # Redirects are refused, not followed: one could re-send the auth
+        # headers (and receive the JWT) wherever it points, including a
+        # plain-http downgrade the https check at construction cannot see.
+        # The exchange never reached a token endpoint, so it failed rather
+        # than being rejected — the classification the other SDKs give it.
+        target = response.headers.get("location")
+        raise TokenSourceError(
+            code=TokenSourceErrorCode.REQUEST_FAILED,
+            message=(
+                f"Token endpoint redirected (HTTP {response.status_code}"
+                + (f" → {target}" if target else "")
+                + "); redirects are refused so the exchange cannot leave the "
+                "configured origin."
+            ),
+        )
     if not response.is_success:
         code, message = _parse_error_detail(response)
         logger.warning(
@@ -210,28 +225,22 @@ async def _post_token_endpoint(url: str, headers: HeadersInput | None) -> Minted
             status_code=response.status_code,
             code=code,
         )
-        raise MintTokenError(code=code, message=message)
+        raise TokenSourceError(code=TokenSourceErrorCode.REQUEST_REJECTED, message=message, server_code=code)
     try:
         body = response.json()
     except ValueError as exc:
-        raise MintTokenError(
-            code="token_source_failed",
+        raise TokenSourceError(
+            code=TokenSourceErrorCode.INVALID_RESPONSE,
             message="Token endpoint response was not JSON.",
         ) from exc
     if isinstance(body, dict) and "expires_at" not in body and "expiresAt" in body:
         # ``expiresAt`` is a serialized SDK ``MintedToken`` — a backend
         # returning its mint result as-is emits this spelling.
         body = {**body, "expires_at": body["expiresAt"]}
-    try:
-        minted = MintedToken.model_validate(body)
-    except ValidationError as exc:
-        raise MintTokenError(
-            code="token_source_failed",
-            message="Token endpoint response missing jwt / expires_at.",
-        ) from exc
-    if not minted.jwt:
-        raise MintTokenError(
-            code="token_source_failed",
+    minted = parse_minted_token(body)
+    if minted is None:
+        raise TokenSourceError(
+            code=TokenSourceErrorCode.INVALID_RESPONSE,
             message="Token endpoint response missing jwt / expires_at.",
         )
     return MintedToken(

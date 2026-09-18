@@ -11,7 +11,7 @@ import asyncio
 
 import pytest
 
-from cosmo_ai import AudioPublishAlreadyActiveError
+from cosmo_ai import SessionStateError
 
 from tests.fakes import start_fake_session
 
@@ -37,7 +37,7 @@ def test_second_stream_is_refused() -> None:
         assert session is not None
         await session.start_audio_stream(object())
 
-        with pytest.raises(AudioPublishAlreadyActiveError):
+        with pytest.raises(SessionStateError):
             await session.start_audio_stream(object())
 
         # The refusal happens before publishing, so no second track exists.
@@ -106,7 +106,7 @@ def test_microphone_is_refused_while_a_stream_publishes() -> None:
         assert session is not None
         await session.start_audio_stream(object())
 
-        with pytest.raises(AudioPublishAlreadyActiveError):
+        with pytest.raises(SessionStateError):
             await session.set_microphone_enabled(True)
 
         assert len(harness.transport.published_sources) == 1

@@ -20,8 +20,10 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173, enter your API key, then select
-**Start Session**. Allow microphone access when the browser asks.
+Open http://localhost:5173 and select **Start Session** — with the key box
+left empty, the dev server mints short-lived tokens from the credential
+`cosmo init` stored (run it once). Allow microphone access when the browser
+asks.
 
 The `cosmo-ai` dependency is the published npm package, so a fresh
 clone needs nothing beyond `npm install`.

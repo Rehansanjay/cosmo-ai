@@ -2,14 +2,14 @@
  * Internal binding of client-tool handlers to the transport RPC bridge —
  * the TS port of the reference SDK's ``_client_tools.py``.
  *
- * The public surface (``ClientToolSpec`` / ``BackgroundClientToolSpec``
+ * The public surface (``ClientTool`` / ``BackgroundClientTool``
  * with a ``handler``) carries no transport vocabulary. This module adapts
  * each handler into an RPC method whose request payload is the
  * JSON-encoded args and whose reply is the JSON envelope
  * ``{ok, result, error}``.
  *
- * A ``ClientToolSpec`` handler is plain (``(args) => result``). A
- * ``BackgroundClientToolSpec`` handler (``(args, job) => void``) receives a
+ * A ``ClientTool`` handler is plain (``(args) => result``). A
+ * ``BackgroundClientTool`` handler (``(args, job) => void``) receives a
  * ``ClientToolJob``: it calls ``job.ack(note)`` to release the RPC reply
  * early (a ``deferred`` envelope) and keeps running; when the work finishes
  * it calls ``job.complete(...)`` / ``job.fail(...)``, which publishes a
@@ -25,10 +25,10 @@ import type { RpcInvocation, Unsubscribe } from '../transport/types';
 
 import { ToolInputValidationError } from '../tool/errors';
 import type {
+  AgentToolPayload,
   BackgroundClientToolHandler,
-  BackgroundClientToolSpec,
+  BackgroundClientTool,
   ClientToolHandler,
-  RealtimeTool,
 } from './agent';
 import {
   ClientToolJob,
@@ -60,7 +60,7 @@ function newJobId(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
-function replyEnvelope(opts: {
+function replyEnvelope(options: {
   ok: boolean;
   result: Record<string, unknown> | null;
   error: string | null;
@@ -68,14 +68,14 @@ function replyEnvelope(opts: {
   jobId?: string;
 }): string {
   const envelope: Record<string, unknown> = {
-    ok: opts.ok,
-    result: opts.result,
-    error: opts.error,
+    ok: options.ok,
+    result: options.result,
+    error: options.error,
   };
   // Only a deferred ack carries these keys, so a normal reply is byte-unchanged.
-  if (opts.deferred === true) {
+  if (options.deferred === true) {
     envelope.deferred = true;
-    envelope.job_id = opts.jobId;
+    envelope.job_id = options.jobId;
   }
   return JSON.stringify(envelope);
 }
@@ -358,23 +358,23 @@ function wasRewritten(
 async function applyPreHook(
   hooks: HookEngine | null,
   sessionId: string | null,
-  opts: { toolName: string; args: Record<string, unknown> },
+  options: { toolName: string; args: Record<string, unknown> },
 ): Promise<
   { args: Record<string, unknown>; deniedReply: null } | { args: null; deniedReply: string }
 > {
   if (hooks === null || sessionId === null) {
-    return { args: opts.args, deniedReply: null };
+    return { args: options.args, deniedReply: null };
   }
   const decision = await hooks.runPreToolUse({
-    toolName: opts.toolName,
-    arguments: opts.args,
+    toolName: options.toolName,
+    arguments: options.args,
     sessionId,
   });
   if (decision.denied) {
     const reason = decision.reason ?? 'denied by hook';
     await hooks.runPostToolUse({
       event: 'PostToolUse',
-      toolName: opts.toolName,
+      toolName: options.toolName,
       arguments: decision.arguments,
       outcome: { kind: 'denied', reason },
       sessionId,
@@ -406,15 +406,20 @@ async function firePostHook(
 export async function invokeClientToolHandler(
   handler: ClientToolHandler,
   payload: string,
-  opts: { toolName: string; hooks?: HookEngine | null; sessionId?: string | null },
+  options: {
+    toolName: string;
+    signal?: AbortSignal;
+    hooks?: HookEngine | null;
+    sessionId?: string | null;
+  },
 ): Promise<string> {
   const decoded = decodeArgs(payload);
   if (typeof decoded === 'string') return errorReply(decoded);
 
-  const hooks = opts.hooks ?? null;
-  const sessionId = opts.sessionId ?? null;
+  const hooks = options.hooks ?? null;
+  const sessionId = options.sessionId ?? null;
   const pre = await applyPreHook(hooks, sessionId, {
-    toolName: opts.toolName,
+    toolName: options.toolName,
     args: decoded,
   });
   if (pre.deniedReply !== null) return pre.deniedReply;
@@ -422,11 +427,13 @@ export async function invokeClientToolHandler(
   let reply: string;
   let outcome: ToolOutcome;
   try {
-    const result = await handler(pre.args);
+    options.signal?.throwIfAborted();
+    const result = await handler(pre.args, options.signal);
     ({ reply, outcome } = envelopeResult(result ?? null));
   } catch (err) {
-    log.error('[realtime] client tool handler failed', { tool: opts.toolName }, err);
-    warnIfHookRewriteBrokeValidation(err, opts.toolName, () =>
+    if (options.signal?.aborted) throw err;
+    log.error('[realtime] client tool handler failed', { tool: options.toolName }, err);
+    warnIfHookRewriteBrokeValidation(err, options.toolName, () =>
       wasRewritten(decoded, pre.args),
     );
     const message = errorMessage(err);
@@ -434,7 +441,7 @@ export async function invokeClientToolHandler(
     outcome = { kind: 'error', message };
   }
 
-  await firePostHook(hooks, sessionId, opts.toolName, pre.args, outcome);
+  await firePostHook(hooks, sessionId, options.toolName, pre.args, outcome);
   return reply;
 }
 
@@ -448,7 +455,7 @@ export async function invokeClientToolHandler(
 export async function invokeBackgroundClientToolHandler(
   handler: BackgroundClientToolHandler,
   payload: string,
-  opts: {
+  options: {
     toolName: string;
     sink: ClientToolJobSink;
     hooks?: HookEngine | null;
@@ -458,10 +465,10 @@ export async function invokeBackgroundClientToolHandler(
   const decoded = decodeArgs(payload);
   if (typeof decoded === 'string') return errorReply(decoded);
 
-  const hooks = opts.hooks ?? null;
-  const sessionId = opts.sessionId ?? null;
+  const hooks = options.hooks ?? null;
+  const sessionId = options.sessionId ?? null;
   const pre = await applyPreHook(hooks, sessionId, {
-    toolName: opts.toolName,
+    toolName: options.toolName,
     args: decoded,
   });
   if (pre.deniedReply !== null) return pre.deniedReply;
@@ -469,14 +476,14 @@ export async function invokeBackgroundClientToolHandler(
 
   const job = new ClientToolJob({
     jobId: newJobId(),
-    toolName: opts.toolName,
-    sink: opts.sink,
+    toolName: options.toolName,
+    sink: options.sink,
     hooks,
     sessionId,
     arguments: resolvedArgs,
   });
-  void opts.sink.spawn(() =>
-    runBackgroundHandler(handler, resolvedArgs, job, opts.toolName, () =>
+  void options.sink.spawn(() =>
+    runBackgroundHandler(handler, resolvedArgs, job, options.toolName, () =>
       wasRewritten(decoded, resolvedArgs),
     ),
   );
@@ -487,23 +494,23 @@ export async function invokeBackgroundClientToolHandler(
       // Deferred: the run keeps going (the sink owns it); the terminal
       // result and PostToolUse arrive later via job.complete / job.fail.
       log.info('[realtime] client tool deferred', {
-        tool: opts.toolName,
+        tool: options.toolName,
         jobId: job.jobId,
       });
       return deferredReply(raced.note, job.jobId);
     case 'finished-without-ack': {
       const message = 'background client tool returned without acking or completing';
       log.warn('[realtime] client tool job finished without ack', {
-        tool: opts.toolName,
+        tool: options.toolName,
       });
-      await firePostHook(hooks, sessionId, opts.toolName, resolvedArgs, {
+      await firePostHook(hooks, sessionId, options.toolName, resolvedArgs, {
         kind: 'error',
         message,
       });
       return errorReply(message);
     }
     case 'failed-before-ack':
-      await firePostHook(hooks, sessionId, opts.toolName, resolvedArgs, {
+      await firePostHook(hooks, sessionId, options.toolName, resolvedArgs, {
         kind: 'error',
         message: raced.message,
       });
@@ -574,8 +581,8 @@ async function runBackgroundHandler(
 }
 
 export function isBackgroundClientTool(
-  tool: RealtimeTool,
-): tool is BackgroundClientToolSpec {
+  tool: AgentToolPayload,
+): tool is BackgroundClientTool {
   return tool.kind === 'client' && tool.background === true;
 }
 
@@ -631,11 +638,9 @@ export function makeRpcHandler(
   });
 }
 
-/** Register one RPC method per client tool that carries a handler.
- *
- *  Tools without a handler are skipped — they are declared to the agent
- *  but not locally executable. A ``BackgroundClientToolSpec`` is registered
- *  as long-running (driven through ``jobSink``).
+/** Register one RPC method per client tool; other tool kinds carry no
+ *  local execution and are passed over. A ``BackgroundClientTool`` is
+ *  registered as long-running (driven through ``jobSink``).
  *
  *  Returns a disposer that unregisters every method this call installed.
  *  If a registration throws mid-loop, the already-installed methods are
@@ -643,8 +648,8 @@ export function makeRpcHandler(
  *  partial tool set. */
 export function registerClientToolHandlers(
   registrar: ClientToolRpcRegistrar,
-  tools: readonly RealtimeTool[],
-  opts: {
+  tools: readonly AgentToolPayload[],
+  options: {
     hooks?: HookEngine | null;
     /** The session id for hook contexts, or a getter resolved per invocation
      *  — registration may happen pre-connect, before the id is minted. */
@@ -652,11 +657,11 @@ export function registerClientToolHandlers(
     jobSink?: ClientToolJobSink | null;
   } = {},
 ): Unsubscribe {
-  const hooks = opts.hooks ?? null;
-  const sessionIdOpt = opts.sessionId ?? null;
+  const hooks = options.hooks ?? null;
+  const sessionIdOpt = options.sessionId ?? null;
   const resolveSessionId = (): string | null =>
     typeof sessionIdOpt === 'function' ? sessionIdOpt() : sessionIdOpt;
-  const jobSink = opts.jobSink ?? null;
+  const jobSink = options.jobSink ?? null;
   const unsubscribes: Unsubscribe[] = [];
   const unregisterAll = (): void => {
     for (const unsubscribe of unsubscribes.splice(0)) {
@@ -670,40 +675,36 @@ export function registerClientToolHandlers(
   try {
     for (const tool of tools) {
       if (tool.kind !== 'client') continue;
-      let invoke: ((invocation: RpcInvocation) => Promise<string>) | null = null;
+      let invoke: (invocation: RpcInvocation) => Promise<string>;
       if (isBackgroundClientTool(tool)) {
         const handler = tool.handler;
-        if (handler !== undefined) {
-          invoke = (invocation) => {
-            if (jobSink === null) {
-              log.error(
-                '[realtime] background client tool has no session job sink',
-                { tool: tool.name },
-              );
-              return Promise.resolve(
-                errorReply('background client tool has no session job sink'),
-              );
-            }
-            return invokeBackgroundClientToolHandler(handler, invocation.payload, {
-              toolName: tool.name,
-              sink: jobSink,
-              hooks,
-              sessionId: resolveSessionId(),
-            });
-          };
-        }
+        invoke = (invocation) => {
+          if (jobSink === null) {
+            log.error(
+              '[realtime] background client tool has no session job sink',
+              { tool: tool.name },
+            );
+            return Promise.resolve(
+              errorReply('background client tool has no session job sink'),
+            );
+          }
+          return invokeBackgroundClientToolHandler(handler, invocation.payload, {
+            toolName: tool.name,
+            sink: jobSink,
+            hooks,
+            sessionId: resolveSessionId(),
+          });
+        };
       } else {
         const handler = tool.handler;
-        if (handler !== undefined) {
-          invoke = (invocation) =>
-            invokeClientToolHandler(handler, invocation.payload, {
-              toolName: tool.name,
-              hooks,
-              sessionId: resolveSessionId(),
-            });
-        }
+        invoke = (invocation) =>
+          invokeClientToolHandler(handler, invocation.payload, {
+            toolName: tool.name,
+            hooks,
+            sessionId: resolveSessionId(),
+            signal: invocation.signal,
+          });
       }
-      if (invoke === null) continue;
       unsubscribes.push(
         registrar.registerRpcMethod(tool.name, guardAgentCaller(tool.name, invoke)),
       );

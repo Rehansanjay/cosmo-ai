@@ -9,9 +9,11 @@
  * valid against the backend it was issued for — and a ``COSMO_BASE_URL``
  * naming a different backend is refused rather than obeyed.
  *
- * Node-only: a browser has no environment and no credentials file, so
- * :func:`resolveCredentialFromRuntime` short-circuits to ``null`` there and
- * the client keeps its credential-less (cookie / host-app) behavior.
+ * Off Node there is no environment and no credentials file, so the chain can
+ * never succeed: :func:`resolveCredentialFromRuntime` fails with
+ * ``no_credential`` there without touching Node builtins. A browser client
+ * is given its credential — a minted ``token``, or ``getAuthHeaders``, which
+ * skips the chain entirely.
  *
  * The file is TOML written exclusively by the Cosmo CLI. Rather than take a
  * TOML dependency (this package has zero runtime dependencies), the parser
@@ -22,14 +24,8 @@
  * ``credentials-resolution-vectors.json``.
  */
 
-import { CredentialError } from './auth';
+import { CredentialsError } from './auth';
 
-export type CredentialsErrorCode =
-  | 'no_credential'
-  | 'profile_not_found'
-  | 'file_invalid'
-  | 'expired'
-  | 'base_url_mismatch';
 
 export type ResolvedCredential = {
   apiKey: string;
@@ -51,7 +47,7 @@ type EnvMap = Record<string, string | undefined>;
  *
  *  Split from :func:`resolveCredentialFromRuntime` so the conformance
  *  vectors can drive it without touching the process environment or
- *  filesystem. Throws :class:`CredentialError` with a vector
+ *  filesystem. Throws :class:`CredentialsError` with a vector
  *  ``code`` on every failure, including ``no_credential``.
  */
 export function resolveCredential(
@@ -67,11 +63,11 @@ export function resolveCredential(
 
   const profile = env.COSMO_PROFILE || DEFAULT_PROFILE;
   if (fileText === null) {
-    throw new CredentialError(
-      'No Cosmo credential found. Pass apiKey or token, set COSMO_API_KEY, ' +
+    throw new CredentialsError({
+      code: 'no_credential',
+      message: 'No Cosmo credential found. Pass apiKey or token, set COSMO_API_KEY, ' +
         `or sign in with: cosmo login (credentials file checked: ${pathDisplay})`,
-      'no_credential',
-    );
+    });
   }
 
   const entry = loadProfile(fileText, profile, pathDisplay);
@@ -80,32 +76,36 @@ export function resolveCredential(
   return { apiKey: entry.api_key, baseUrl: entry.base_url, source: 'file' };
 }
 
-/** Run the chain against the real environment and filesystem (Node only).
+/** Run the chain against the real environment and filesystem.
  *
- *  Returns ``null`` when there is nothing to resolve — off Node, or with no
- *  env var and no credentials file — so the client can keep its
- *  credential-less mode. An unusable file (bad format, missing fields,
- *  expired key) still throws: the user set up file auth and it failed.
+ *  Throws :class:`CredentialsError` on every failure — ``no_credential`` when
+ *  there is nothing to resolve, the file codes when the file exists but
+ *  cannot be used — the same outcomes the conformance vectors pin for the
+ *  Python and Swift constructors.
  */
-export async function resolveCredentialFromRuntime(): Promise<ResolvedCredential | null> {
-  if (typeof process === 'undefined' || !process.versions?.node) return null;
+export async function resolveCredentialFromRuntime(): Promise<ResolvedCredential> {
+  if (typeof process === 'undefined' || !process.versions?.node) {
+    throw browserNoCredential();
+  }
   // An Electron renderer (or a bundler-shimmed browser context) has a window;
   // a credentials file on disk is a server/CLI concern, never a page's.
-  if (typeof window !== 'undefined') return null;
+  if (typeof window !== 'undefined') throw browserNoCredential();
 
   const env = process.env as EnvMap;
-  try {
-    if (env.COSMO_API_KEY?.trim()) {
-      return resolveCredential(env, null, '(not read)', Date.now());
-    }
-    const { path, text } = await readCredentialsFile(env);
-    return resolveCredential(env, text, path, Date.now());
-  } catch (err) {
-    if (err instanceof CredentialError && err.code === 'no_credential') {
-      return null;
-    }
-    throw err;
+  if (env.COSMO_API_KEY?.trim()) {
+    return resolveCredential(env, null, '(not read)', Date.now());
   }
+  const { path, text } = await readCredentialsFile(env);
+  return resolveCredential(env, text, path, Date.now());
+}
+
+function browserNoCredential(): CredentialsError {
+  return new CredentialsError({
+    code: 'no_credential',
+    message: 'No Cosmo credential found. Pass a minted end-user token (token) or ' +
+      'supply getAuthHeaders — a browser has no COSMO_API_KEY environment ' +
+      'and no cosmo login credentials file.',
+  });
 }
 
 async function readCredentialsFile(
@@ -123,11 +123,11 @@ async function readCredentialsFile(
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { path, text: null };
     const reason = err instanceof Error ? err.message : String(err);
-    throw new CredentialError(
-      `Cannot read ${path}: ${reason}. Fix its permissions, or point ` +
+    throw new CredentialsError({
+      code: 'file_invalid',
+      message: `Cannot read ${path}: ${reason}. Fix its permissions, or point ` +
         'COSMO_CREDENTIALS_FILE elsewhere.',
-      'file_invalid',
-    );
+    });
   }
 }
 
@@ -146,11 +146,11 @@ function loadProfile(
   const entry = document.tables.get(profile);
   if (entry === undefined) {
     const present = [...document.tables.keys()].sort().join(', ');
-    throw new CredentialError(
-      `No '${profile}' credentials in ${pathDisplay}. ` +
+    throw new CredentialsError({
+      code: 'profile_not_found',
+      message: `No '${profile}' credentials in ${pathDisplay}. ` +
         `Profiles present: ${present || '(none)'}. Run: cosmo login`,
-      'profile_not_found',
-    );
+    });
   }
 
   const values: Partial<ProfileEntry> = {};
@@ -161,36 +161,36 @@ function loadProfile(
     else missing.push(field);
   }
   if (missing.length > 0) {
-    throw new CredentialError(
-      `Profile '${profile}' in ${pathDisplay} is missing: ${missing.join(', ')}. ` +
+    throw new CredentialsError({
+      code: 'file_invalid',
+      message: `Profile '${profile}' in ${pathDisplay} is missing: ${missing.join(', ')}. ` +
         'Run: cosmo login',
-      'file_invalid',
-    );
+    });
   }
   return values as ProfileEntry;
 }
 
 function rejectUnreadableVersion(version: TomlValue | undefined, pathDisplay: string): void {
   if (version === undefined) {
-    throw new CredentialError(
-      `${pathDisplay} predates the versioned credentials format. ` +
+    throw new CredentialsError({
+      code: 'file_invalid',
+      message: `${pathDisplay} predates the versioned credentials format. ` +
         'Run: cosmo login (rewrites it, keeping a .bak copy)',
-      'file_invalid',
-    );
+    });
   }
   if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) {
-    throw new CredentialError(
-      `${pathDisplay}: 'version' must be a positive integer, found ${String(version)}. ` +
+    throw new CredentialsError({
+      code: 'file_invalid',
+      message: `${pathDisplay}: 'version' must be a positive integer, found ${String(version)}. ` +
         'Move it aside or delete it, then run: cosmo login',
-      'file_invalid',
-    );
+    });
   }
   if (version > CREDENTIALS_VERSION) {
-    throw new CredentialError(
-      `${pathDisplay} was written by a newer Cosmo CLI (format ${version}; this ` +
+    throw new CredentialsError({
+      code: 'file_invalid',
+      message: `${pathDisplay} was written by a newer Cosmo CLI (format ${version}; this ` +
         `SDK understands ${CREDENTIALS_VERSION}). Upgrade the cosmo-ai package.`,
-      'file_invalid',
-    );
+    });
   }
 }
 
@@ -204,13 +204,13 @@ function rejectBaseUrlConflict(
   pathDisplay: string,
 ): void {
   if (envBase === null || originKey(envBase) === originKey(storedBase)) return;
-  throw new CredentialError(
-    `COSMO_BASE_URL is ${envBase}, but the stored key for profile '${profile}' ` +
+  throw new CredentialsError({
+    code: 'base_url_mismatch',
+    message: `COSMO_BASE_URL is ${envBase}, but the stored key for profile '${profile}' ` +
       `was issued by ${storedBase} (${pathDisplay}). Unset COSMO_BASE_URL, sign ` +
       `in against ${envBase} with \`cosmo login\`, or pass a key for that ` +
       'backend explicitly / via COSMO_API_KEY.',
-    'base_url_mismatch',
-  );
+  });
 }
 
 /** The effective origin — scheme, host, default-aware port — so
@@ -239,18 +239,18 @@ function rejectExpired(
 ): void {
   const expiryMs = parseRfc3339Ms(expiresAt);
   if (expiryMs === null) {
-    throw new CredentialError(
-      `Profile '${profile}' in ${pathDisplay} has an unreadable expires_at: ` +
+    throw new CredentialsError({
+      code: 'file_invalid',
+      message: `Profile '${profile}' in ${pathDisplay} has an unreadable expires_at: ` +
         `'${expiresAt}'. Run: cosmo login`,
-      'file_invalid',
-    );
+    });
   }
   if (nowMs >= expiryMs) {
-    throw new CredentialError(
-      `The stored API key for profile '${profile}' expired at ${expiresAt} ` +
+    throw new CredentialsError({
+      code: 'expired',
+      message: `The stored API key for profile '${profile}' expired at ${expiresAt} ` +
         `(${pathDisplay}). Run: cosmo login`,
-      'expired',
-    );
+    });
   }
 }
 
@@ -273,11 +273,11 @@ type ParsedDocument = {
 const BARE_KEY = /^[A-Za-z0-9_-]+$/;
 
 function invalid(pathDisplay: string, lineNo: number, reason: string): never {
-  throw new CredentialError(
-    `${pathDisplay} is not a readable credentials file (line ${lineNo}: ${reason}). ` +
+  throw new CredentialsError({
+    code: 'file_invalid',
+    message: `${pathDisplay} is not a readable credentials file (line ${lineNo}: ${reason}). ` +
       'Move it aside or delete it, then run: cosmo login',
-    'file_invalid',
-  );
+  });
 }
 
 function parseCredentialsToml(text: string, pathDisplay: string): ParsedDocument {

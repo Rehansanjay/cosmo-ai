@@ -2,35 +2,32 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  RealtimeClient,
+  TokenSource,
+  type RealtimeClientOptions,
+  type RealtimeSession,
+  type TransportState,
+} from 'cosmo-ai';
+import {
   BarVisualizer,
   RealtimeProvider,
   MicToggle,
   RealtimeAudio,
-  RealtimeClient,
   StartAudio,
-  TokenSource,
   useAgentState,
   useMicLevel,
   useOutputLevel,
   useRealtimeError,
   useTransportState,
   useTranscript,
-  type RealtimeClientOptions,
-  type RealtimeSession,
-  type TransportState,
-} from 'cosmo-ai';
+} from 'cosmo-ai/react';
 
 import { route, type RouteResult } from './route';
 
-// Prefill from a gitignored .env for local dev convenience (see .env.example).
-// Never hardcode a key here — this file is committed. Gated on `DEV` (a
-// compile-time-literal boolean Vite dead-code-eliminates) rather than just
-// trusting `pages:build`'s `VITE_COSMO_API_KEY=` override: that blanking only
-// covers the `pages:build` script, so a plain `npm run build` with a real key
-// still in `.env` would otherwise inline it into the shipped bundle. This
-// gate makes that impossible regardless of which build script gets run —
-// the literal read of the env var is compiled out of any production build.
-const API_KEY_DEFAULT = import.meta.env.DEV ? (import.meta.env.VITE_COSMO_API_KEY ?? '') : '';
+// No key in page code: /token mints short-lived tokens in both modes — the
+// vite.config tokenRoute plugin under `vite dev`, the deployed Pages
+// Function otherwise. The settings box collects only the hosted access
+// password; dev needs nothing.
 
 // Display only — the SDK resolves its backend itself, from the
 // `cosmo-base-url` meta tag vite.config.ts injects when VITE_COSMO_BASE_URL
@@ -83,7 +80,7 @@ const STATUS_META: Record<TransportState, { label: string; color: string; pulse:
 };
 
 export function App() {
-  const [apiKey, setApiKey] = useState(API_KEY_DEFAULT);
+  const [apiKey, setApiKey] = useState('');
   const [session, setSession] = useState<RealtimeSession | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [connectError, setConnectError] = useState<string | null>(null);
@@ -101,20 +98,22 @@ export function App() {
   const handleConnect = useCallback(async () => {
     if (startingRef.current) return;
     const text = intent.trim();
-    if (!text || !apiKey) return;
+    if (!text || (HOSTED && !apiKey)) return;
 
     startingRef.current = true;
     const result = route(text);
     setConnectError(null);
     setConnecting(true);
-    // Hosted: the box held a password, traded for short-lived end-user tokens
-    // by this deployment's /token Function — TokenSource keeps one fresh.
-    // Local: the box held an API key, sent to the backend directly.
-    const opts: RealtimeClientOptions = HOSTED
-      ? { token: TokenSource.endpoint('/token', { headers: () => mintHeaders(apiKey) }) }
-      : { apiKey };
+    // One path, either mode: /token mints, TokenSource keeps one fresh.
+    // Hosted sends the box's access password; dev sends only the visitor id.
+    const options: RealtimeClientOptions = {
+      token: TokenSource.endpoint('/token', {
+        headers: () =>
+          HOSTED ? mintHeaders(apiKey) : { 'x-external-user-id': externalUserId() },
+      }),
+    };
     try {
-      const client = new RealtimeClient(opts);
+      const client = new RealtimeClient(options);
       setSession(await client.agent(result.agentConfig).start());
       setPendingRoute(result);
     } catch (err) {
@@ -122,8 +121,8 @@ export function App() {
       setConnectError(
         err instanceof Error && /401|invalid/i.test(message)
           ? `That key was rejected by ${SESSION_TARGET} — a key from one environment will not work against another.`
-          : /not available for this workspace/i.test(message)
-            ? `${message} (openai/openai_mini routes need the realtime-openai-provider-enabled flag on for this workspace — try an intent that routes to Gemini instead, e.g. "help me practice a speech".)`
+          : /not available on this server/i.test(message)
+            ? `${message} (openai/openai_mini routes need an OpenAI API key configured on the server — try an intent that routes to Gemini instead, e.g. "help me practice a speech".)`
             : message,
       );
     } finally {
@@ -185,7 +184,7 @@ export function App() {
         )}
 
         {session ? (
-          <RealtimeProvider session={session} maxTranscriptLength={40}>
+          <RealtimeProvider session={session}>
             <Session
               intent={intent}
               pendingRoute={pendingRoute}
@@ -215,47 +214,38 @@ export function App() {
                 type="button"
                 className="mr-button mr-button-primary"
                 onClick={() => void handleConnect()}
-                disabled={connecting || !intent.trim() || !apiKey}
+                disabled={connecting || !intent.trim() || (HOSTED && !apiKey)}
               >
                 {connecting ? 'Connecting…' : 'Start session'}
               </button>
             </section>
 
-            <details className="mr-settings" open={!apiKey}>
-              <summary>Connection</summary>
-              <div style={{ marginTop: 10 }}>
-                <label
-                  htmlFor="k"
-                  style={{ display: 'block', fontSize: 12.5, color: 'var(--color-text-muted)', marginBottom: 6 }}
-                >
-                  {HOSTED ? 'Access password' : 'API key'}
-                </label>
-                <input
-                  id="k"
-                  className="mr-input"
-                  type="password"
-                  value={apiKey}
-                  onChange={(e) => setApiKey(e.target.value)}
-                  placeholder={HOSTED ? '' : 'cosmo_…'}
-                  style={{ width: '100%' }}
-                />
-                <p style={{ fontSize: 12, color: 'var(--color-text-faint)', margin: '8px 0 0' }}>
-                  {HOSTED ? (
-                    <>
-                      This deployment keeps its Cosmo key server-side; the
-                      password lets the page mint its own short-lived tokens.
-                    </>
-                  ) : (
-                    <>
-                      A workspace API key with the <code>realtime:use</code>{' '}
-                      scope, sent to <code>{SESSION_TARGET}</code>. Set{' '}
-                      <code>VITE_COSMO_API_KEY</code> in <code>.env</code> to
-                      skip pasting it every run.
-                    </>
-                  )}
-                </p>
-              </div>
-            </details>
+            {HOSTED && (
+              <details className="mr-settings" open={!apiKey}>
+                <summary>Connection</summary>
+                <div style={{ marginTop: 10 }}>
+                  <label
+                    htmlFor="k"
+                    style={{ display: 'block', fontSize: 12.5, color: 'var(--color-text-muted)', marginBottom: 6 }}
+                  >
+                    Access password
+                  </label>
+                  <input
+                    id="k"
+                    className="mr-input"
+                    type="password"
+                    value={apiKey}
+                    onChange={(e) => setApiKey(e.target.value)}
+                    style={{ width: '100%' }}
+                  />
+                  <p style={{ fontSize: 12, color: 'var(--color-text-faint)', margin: '8px 0 0' }}>
+                    This deployment keeps its Cosmo key server-side; the
+                    password lets the page mint its own short-lived tokens.
+                    Sessions go to <code>{SESSION_TARGET}</code>.
+                  </p>
+                </div>
+              </details>
+            )}
           </>
         )}
       </div>

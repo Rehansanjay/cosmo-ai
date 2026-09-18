@@ -1,20 +1,21 @@
 import { useCallback, useRef, useState } from 'react';
 
-import { RealtimeProvider, RealtimeClient, type RealtimeSession } from 'cosmo-ai';
+import { RealtimeClient, TokenSource, type RealtimeSession } from 'cosmo-ai';
+import { RealtimeProvider } from 'cosmo-ai/react';
 
 import { partyGameNightAgent } from './agent';
 import { GameStore } from './game/state';
 import { LiveView } from './LiveView';
 
-// Prefill from a gitignored .env for local dev convenience (see .env.example).
-// Never hardcode a key here — this file is committed.
-const API_KEY_DEFAULT = import.meta.env.VITE_COSMO_API_KEY ?? '';
+// No key in page code: the /token route (vite.config's tokenRoute plugin in
+// dev; a real route when deployed) mints short-lived tokens. The paste box
+// below stays as an override for a deployment without one.
 
 type Phase = 'idle' | 'starting' | 'live';
 
 export function App() {
   const [phase, setPhase] = useState<Phase>('idle');
-  const [apiKey, setApiKey] = useState(API_KEY_DEFAULT);
+  const [apiKey, setApiKey] = useState('');
   const [session, setSession] = useState<RealtimeSession | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
@@ -47,7 +48,7 @@ export function App() {
   }, []);
 
   const start = useCallback(async () => {
-    if (!apiKey || phase !== 'idle') return;
+    if (phase !== 'idle') return;
     setPhase('starting');
     setError(null);
     setNote(null);
@@ -55,7 +56,10 @@ export function App() {
 
     let session: RealtimeSession;
     try {
-      const live = new RealtimeClient({ apiKey });
+      // Empty box → the app's own /token route; a pasted key overrides it.
+      const live = new RealtimeClient(
+        apiKey.trim() ? { apiKey } : { token: TokenSource.endpoint('/token') },
+      );
       session = await live.agent(partyGameNightAgent(store)).start();
     } catch (err) {
       console.error('[party-game-night] session start failed', err);
@@ -122,21 +126,19 @@ export function App() {
         An AI game-show host on your TV: it conjures the board, flips the
         answers you shout, and keeps score — one device, the whole room playing.
       </p>
-      {API_KEY_DEFAULT === '' && (
-        <input
-          type="password"
-          value={apiKey}
-          placeholder="Cosmo API key (realtime:use)"
-          autoComplete="off"
-          onChange={(event) => setApiKey(event.target.value)}
-        />
-      )}
+      <input
+        type="password"
+        value={apiKey}
+        placeholder="API key (optional — the /token route is used when empty)"
+        autoComplete="off"
+        onChange={(event) => setApiKey(event.target.value)}
+      />
       {error !== null && <p className="err">{error}</p>}
       {note !== null && <p className="note">{note}</p>}
       <button
         className="btn primary"
         onClick={() => void start()}
-        disabled={!apiKey || phase === 'starting'}
+        disabled={phase === 'starting'}
       >
         {phase === 'starting' ? 'Warming up the stage…' : 'Start game night'}
       </button>

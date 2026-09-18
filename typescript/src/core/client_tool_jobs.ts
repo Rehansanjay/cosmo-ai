@@ -2,7 +2,7 @@
  * Background client-tool job model — the TS port of the reference SDK's
  * ``_client_tool_jobs.py``.
  *
- * A ``BackgroundClientToolSpec`` handler receives a ``ClientToolJob`` to
+ * A ``BackgroundClientTool`` handler receives a ``ClientToolJob`` to
  * ack the call and deliver its terminal result later. This module holds
  * that model — the per-invocation ``ClientToolJob`` and the session-scoped
  * ``ClientToolJobSink`` that owns the in-flight handler work and the
@@ -11,7 +11,7 @@
  */
 
 import { log } from './logger';
-import type { ToolJobResult } from '../wire/types.gen';
+import type { ToolJobResult } from '../protocol';
 
 import { SAFE_PACKET_BYTES } from '../transport/envelope';
 import type { HookEngine, ToolOutcome } from './hooks';
@@ -100,12 +100,12 @@ export class ClientToolJobSink {
   private readonly inflight = new Set<Promise<void>>();
   private closed = false;
 
-  constructor(opts: {
+  constructor(options: {
     publish: (message: ToolJobResult) => Promise<void>;
     isOpen: () => boolean;
   }) {
-    this.publishFn = opts.publish;
-    this.isOpenFn = opts.isOpen;
+    this.publishFn = options.publish;
+    this.isOpenFn = options.isOpen;
   }
 
   isOpen(): boolean {
@@ -154,7 +154,10 @@ export type ClientToolJobRaceOutcome =
  *  message the server injects into the live session. All three are
  *  idempotent; a terminal call after the session has closed is dropped. */
 export class ClientToolJob {
+  /** Identifies this job — the id the acked tool call was given, and what
+   *  the terminal result is matched back to. */
   readonly jobId: string;
+  /** Name of the tool this job is running, for logging and attribution. */
   readonly toolName: string;
   private readonly sink: ClientToolJobSink;
   private readonly hooks: HookEngine | null;
@@ -168,7 +171,7 @@ export class ClientToolJob {
   readonly raceOutcome: Promise<ClientToolJobRaceOutcome>;
 
   /** @internal — constructed by the dispatch in ``./client_tools``. */
-  constructor(opts: {
+  constructor(options: {
     jobId: string;
     toolName: string;
     sink: ClientToolJobSink;
@@ -176,17 +179,20 @@ export class ClientToolJob {
     sessionId: string | null;
     arguments: Record<string, unknown>;
   }) {
-    this.jobId = opts.jobId;
-    this.toolName = opts.toolName;
-    this.sink = opts.sink;
-    this.hooks = opts.hooks;
-    this.sessionId = opts.sessionId;
-    this.toolArguments = opts.arguments;
+    this.jobId = options.jobId;
+    this.toolName = options.toolName;
+    this.sink = options.sink;
+    this.hooks = options.hooks;
+    this.sessionId = options.sessionId;
+    this.toolArguments = options.arguments;
     this.raceOutcome = new Promise((resolve) => {
       this.settleRace = resolve;
     });
   }
 
+  /** Whether the reply has been released yet, by ``ack()`` or by a terminal
+   *  call that answered without one. Lets a handler that may reach completion
+   *  either way avoid a redundant ``ack()``, which is ignored anyway. */
   get acked(): boolean {
     return this.ackedFlag;
   }
@@ -214,13 +220,13 @@ export class ClientToolJob {
   /** Deliver a successful terminal result. Idempotent once delivered; a
    *  failed publish rejects and leaves the job retryable. */
   async complete(
-    opts: { result?: Record<string, unknown> | null; summary?: string | null } = {},
+    options: { result?: Record<string, unknown> | null; summary?: string | null } = {},
   ): Promise<void> {
-    const result = opts.result ?? null;
+    const result = options.result ?? null;
     await this.deliver({
       status: 'completed',
       result,
-      summary: opts.summary ?? null,
+      summary: options.summary ?? null,
       error: null,
       outcome: { kind: 'ok', result: result ?? {} },
     });
@@ -228,13 +234,13 @@ export class ClientToolJob {
 
   /** Deliver a failed terminal result. Idempotent once delivered; a failed
    *  publish rejects and leaves the job retryable. */
-  async fail(opts: { error: string }): Promise<void> {
+  async fail(options: { error: string }): Promise<void> {
     await this.deliver({
       status: 'failed',
       result: null,
       summary: null,
-      error: opts.error,
-      outcome: { kind: 'error', message: opts.error },
+      error: options.error,
+      outcome: { kind: 'error', message: options.error },
     });
   }
 
@@ -250,7 +256,7 @@ export class ClientToolJob {
     this.settleRace(outcome);
   }
 
-  private async deliver(opts: {
+  private async deliver(options: {
     status: 'completed' | 'failed';
     result: Record<string, unknown> | null;
     summary: string | null;
@@ -286,10 +292,10 @@ export class ClientToolJob {
       type: 'tool_job_result',
       job_id: this.jobId,
       tool_name: this.toolName,
-      status: opts.status,
-      result: capResult(opts.result) ?? undefined,
-      summary: capText(opts.summary) ?? undefined,
-      error: capText(opts.error) ?? undefined,
+      status: options.status,
+      result: capResult(options.result) ?? undefined,
+      summary: capText(options.summary) ?? undefined,
+      error: capText(options.error) ?? undefined,
     });
     try {
       await this.sink.publish(message);
@@ -310,7 +316,7 @@ export class ClientToolJob {
         event: 'PostToolUse',
         toolName: this.toolName,
         arguments: this.toolArguments,
-        outcome: opts.outcome,
+        outcome: options.outcome,
         sessionId: this.sessionId,
       });
     }

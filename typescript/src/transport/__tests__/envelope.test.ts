@@ -20,7 +20,7 @@ if (typeof global.TextDecoder === 'undefined') {
   global.TextDecoder = NodeTextDecoder as typeof global.TextDecoder;
 }
 
-import type { ServerEnvelope } from '../../wire/types.gen';
+import type { ServerEnvelope } from '../../protocol';
 
 import {
   base64ToBytes,

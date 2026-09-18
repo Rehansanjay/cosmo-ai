@@ -1,4 +1,5 @@
 import type { AgentConfig } from 'cosmo-ai';
+import { endCallTool, webSearchTool } from 'cosmo-ai';
 
 import buzzerTriviaSkill from './skills/buzzer_trivia/SKILL.md?raw';
 import buzzerTriviaQuestions from './skills/buzzer_trivia/questions.md?raw';
@@ -27,9 +28,9 @@ export function partyGameNightAgent(store: GameStore): AgentConfig {
     voice: VOICE,
     // Nothing here reads thought summaries, and leaving them on costs
     // tokens ahead of every reply — latency the room hears.
-    modelOptions: { provider: 'gemini', includeThoughts: false },
+    model: { provider: 'gemini', includeThoughts: false },
     // web_search backs trivia dispute rulings; the game tools are the board.
-    tools: [...makeGameTools(store), { kind: 'web_search' }, { kind: 'end_call' }],
+    tools: [...makeGameTools(store), webSearchTool(), endCallTool()],
     skills: [
       assembleGameSkill(familyFeudSkill, familyFeudQuestions, 'family-feud'),
       assembleGameSkill(buzzerTriviaSkill, buzzerTriviaQuestions, 'buzzer-trivia'),

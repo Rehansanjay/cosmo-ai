@@ -19,22 +19,22 @@ the persona.
 |---|---|
 | `web_search` | How it knows any recipe. There is no recipe database here: the agent searches, then lands the result as one structured `set_recipe` call. Search → structure → typed tool call. |
 | `examine_image` | Every doneness judgment. The published camera gives the model occasional stills; anything consequential goes through the tool, which runs a vision model over the freshest frame at full resolution. |
-| Background client tools | `start_timer` is `tool({ background: true })`. `job.ack()` releases the reply so the chef keeps talking, and `job.complete()` delivers the outcome minutes later — which is what lets the agent interrupt you. |
+| Background client tools | `start_timer` is `backgroundClientTool({ ... })`. `job.ack()` releases the reply so the chef keeps talking, and `job.complete()` delivers the outcome minutes later — which is what lets the agent interrupt you. |
 | A `PreToolUse` hook | House rules a schema cannot express: a step that does not exist, a timer label already taken, a duration outside 5 seconds to 2 hours. The denial reason goes back to the model, which recovers in words. |
 | A `SilenceTimeout` server hook | A quiet kitchen gets a check-in. It runs on the server, so it still fires if the tab sleeps. |
-| The OpenAI realtime provider | `model: 'openai'` picks the provider and `modelOptions` carries its knobs — both, or the session quietly runs on the workspace default. |
-| Typed session-start errors | The start screen reads `SessionBusyError` / `SessionEntitlementError` / `detail.code` instead of sniffing status codes. |
+| The OpenAI realtime provider | `model: { provider: 'openai', ... }` picks the provider and carries its knobs in one field, so the two cannot disagree. |
+| Typed session-start errors | The start screen reads `SessionStartError`'s `code` / `serverCode` instead of sniffing status codes. |
 | `useRealtimeSession()` | The whole session lifecycle: one single-use client per run, the mic released before the next start, every exit path funnelled into one teardown. |
 
 ## Run it
 
 ```bash
 npm install
-cp .env.example .env   # then paste a Cosmo API key into VITE_COSMO_API_KEY
+cosmo init            # once — signs in and stores the credential /token mints with
 npm run dev
 ```
 
-The key needs the `realtime:use` scope (Developer platform → API keys in the
+The key needs the `realtime:start` scope (**Voice — start sessions** under Developer platform → API keys in the
 Cosmo web app). Two things to know before the first run:
 
 - **The workspace must be able to run the OpenAI realtime provider.** If it
@@ -67,6 +67,11 @@ Both tunnel hostnames are in `server.allowedHosts` in `vite.config.ts`; a
 different tunnel needs its own entry, or Vite answers "Blocked request".
 ngrok's free tier also shows a one-time interstitial before the app — tap
 **Visit Site** once per URL.
+
+A tunnel publishes everything the dev server answers, including its `/token`
+route — so while it is open, anyone with the URL can mint tokens against your
+workspace. They expire in an hour and arrive at a few per minute, so the cost
+is bounded, but stop the tunnel when you are done rather than leaving it up.
 
 Then say something like *"I want to make a simple tomato pasta for two"*,
 and once you are cooking, *"tell me when the sauce has thickened."*

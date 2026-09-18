@@ -9,21 +9,60 @@
  * for the life of the process with no refresh code in the app.
  */
 
-import { MintTokenError, type MintedToken } from './auth';
+import { RealtimeError, ApiError } from './errors';
+import { CredentialsError } from './auth';
+import { parseRfc3339, type MintedToken } from './auth';
 import { log } from './logger';
 import { parseErrorDetail } from '../transport/error_detail';
 import { describeFetchFailure } from '../transport/fetch_failure';
+
+/** Why a `TokenSource` could not produce a token.
+ *
+ *  Closed: every one is raised by this SDK. The token endpoint's own
+ *  rejection slug is open and rides on `serverCode`. */
+export type TokenSourceErrorCode =
+  | 'request_failed'
+  | 'request_rejected'
+  | 'invalid_response'
+  | 'fetcher_failed';
+
+/** A `TokenSource` could not produce a token.
+ *
+ *  Raised while the SDK obtains a credential for itself, which happens
+ *  beneath every authenticated call — verify, mintToken, session start, dial
+ *  and usage reads all resolve the source first, and it re-resolves on expiry
+ *  and after a 401. So this surfaces from whichever call needed a token, not
+ *  from one operation.
+ *
+ *  `code` names what this SDK saw; `serverCode` carries the token endpoint's
+ *  own slug when `code` is `request_rejected`. */
+export class TokenSourceError extends ApiError {
+  /** Always ``'TokenSourceError'``. */
+  readonly name = 'TokenSourceError';
+  /** How far the fetch got. A closed set this SDK raises — switch on it. */
+  readonly code: TokenSourceErrorCode;
+  /** The token endpoint's own rejection slug when it sent one. An open set:
+   *  log it, do not switch on it. */
+  readonly serverCode?: string;
+
+  constructor(options: {
+    code: TokenSourceErrorCode;
+    message: string;
+    serverCode?: string;
+  }) {
+    super(options.message);
+    this.code = options.code;
+    this.serverCode = options.serverCode;
+  }
+}
+
 
 /** Re-fetch this long before ``expiresAt`` so an in-flight session start
  *  never races the expiry boundary. Matches the cross-SDK contract
  *  (``token-source-vectors.json``). */
 const REFRESH_SKEW_MS = 60_000;
 
-/** What a ``TokenSource.custom`` fetcher resolves with: the minted JWT and
- *  its expiry (a ``Date``, or the RFC 3339 string straight off a mint
- *  response). */
-export type FetchedToken = { jwt: string; expiresAt: Date | string };
-
+/** Options for ``TokenSource.endpoint(url, options)``. */
 export type TokenSourceEndpointOptions = {
   /** Headers attached to every token request — the app's own auth (its
    *  session cookie rides automatically only same-origin; a bearer or
@@ -47,8 +86,8 @@ export type TokenSourceEndpointOptions = {
  *  - ``TokenSource.endpoint(url)`` — POST a token endpoint that returns
  *    ``{ jwt, expires_at }`` (the shape ``mintToken`` responses already
  *    have; any backend that forwards ``POST auth/token`` qualifies).
- *  - ``TokenSource.custom(fn)`` — any async function resolving with
- *    ``{ jwt, expiresAt }`` — full control over transport and auth.
+ *  - ``TokenSource.custom(fn)`` — any async function resolving with a
+ *    ``MintedToken`` — full control over transport and auth.
  */
 export class TokenSource {
   readonly #fetchToken: () => Promise<MintedToken>;
@@ -62,23 +101,27 @@ export class TokenSource {
   /** A source that POSTs ``url`` (empty JSON body) and reads
    *  ``{ jwt, expires_at }`` from the response — the wire shape of
    *  ``POST /api/v1/external/auth/token`` and of the token-server
-   *  template. Rejections surface as ``MintTokenError`` carrying
-   *  the server's error slug when the body parses, else an
-   *  ``http_<status>`` synthetic; local failures carry
-   *  ``token_source_failed``. An absolute ``url`` must be https
+   *  template. Failures throw ``TokenSourceError``; on a rejection its
+   *  ``serverCode`` carries the endpoint's own slug when the body
+   *  parses, else an ``http_<status>`` synthetic. ``url`` is a string or a
+   *  ``URL`` instance — the pair ``fetch`` itself accepts. An absolute
+   *  ``url`` must be https
    *  (http only for localhost) — auth headers and JWTs must not cross
-   *  the network in the clear; a relative ``url`` rides the page's own
+   *  the network in the clear; a relative ``url`` (string form only, since
+   *  a ``URL`` is absolute by construction) rides the page's own
    *  origin. */
-  static endpoint(url: string, options: TokenSourceEndpointOptions = {}): TokenSource {
-    assertSupportedEndpointUrl(url);
-    return new TokenSource(() => postTokenEndpoint(url, options));
+  static endpoint(url: string | URL, options: TokenSourceEndpointOptions = {}): TokenSource {
+    const target = typeof url === 'string' ? url : url.href;
+    assertSupportedEndpointUrl(target);
+    return new TokenSource(() => postTokenEndpoint(target, options));
   }
 
   /** A source backed by ``fetchToken`` — called whenever a fresh token is
-   *  needed. Resolve with ``{ jwt, expiresAt }``; a malformed result
-   *  raises ``MintTokenError('token_source_failed')``. */
-  static custom(fetchToken: () => Promise<FetchedToken>): TokenSource {
-    return new TokenSource(async () => normalizeFetched(await fetchToken()));
+   *  needed. Resolve with a ``MintedToken`` — the same shape ``mintToken``
+   *  returns; an empty ``jwt`` or invalid ``expiresAt`` raises
+   *  ``TokenSourceError``. */
+  static custom(fetchToken: () => Promise<MintedToken>): TokenSource {
+    return new TokenSource(async () => validateFetched(await fetchToken()));
   }
 
   /** @internal The JWT to send right now: cached while it has more than
@@ -126,39 +169,38 @@ function assertSupportedEndpointUrl(url: string): void {
     asHttps = new URL(url, 'https://cosmo-relative.invalid');
     asHttp = new URL(url, 'http://cosmo-relative.invalid');
   } catch {
-    throw new MintTokenError(
-      'token_source_failed',
-      `TokenSource.endpoint could not be parsed as a URL: ${JSON.stringify(url)}`,
-    );
+    throw new TypeError(`TokenSource.endpoint could not be parsed as a URL: ${JSON.stringify(url)}`);
   }
   if (asHttps.hostname === 'cosmo-relative.invalid' && asHttp.hostname === 'cosmo-relative.invalid') {
     return; // relative — resolves against the page's own origin
   }
   if (asHttps.protocol !== asHttp.protocol) {
-    throw new MintTokenError(
-      'token_source_failed',
-      'TokenSource.endpoint must be an absolute https URL or a relative path, not scheme-relative.',
-    );
+    throw new TypeError('TokenSource.endpoint must be an absolute https URL or a relative path, not scheme-relative.');
   }
   if (asHttps.protocol === 'https:') return;
   if (asHttps.protocol === 'http:' && LOCAL_HOSTS.has(asHttps.hostname)) return;
-  throw new MintTokenError(
-    'token_source_failed',
-    'TokenSource.endpoint must use https:// (http is allowed only for localhost).',
-  );
+  throw new CredentialsError({
+    code: 'insecure_base_url',
+    message:
+      'TokenSource.endpoint must use https:// (http is allowed only for localhost).',
+  });
 }
 
-function normalizeFetched(fetched: FetchedToken): MintedToken {
+function validateFetched(fetched: MintedToken): MintedToken {
   const jwt = fetched?.jwt;
-  const raw = fetched?.expiresAt;
-  const expiresAt = raw instanceof Date ? raw : new Date(raw ?? '');
-  if (typeof jwt !== 'string' || jwt.length === 0 || Number.isNaN(expiresAt.getTime())) {
-    throw new MintTokenError(
-      'token_source_failed',
-      'TokenSource.custom fetcher must resolve with { jwt, expiresAt }.',
-    );
+  const expiresAt = fetched?.expiresAt;
+  if (
+    typeof jwt !== 'string' ||
+    jwt.length === 0 ||
+    !(expiresAt instanceof Date) ||
+    Number.isNaN(expiresAt.getTime())
+  ) {
+    throw new TokenSourceError({
+      code: 'fetcher_failed',
+      message: 'TokenSource.custom fetcher must resolve with a MintedToken ({ jwt, expiresAt }).',
+    });
   }
-  return { jwt, expiresAt };
+  return { jwt, expiresAt, tokenId: fetched.tokenId };
 }
 
 async function postTokenEndpoint(
@@ -178,34 +220,40 @@ async function postTokenEndpoint(
       redirect: 'error',
     });
   } catch (err) {
-    throw new MintTokenError('token_source_failed', describeFetchFailure(url, err));
+    throw new TokenSourceError({
+      code: 'request_failed',
+      message: describeFetchFailure(url, err),
+    });
   }
   if (!response.ok) {
     const { code, message } = await parseErrorDetail(response);
     log.warn('[realtime] token source rejected', { status: response.status, code });
-    throw new MintTokenError(code, message);
+    throw new TokenSourceError({
+      code: 'request_rejected',
+      message,
+      serverCode: code,
+    });
   }
   let body: unknown;
   try {
     body = await response.json();
   } catch {
-    throw new MintTokenError(
-      'token_source_failed',
-      'Token endpoint response was not JSON.',
-    );
+    throw new TokenSourceError({
+      code: 'invalid_response',
+      message: 'Token endpoint response was not JSON.',
+    });
   }
   const obj = (typeof body === 'object' && body !== null ? body : {}) as Record<string, unknown>;
   const jwt = obj.jwt;
   // ``expires_at`` is the wire shape (a forwarded mint response);
   // ``expiresAt`` is a serialized SDK ``MintedToken`` — a backend returning
   // its ``mintToken()`` result as-is emits this spelling.
-  const expiresAtRaw = obj.expires_at ?? obj.expiresAt;
-  const expiresAt = typeof expiresAtRaw === 'string' ? new Date(expiresAtRaw) : new Date(NaN);
-  if (typeof jwt !== 'string' || jwt.length === 0 || Number.isNaN(expiresAt.getTime())) {
-    throw new MintTokenError(
-      'token_source_failed',
-      'Token endpoint response missing jwt / expires_at.',
-    );
+  const expiresAt = parseRfc3339(obj.expires_at ?? obj.expiresAt);
+  if (typeof jwt !== 'string' || jwt.length === 0 || expiresAt === null) {
+    throw new TokenSourceError({
+      code: 'invalid_response',
+      message: 'Token endpoint response missing jwt / expires_at.',
+    });
   }
   return { jwt, expiresAt };
 }

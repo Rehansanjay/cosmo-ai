@@ -25,6 +25,18 @@ swift run MCPExample
 swift run SkillsExample
 ```
 
+To run `HelloRealtime` against the one-process local OSS server:
+
+```bash
+COSMO_API_KEY=local-development \
+COSMO_BASE_URL=http://localhost:8080 \
+COSMO_TRANSPORT=websocket \
+swift run HelloRealtime
+```
+
+The WebSocket transport is for the local OSS server on macOS. The other
+examples use features that may require the managed LiveKit transport.
+
 The package builds against the published `cosmo-swift-sdk`; inside a checkout
 that has the SDK sources as a sibling it uses those automatically (see the
 probe in `Package.swift`).

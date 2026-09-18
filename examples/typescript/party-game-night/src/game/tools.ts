@@ -1,4 +1,4 @@
-import { tool } from 'cosmo-ai/tool';
+import { clientTool } from 'cosmo-ai/tool';
 import { zodInput } from 'cosmo-ai/tool/zod';
 import { z } from 'zod/v4';
 
@@ -11,7 +11,7 @@ import type { GameStore } from './state';
  * is what keeps every visible move at data-channel latency.
  */
 export function makeGameTools(store: GameStore) {
-  const renderUi = tool({
+  const renderUi = clientTool({
     name: 'render_ui',
     description:
       'Put a component on the TV, replacing whatever is showing: a title card (a big show beat — game intro, round break), a feud board (all answers start hidden), a quiz card (opens the buzzers), a charades prompt card (shows the secret word during the look-away, then hides it and runs the timer), or the scoreboard.',
@@ -103,7 +103,7 @@ export function makeGameTools(store: GameStore) {
     },
   });
 
-  const clearBuzzer = tool({
+  const clearBuzzer = clientTool({
     name: 'clear_buzzer',
     description:
       'Reopen the buzzers on the current quiz question — after a wrong answer, so the other teams can steal.',
@@ -114,7 +114,7 @@ export function makeGameTools(store: GameStore) {
     },
   });
 
-  const revealAnswer = tool({
+  const revealAnswer = clientTool({
     name: 'reveal_answer',
     description:
       'Flip one hidden answer face-up on the feud board, with the flip animation and its points. `number` is the slot number shown on the board (1 is the top answer).',
@@ -132,7 +132,7 @@ export function makeGameTools(store: GameStore) {
     },
   });
 
-  const addStrike = tool({
+  const addStrike = clientTool({
     name: 'add_strike',
     description:
       'Give the guessing team a strike (a wrong guess) — a big X flashes on the board. Three strikes ends the round.',
@@ -144,7 +144,7 @@ export function makeGameTools(store: GameStore) {
     },
   });
 
-  const setTeams = tool({
+  const setTeams = clientTool({
     name: 'set_teams',
     description:
       'Register the teams playing tonight (2–4 team names). Resets all scores to zero, so call it once at the start, not between rounds.',
@@ -161,7 +161,7 @@ export function makeGameTools(store: GameStore) {
     },
   });
 
-  const awardPoints = tool({
+  const awardPoints = clientTool({
     name: 'award_points',
     description:
       'Add points to one team, by the team name registered with set_teams. The teams strip on the TV updates immediately.',

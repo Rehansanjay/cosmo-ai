@@ -7,8 +7,18 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { buildAgentSessionConfig, type RealtimeTool } from '../agent';
-import type { ScreenCapture } from '../../tool/screen';
+import {
+  buildAgentSessionConfig,
+  detectObjectsTool,
+  endCallTool,
+  examineImageTool,
+  mintAgentTool,
+  pointAtObjectTool,
+  speakerLogTool,
+  webSearchTool,
+  type AgentTool,
+} from '../agent';
+import { screenLocateTool, type ScreenCapture } from '../../tool/screen';
 import { SDK_NAME, SDK_VERSION } from '../../constants';
 
 describe('buildAgentSessionConfig', () => {
@@ -34,9 +44,9 @@ describe('buildAgentSessionConfig', () => {
     const config = buildAgentSessionConfig(
       {
         instructions: 'You are terse.',
-        model: 'gemini',
-        modelOptions: {
+        model: {
           provider: 'gemini',
+          modelId: 'gemini-live',
           temperature: 0.7,
           maxOutputTokens: 4096,
           thinkingLevel: 'high',
@@ -49,9 +59,9 @@ describe('buildAgentSessionConfig', () => {
     expect(config.agent).toEqual({
       type: 'inline',
       instructions: 'You are terse.',
-      model: 'gemini',
-      model_options: {
+      model: {
         provider: 'gemini',
+        model_id: 'gemini-live',
         temperature: 0.7,
         max_output_tokens: 4096,
         thinking_level: 'high',
@@ -64,7 +74,7 @@ describe('buildAgentSessionConfig', () => {
   it('maps the Gemini endpointing knobs onto their wire names', () => {
     const config = buildAgentSessionConfig(
       {
-        modelOptions: {
+        model: {
           provider: 'gemini',
           includeThoughts: false,
           endOfSpeechSensitivity: 'high',
@@ -76,7 +86,7 @@ describe('buildAgentSessionConfig', () => {
     );
     expect(config.agent).toEqual({
       type: 'inline',
-      model_options: {
+      model: {
         provider: 'gemini',
         include_thoughts: false,
         end_of_speech_sensitivity: 'high',
@@ -88,19 +98,19 @@ describe('buildAgentSessionConfig', () => {
 
   it('maps the Gemini server_vad turn-detection opt-out onto the wire', () => {
     const config = buildAgentSessionConfig(
-      { modelOptions: { provider: 'gemini', turnDetection: 'server_vad' } },
+      { model: { provider: 'gemini', turnDetection: 'server_vad' } },
       {},
     );
     expect(config.agent).toEqual({
       type: 'inline',
-      model_options: { provider: 'gemini', turn_detection: 'server_vad' },
+      model: { provider: 'gemini', turn_detection: 'server_vad' },
     });
   });
 
   it('maps the Gemini cosmo_vad selection and its tuning block onto the wire', () => {
     const config = buildAgentSessionConfig(
       {
-        modelOptions: {
+        model: {
           provider: 'gemini',
           turnDetection: 'cosmo_vad',
           cosmoVad: { pauseMs: 250, prefixMs: 300, maxHoldMs: 900 },
@@ -110,7 +120,7 @@ describe('buildAgentSessionConfig', () => {
     );
     expect(config.agent).toEqual({
       type: 'inline',
-      model_options: {
+      model: {
         provider: 'gemini',
         turn_detection: 'cosmo_vad',
         cosmo_vad: { pause_ms: 250, prefix_ms: 300, max_hold_ms: 900 },
@@ -121,7 +131,7 @@ describe('buildAgentSessionConfig', () => {
   it('sends only the knobs the selected OpenAI turn detector reads', () => {
     const serverVad = buildAgentSessionConfig(
       {
-        modelOptions: {
+        model: {
           provider: 'openai',
           turnDetection: 'server_vad',
           silenceDurationMs: 200,
@@ -132,7 +142,7 @@ describe('buildAgentSessionConfig', () => {
     );
     expect(serverVad.agent).toEqual({
       type: 'inline',
-      model_options: {
+      model: {
         provider: 'openai',
         turn_detection: 'server_vad',
         silence_duration_ms: 200,
@@ -141,12 +151,12 @@ describe('buildAgentSessionConfig', () => {
     });
 
     const semanticVad = buildAgentSessionConfig(
-      { modelOptions: { provider: 'openai', turnDetection: 'semantic_vad', eagerness: 'high' } },
+      { model: { provider: 'openai', turnDetection: 'semantic_vad', eagerness: 'high' } },
       {},
     );
     expect(semanticVad.agent).toEqual({
       type: 'inline',
-      model_options: {
+      model: {
         provider: 'openai',
         turn_detection: 'semantic_vad',
         eagerness: 'high',
@@ -157,7 +167,7 @@ describe('buildAgentSessionConfig', () => {
   it('maps the Grok silence window onto the wire', () => {
     const config = buildAgentSessionConfig(
       {
-        modelOptions: {
+        model: {
           provider: 'grok',
           turnDetection: 'server_vad',
           silenceDurationMs: 200,
@@ -168,7 +178,7 @@ describe('buildAgentSessionConfig', () => {
     );
     expect(config.agent).toEqual({
       type: 'inline',
-      model_options: {
+      model: {
         provider: 'grok',
         turn_detection: 'server_vad',
         silence_duration_ms: 200,
@@ -178,10 +188,10 @@ describe('buildAgentSessionConfig', () => {
   });
 
   it('leaves an unconfigured OpenAI block at the bare discriminator', () => {
-    const config = buildAgentSessionConfig({ modelOptions: { provider: 'openai' } }, {});
+    const config = buildAgentSessionConfig({ model: { provider: 'openai' } }, {});
     expect(config.agent).toEqual({
       type: 'inline',
-      model_options: { provider: 'openai' },
+      model: { provider: 'openai' },
     });
   });
 
@@ -189,14 +199,15 @@ describe('buildAgentSessionConfig', () => {
     const config = buildAgentSessionConfig(
       {
         tools: [
-          { kind: 'web_search' },
-          { kind: 'examine_image' },
-          {
+          webSearchTool(),
+          examineImageTool(),
+          mintAgentTool({
             kind: 'client',
             name: 'lookup',
             description: 'Look something up.',
             parameters: { type: 'object' },
-          },
+            handler: async () => null,
+          }),
         ],
       },
       {},
@@ -217,11 +228,12 @@ describe('buildAgentSessionConfig', () => {
     const config = buildAgentSessionConfig(
       {
         tools: [
-          { kind: 'web_search' },
-          { kind: 'examine_image' },
-          { kind: 'detect_objects' },
-          { kind: 'point_at_object' },
-          { kind: 'end_call' },
+          webSearchTool(),
+          examineImageTool(),
+          detectObjectsTool(),
+          pointAtObjectTool(),
+          endCallTool(),
+          speakerLogTool(),
         ],
       },
       {},
@@ -232,6 +244,7 @@ describe('buildAgentSessionConfig', () => {
       { kind: 'detect_objects' },
       { kind: 'point_at_object' },
       { kind: 'end_call' },
+      { kind: 'speaker_log' },
     ]);
   });
 
@@ -240,18 +253,15 @@ describe('buildAgentSessionConfig', () => {
     const config = buildAgentSessionConfig(
       {
         tools: [
-          { kind: 'web_search' },
-          {
-            kind: 'screen_locate',
-            capture: () => {
-              const taken: ScreenCapture = {
-                imageJpeg: new Uint8Array([0xff, 0xd8]),
-                elements: [],
-              };
-              captures.push(taken);
-              return taken;
-            },
-          },
+          webSearchTool(),
+          screenLocateTool(() => {
+            const taken: ScreenCapture = {
+              imageJpeg: new Uint8Array([0xff, 0xd8]),
+              elements: [],
+            };
+            captures.push(taken);
+            return taken;
+          }),
         ],
       },
       {},
@@ -263,9 +273,15 @@ describe('buildAgentSessionConfig', () => {
     ]);
   });
 
+  it('keeps a hand-written literal off the opaque tool type', () => {
+    // @ts-expect-error a tool is built by calling its constructor
+    const authored: AgentTool = { kind: 'web_search' };
+    expect(authored).toBeDefined();
+  });
+
   it('keeps the locator unauthorable without a handler — it only exists to drive one', () => {
     // @ts-expect-error the declaration follows the handler, never config alone
-    const authored: RealtimeTool = { kind: 'screen_locate' };
+    const authored: AgentTool = { kind: 'screen_locate' };
     expect(authored).toBeDefined();
   });
 
@@ -273,13 +289,13 @@ describe('buildAgentSessionConfig', () => {
     // The kind is not part of the authorable surface, so a config carrying
     // one is a compile error here and fails schema validation at connect.
     // @ts-expect-error the kind is retired from the authorable surface
-    const authored: RealtimeTool = { kind: 'transfer_call' };
+    const authored: AgentTool = { kind: 'transfer_call' };
     expect(authored).toBeDefined();
   });
 
   it('keeps the generic server reference off the authorable tool union', () => {
     // @ts-expect-error the kind is retired from the authorable surface
-    const authored: RealtimeTool = { kind: 'server', name: 'cosmo.web_search' };
+    const authored: AgentTool = { kind: 'server', name: 'cosmo.web_search' };
     expect(authored).toBeDefined();
   });
 
@@ -298,14 +314,14 @@ describe('buildAgentSessionConfig', () => {
     const config = buildAgentSessionConfig(
       {
         tools: [
-          {
+          mintAgentTool({
             kind: 'client',
             name: 'lookup',
             description: 'd',
             parameters: { type: 'object' },
             handler: async () => null,
-          },
-          {
+          }),
+          mintAgentTool({
             kind: 'client',
             background: true,
             name: 'export_report',
@@ -314,7 +330,7 @@ describe('buildAgentSessionConfig', () => {
             handler: async (_args, job) => {
               job.ack();
             },
-          },
+          }),
         ],
       },
       {},
@@ -346,7 +362,7 @@ describe('buildAgentSessionConfig', () => {
       {
         instructions: 'You are a support agent.',
         voice: 'Puck',
-        audio: { noiseCancellation: true },
+        audio: { noiseCancellation: 'voice_focus' },
       },
       { resumeSessionId: '0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d' },
     );
@@ -354,7 +370,7 @@ describe('buildAgentSessionConfig', () => {
       type: 'inline',
       instructions: 'You are a support agent.',
       voice: { name: 'Puck' },
-      audio: { noise_cancellation: true },
+      audio: { noise_cancellation: 'voice_focus' },
     });
     expect(config.session).toEqual({
       experimental: { resume_session_id: '0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d' },
@@ -365,13 +381,13 @@ describe('buildAgentSessionConfig', () => {
     // The server default is on, so the opt-out has to reach the wire as a
     // value — an omitted field would read back as the default.
     const config = buildAgentSessionConfig(
-      { voice: 'Puck', audio: { noiseCancellation: false } },
+      { voice: 'Puck', audio: { noiseCancellation: 'off' } },
       {},
     );
     expect(config.agent).toEqual({
       type: 'inline',
       voice: { name: 'Puck' },
-      audio: { noise_cancellation: false },
+      audio: { noise_cancellation: 'off' },
     });
   });
 
@@ -421,7 +437,7 @@ describe('buildAgentSessionConfig', () => {
     ).toThrow(/stored config verbatim.*greeting/);
     expect(() =>
       buildAgentSessionConfig(
-        { name: 'driver-pay', audio: { noiseCancellation: true } },
+        { name: 'driver-pay', audio: { noiseCancellation: 'voice_focus' } },
         {},
       ),
     ).toThrow(/audio/);
@@ -432,7 +448,7 @@ describe('buildAgentSessionConfig', () => {
       {
         name: 'driver-pay',
         inputs: { caller_name: 'Sam' },
-        tools: [{ kind: 'web_search' }],
+        tools: [webSearchTool()],
         voice: { name: 'Puck', speakingStyle: 'warm' },
       },
       {},
@@ -462,9 +478,9 @@ describe('reserved SDK tool names', () => {
   // The SDK owns the name and schema of the tools it ships, so a caller's
   // tool taking one would swap it for something the model was told behaves
   // differently. Caught here rather than at the server's 422.
-  const callerTool = (name: string) =>
-    ({
-      kind: 'client' as const,
+  const callerTool = (name: string): AgentTool =>
+    mintAgentTool({
+      kind: 'client',
       name,
       description: 'mine',
       parameters: { type: 'object', properties: {} },

@@ -5,14 +5,14 @@ Useful for embedded agents, scripted demos, and headless test harnesses.
 Audio-only, no image stream — pure voice-plus-tools mode.
 
 ```ts
-import { RealtimeClient } from 'cosmo-ai';
+import { RealtimeClient, webSearchTool } from 'cosmo-ai';
 
 const client = new RealtimeClient({
   baseUrl: 'https://platform.askcosmo.ai',
   token: mintedEndUserJwt,
 });
 const agent = client.agent({
-  tools: [{ kind: 'web_search' }],
+  tools: [webSearchTool()],
 });
 const session = await agent.start();
 

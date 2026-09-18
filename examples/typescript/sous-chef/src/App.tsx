@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useState } from 'react';
 
 import {
-  RealtimeProvider,
-  SessionBusyError,
-  SessionEntitlementError,
   SessionStartError,
-  useRealtimeSession,
+  TokenSource,
   type RealtimeSession,
 } from 'cosmo-ai';
+import {
+  RealtimeProvider,
+  useRealtimeSession,
+} from 'cosmo-ai/react';
 
 import { sousChefAgent } from './agent/agent';
 import { useCamera } from './camera/use_camera';
@@ -15,34 +16,29 @@ import { cookStore } from './state/cook';
 import { ChefFace } from './ui/Avatar';
 import { LiveView } from './ui/LiveView';
 
-// Read from a gitignored .env (see .env.example). Never hardcode a key here —
-// this file is committed, and Vite inlines VITE_* values into the bundle, so a
-// build made with a key in .env is a build that publishes it. Anything you
-// deploy should mint short-lived end-user tokens instead; the token-server
-// example alongside this one is that server.
-const API_KEY = import.meta.env.VITE_COSMO_API_KEY ?? '';
+// No key in page code: the page asks its own /token route (the vite.config
+// tokenRoute plugin in dev; the same mint call in a real route when
+// deployed) and the SDK keeps the short-lived token fresh.
 
 // Both providers run this agent unchanged. Set VITE_REALTIME_PROVIDER=gemini
 // in .env to cook on Gemini instead.
 const PROVIDER = import.meta.env.VITE_REALTIME_PROVIDER === 'gemini' ? 'gemini' : 'openai';
 
-const NO_KEY_NOTE =
-  'Add a Cosmo API key to .env as VITE_COSMO_API_KEY, then restart the dev server.';
-
 const VOICE_ONLY_NOTE =
   'No camera — I can still find recipes, walk the steps, and run timers; I just cannot look at the pan.';
 
-/** Session-start rejections are typed, so the start screen can say what went
- *  wrong instead of showing a status line. This agent asks for the OpenAI
+/** A session-start rejection carries a closed `code`, so the start screen can
+ *  say what went wrong instead of showing a status line. This agent asks for the OpenAI
  *  provider, which is the rejection worth naming precisely. */
 function describeStartError(error: Error): string {
-  if (error instanceof SessionBusyError) {
+  if (!(error instanceof SessionStartError)) return error.message;
+  if (error.code === 'busy') {
     return 'The kitchen line is busy — try again in a minute.';
   }
-  if (error instanceof SessionEntitlementError) {
+  if (error.code === 'entitlement') {
     return `This workspace's plan does not cover the session: ${error.message}`;
   }
-  if (error instanceof SessionStartError && error.detail?.code === 'model_unavailable') {
+  if (error.serverCode === 'model_unavailable') {
     return 'This workspace cannot run the OpenAI realtime provider yet — see the README.';
   }
   return error.message;
@@ -74,7 +70,7 @@ export function App() {
   // teardown. The camera and the card stay this app's job.
   const { phase, session, start, end, error, warning, endedReason, lastEnd } = useRealtimeSession({
     makeAgent: (live) => live.agent(sousChefAgent(cookStore, PROVIDER)),
-    clientOptions: { apiKey: API_KEY },
+    clientOptions: { token: TokenSource.endpoint('/token') },
   });
 
   // Whatever ended the session — End button, hangup tool, network loss — the
@@ -113,7 +109,7 @@ export function App() {
   }, []);
 
   const startCooking = useCallback(async () => {
-    if (API_KEY === '' || phase !== 'idle') return;
+    if (phase !== 'idle') return;
     setCameraNote(null);
 
     // Unlike a camera app, this one is still useful blind: a denied camera
@@ -133,14 +129,6 @@ export function App() {
       return;
     }
     const session = result.session;
-
-    // ``start()`` resolves while the transport is still connecting, and video
-    // can only publish on a live session.
-    try {
-      await session.waitUntilReady();
-    } catch {
-      return; // The session ended before it got going; teardown handles it.
-    }
 
     if (cameraLive) {
       try {
@@ -184,14 +172,13 @@ export function App() {
         hands free. It finds the recipe, keeps the steps in time with you, runs
         the timers, and looks at the pan when it matters.
       </p>
-      {API_KEY === '' && <p className="err">{NO_KEY_NOTE}</p>}
       {startError !== null && <p className="err">{startError}</p>}
       {cameraNote !== null && <p className="note">{cameraNote}</p>}
       {endedReason !== null && <p className="note">{`Session ended (${endedReason}).`}</p>}
       <button
         className="btn primary"
         onClick={() => void startCooking()}
-        disabled={API_KEY === '' || phase !== 'idle'}
+        disabled={phase !== 'idle'}
       >
         {phase === 'idle' ? 'Start cooking' : 'Connecting…'}
       </button>

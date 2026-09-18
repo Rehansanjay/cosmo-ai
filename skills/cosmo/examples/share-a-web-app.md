@@ -38,6 +38,10 @@ export async function POST(request: Request) {
 
 ### Browser page
 
+This voice-only page selects Grok realtime. If the app needs camera, video,
+or shared-screen understanding, use `model: 'gemini'` and remove the Grok voice, as described
+in the [provider selection guide](../reference/core.md#choose-the-realtime-engine).
+
 ```tsx
 'use client';
 import { useRef, useState } from 'react';
@@ -55,7 +59,7 @@ export default function Home() {
         headers: { 'X-External-User-Id': visitorId() },
       }),
     });
-    const agent = client.agent({ instructions: '…', greeting: '…' });
+    const agent = client.agent({ model: 'grok', voice: 'ara', instructions: '…', greeting: '…' });
     let session;
     try {
       session = await agent.start();
@@ -82,8 +86,8 @@ export default function Home() {
     await sessionRef.current?.end();
     sessionRef.current = null;
   }
-  // … buttons + transcript rendering (coalesce transcript events by
-  // `${turnId}-${role}`, append when event.append is true)
+  // … buttons + transcript rendering (append a non-final delta to the
+  // role's open bubble; a final carries the cumulative text and replaces it)
 }
 
 function visitorId(): string {

@@ -9,6 +9,7 @@
  * composed by ``composeDialUrl`` in ``external_session_url.ts``.
  */
 
+import { ApiError } from '../core/errors';
 import { log } from '../core/logger';
 import { parseErrorDetail } from './error_detail';
 import { describeFetchFailure } from './fetch_failure';
@@ -17,27 +18,41 @@ import { describeFetchFailure } from './fetch_failure';
  *  was queued. The call rings asynchronously — observe progress via session
  *  events, not this value. ``dialId`` correlates the call server-side. */
 export type DialResult = {
+  /** Handle for this dial, to correlate the call with server-side dial
+   *  status. The call rings asynchronously — watch session events for
+   *  progress rather than this return value. */
   dialId: string;
 };
 
-/** ``code`` carried on :class:`DialError`. The server's slug when the
- *  rejection carried one (``phone_calls_disabled``, ``minute_limit_exceeded``,
- *  ``session_not_found``, ``session_not_live``, ``session_already_dialed``) or
- *  a client-side synthetic (``invalid_phone_number``, ``transport_error``,
- *  ``invalid_response``). Slug-less auth / validation
- *  rejections surface the error ``type`` instead (e.g. ``api_error``).
- *  Open-ended — treat unknown codes defensively. */
-export type DialErrorCode = string;
+/** How far a dial got before it failed.
+ *
+ *  Closed: every one is thrown by this SDK, so it changes only when the SDK
+ *  does. It says what happened to the attempt, never why the server refused —
+ *  that is the server's own slug, an open set, on `ApiError.serverCode`
+ *  (`phone_calls_disabled`, `minute_limit_exceeded`, `session_not_found`, …). */
+export type DialErrorCode =
+  /** The request did not produce a usable answer — a network failure or
+   *  timeout. */
+  | 'request_failed'
+  /** The server refused. `serverCode` carries its own slug for why. */
+  | 'request_rejected'
+  /** The server answered, but not with a body this SDK could parse. */
+  | 'invalid_response'
+  /** The SDK refused to send the request — a malformed phone number, or a
+   *  session that cannot be dialed. Nothing reached the server. */
+  | 'invalid_request';
 
-/** ``dial()`` failed. ``code`` is a stable slug (see :type:`DialErrorCode`);
- *  ``message`` is the human-readable reason. */
-export class DialError extends Error {
+/** `dial()` failed. `code` names how far the attempt got; `serverCode` on the
+ *  `ApiError` base carries the server's own slug when it sent one. */
+export class DialError extends ApiError {
+  /** Always ``'DialError'``. */
   readonly name = 'DialError';
+  /** How far the attempt got. A closed set this SDK throws — switch on it. */
   readonly code: DialErrorCode;
 
-  constructor(code: DialErrorCode, message: string) {
-    super(message || code);
-    this.code = code;
+  constructor(options: { code: DialErrorCode; message: string; serverCode?: string }) {
+    super(options.message || options.code, { serverCode: options.serverCode });
+    this.code = options.code;
   }
 }
 
@@ -47,10 +62,10 @@ export function validateE164(phoneNumber: string): string {
   const value = phoneNumber.trim();
   const digits = value.slice(1);
   if (!value.startsWith('+') || !/^\d+$/.test(digits) || digits.length < 8 || digits.length > 15) {
-    throw new DialError(
-      'invalid_phone_number',
-      'phone_number must be E.164, e.g. +14155550199',
-    );
+    throw new DialError({
+      code: 'invalid_request',
+      message: 'phone_number must be E.164, e.g. +14155550199',
+    });
   }
   return value;
 }
@@ -65,8 +80,8 @@ export type PostDialArgs = {
 };
 
 /** Place the authenticated dial POST. Server rejections raise
- *  :class:`DialError` carrying the server slug; a network failure
- *  raises ``transport_error`` and a malformed success raises
+ *  :class:`DialError` carrying the server slug on `serverCode`; a network failure
+ *  raises ``request_failed`` and a malformed success raises
  *  ``invalid_response``. */
 export async function postDial(args: PostDialArgs): Promise<DialResult> {
   const extraHeaders = args.getAuthHeaders ? await args.getAuthHeaders() : {};
@@ -86,28 +101,28 @@ export async function postDial(args: PostDialArgs): Promise<DialResult> {
       body: JSON.stringify(requestBody),
     });
   } catch (err) {
-    throw new DialError(
-      'transport_error',
-      describeFetchFailure(args.dialUrl, err),
-    );
+    throw new DialError({
+      code: 'request_failed',
+      message: describeFetchFailure(args.dialUrl, err),
+    });
   }
   if (!response.ok) {
     const { code, message } = await parseErrorDetail(response);
     log.warn('[realtime] dial rejected', { status: response.status, code });
-    throw new DialError(code, message);
+    throw new DialError({ code: 'request_rejected', message, serverCode: code });
   }
   let body: unknown;
   try {
     body = await response.json();
   } catch (err) {
-    throw new DialError(
-      'invalid_response',
-      err instanceof Error ? err.message : 'Dial response was not JSON.',
-    );
+    throw new DialError({
+      code: 'invalid_response',
+      message: err instanceof Error ? err.message : 'Dial response was not JSON.',
+    });
   }
   const dialId = extractDialId(body);
   if (dialId === null) {
-    throw new DialError('invalid_response', 'Dial response missing dial_id.');
+    throw new DialError({ code: 'invalid_response', message: 'Dial response missing dial_id.' });
   }
   return { dialId };
 }

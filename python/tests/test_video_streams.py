@@ -7,7 +7,7 @@ import asyncio
 
 import pytest
 
-from cosmo_ai.errors import NotConnectedError
+from cosmo_ai.errors import SessionStateError
 from cosmo_ai.session import VideoStreamHandle
 
 from .fakes import start_fake_session
@@ -68,7 +68,7 @@ def test_adding_a_stream_before_the_session_is_live_fails_loudly() -> None:
     async def scenario() -> None:
         session = RealtimeSession.__new__(RealtimeSession)
         session._transport = None  # type: ignore[attr-defined]
-        with pytest.raises(NotConnectedError):
+        with pytest.raises(SessionStateError):
             await session.add_video_stream()
 
     asyncio.run(scenario())

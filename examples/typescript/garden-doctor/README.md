@@ -7,7 +7,7 @@ yellowing leaves, a point on the spot to prune.
 
 An example of the SDK's live-camera vision loop, end to end:
 
-1. The page publishes the rear camera with `client.addVideoStream(stream)`.
+1. The page publishes the rear camera with `session.addVideoStream(stream)`.
 2. The agent opts into the server vision tools — `detect_objects` and
    `point_at_object` (Moondream-backed locators that return normalized
    coordinates), and `examine_image` for open-ended questions about the
@@ -25,14 +25,15 @@ box lands a beat later — the persona is written to expect that.
 
 ```bash
 npm install
-cp .env.example .env   # then paste a Cosmo API key into VITE_COSMO_API_KEY
+cosmo init            # once — signs in and stores the credential /token mints with
 npm run dev
 ```
 
-The key needs the `realtime:use` scope (Developer platform → API keys in the
-Cosmo web app). Open the Vite URL on your laptop and click **Start the
-visit** — the browser asks for camera and microphone, then the session is
-live.
+The dev server mints end-user tokens, so a `COSMO_API_KEY` used in place of
+the `cosmo init` credential needs the `user_tokens:mint` scope (under
+Developer platform → API keys in the Cosmo web app). Open the Vite URL on
+your laptop and click **Start the visit** — the browser asks for camera and
+microphone, then the session is live.
 
 ## Run it on your phone
 
@@ -51,6 +52,13 @@ matches). Tap **Start the visit**: the tap doubles as the user gesture that
 unlocks audio playback, and the app holds a screen wake lock so the phone
 doesn't dim mid-visit. The rear lens is the default; the ⟲ button flips.
 
+A tunnel publishes everything the dev server answers, including its `/token`
+route — so while it is open, anyone with the URL can mint tokens against your
+workspace. With the `cosmo init` credential they expire in an hour and arrive
+at a few per minute, so the cost is bounded; a workspace API key mints
+day-long tokens with no such ceiling. Stop the tunnel when you are done
+rather than leaving it up.
+
 ## Deploying it
 
 A deployed page holds no Cosmo credential at all. The workspace key lives
@@ -62,9 +70,8 @@ deployment's access password for short-lived end-user tokens
 key with only the `user_tokens:mint` scope (a provisioning key): it can mint
 tokens but never start sessions or dial.
 
-`npm run pages:build` blanks `VITE_COSMO_API_KEY` and
-`scripts/assert-no-credential.js` fails the build if anything key-shaped
-survived into `dist/`.
+`npm run pages:build` runs `scripts/assert-no-credential.js`, which fails
+the build if anything key-shaped survived into `dist/`.
 
 ```bash
 npx wrangler pages project create cosmo-garden-doctor --production-branch main

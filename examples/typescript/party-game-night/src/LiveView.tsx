@@ -6,7 +6,7 @@ import {
   StartAudio,
   useRealtimeSessionContext,
   useTransportState,
-} from 'cosmo-ai';
+} from 'cosmo-ai/react';
 
 import { BoardFrame } from './board/BoardFrame';
 import { CaptionStrip } from './CaptionStrip';

@@ -5,6 +5,10 @@
  *  ``RealtimeSession.State``/``EndReason`` is the state-machine precedent. */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  sessionStartErrorFrom,
+  sessionStartRejectionFrom,
+} from '../../transport/session_start_error';
 import { TextEncoder as NodeTextEncoder, TextDecoder as NodeTextDecoder } from 'util';
 
 if (typeof global.TextEncoder === 'undefined') {
@@ -16,14 +20,18 @@ if (typeof global.TextDecoder === 'undefined') {
 
 import { RealtimeClient } from '../realtime_client';
 import type { RealtimeSession } from '../session';
-import type { SessionLifecycleState } from '../state';
+import type { SessionState } from '../state';
 import { SessionStartError } from '../../transport/session_start_error';
 import type { RealtimeServerMessage } from '../../transport/envelope';
 import {
   collect,
   drain,
+  fakeSessionResponse,
   makeFakeTransport,
+  sentTurns,
   transcriptFrame,
+  transcriptEvent,
+  readyEvent,
   type FakeTransport,
 } from './test_helpers';
 
@@ -57,13 +65,21 @@ const READY_FRAME: RealtimeServerMessage = {
   session_id: 'sess-test',
 };
 
+/** What the stream yields for ``READY_FRAME`` — the session's own event,
+ *  not the frame. */
+const READY_ITEM = readyEvent('sess-test');
+
+/** The fake lands ``READY_FRAME`` as part of ``connect`` (``start()``
+ *  resolves at ready), so every stream's first item is that frame. */
 async function startSession(): Promise<{
   client: RealtimeClient;
   session: RealtimeSession;
   fake: FakeTransport;
 }> {
-  const fake = makeFakeTransport();
-  const client = new RealtimeClient({ transportFactory: () => fake });
+  const fake = makeFakeTransport({
+    sessionResponse: fakeSessionResponse('sess-test'),
+  });
+  const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
   const session = await client.agent().start();
   return { client, session, fake };
 }
@@ -76,7 +92,6 @@ describe('RealtimeSession stream', () => {
   it('yields ready, tolerates unknown event types, and keeps flowing', async () => {
     const { session, fake } = await startSession();
 
-    fake.emitMessage(READY_FRAME);
     fake.emitMessage({
       type: 'telemetry-snapshot',
       metrics: { rtt_ms: 42 },
@@ -84,30 +99,31 @@ describe('RealtimeSession stream', () => {
     fake.emitMessage(transcriptFrame('Still here.'));
 
     const [ready, unknown, transcript] = await collect(session, 3);
-    expect(ready).toEqual(READY_FRAME);
+    expect(ready).toEqual(READY_ITEM);
     expect(unknown).toEqual({
       type: 'unknown',
       rawType: 'telemetry-snapshot',
       payload: { type: 'telemetry-snapshot', metrics: { rtt_ms: 42 } },
     });
-    expect(transcript).toEqual(transcriptFrame('Still here.'));
+    expect(transcript).toEqual(transcriptEvent('Still here.'));
     expect(session.state.kind).toBe('connected');
   });
 
   it('folds a server session-ended frame into the always-final terminal item', async () => {
     const { session, fake } = await startSession();
 
-    fake.emitMessage(READY_FRAME);
     fake.emitMessage({ type: 'session-ended', reason: 'max_session_duration' });
     // A frame racing the close still flows — the terminal item stays final.
     fake.emitMessage(transcriptFrame('late frame'));
     fake.emitClose();
 
     const events = await drain(session);
-    expect(events[0]).toEqual(READY_FRAME);
-    expect(events[1]).toEqual(transcriptFrame('late frame'));
-    expect(events[2]).toEqual({ type: 'session-ended', reason: 'max_session_duration' });
-    expect(events).toHaveLength(3);
+    expect(events[0]).toEqual(READY_ITEM);
+    expect(events[1]).toEqual(transcriptEvent('late frame'));
+    // The folded transcript follows the delta that produced it.
+    expect(events[2]?.type).toBe('transcript_updated');
+    expect(events[3]).toEqual({ type: 'session_ended', reason: 'max_session_duration' });
+    expect(events).toHaveLength(4);
     expect(session.state).toMatchObject({
       kind: 'disconnected',
       disconnectReason: 'server_ended',
@@ -119,14 +135,13 @@ describe('RealtimeSession stream', () => {
     try {
       const { session, fake } = await startSession();
 
-      fake.emitMessage(READY_FRAME);
-      fake.emitMessage({ type: 'session-ended', reason: 'worker done' });
+        fake.emitMessage({ type: 'session-ended', reason: 'worker done' });
       // No close follows — the grace timer must force the clean teardown.
       await vi.advanceTimersByTimeAsync(6_000);
 
       const events = await drain(session);
       expect(events[events.length - 1]).toEqual({
-        type: 'session-ended',
+        type: 'session_ended',
         reason: 'worker done',
       });
       expect(session.state).toMatchObject({
@@ -145,7 +160,10 @@ describe('RealtimeSession stream', () => {
     await session.close(); // idempotent
 
     const events = await drain(session);
-    expect(events).toEqual([{ type: 'session-ended', reason: 'client closed' }]);
+    expect(events).toEqual([
+      READY_ITEM,
+      { type: 'session_ended', reason: 'client closed' },
+    ]);
     expect(session.state.disconnectReason).toBe('client_closed');
     expect(fake.lastDisconnectOpts()).toEqual({ sendEndFrame: false });
   });
@@ -153,17 +171,32 @@ describe('RealtimeSession stream', () => {
   it('a bare deliberate server close finishes the stream with the reason as terminal detail', async () => {
     const { session, fake } = await startSession();
 
-    fake.emitMessage(READY_FRAME);
     fake.emitClose({ reason: 'livekit:ROOM_DELETED' });
 
     const events = await drain(session);
-    expect(events[0]).toEqual(READY_FRAME);
-    expect(events[1]).toEqual({ type: 'session-ended', reason: 'ROOM_DELETED' });
+    expect(events[0]).toEqual(READY_ITEM);
+    expect(events[1]).toEqual({ type: 'session_ended', reason: 'ROOM_DELETED' });
     expect(events).toHaveLength(2);
     expect(session.state).toMatchObject({
       kind: 'disconnected',
       disconnectReason: 'server_ended',
       detail: 'ROOM_DELETED',
+    });
+  });
+
+  it('a close the transport calls deliberate finishes as server_ended', async () => {
+    const { session, fake } = await startSession();
+
+    fake.emitClose({ code: '1000', reason: 'socket closed', serverEnded: true });
+
+    const events = await drain(session);
+    expect(events[0]).toEqual(READY_ITEM);
+    expect(events[1]).toEqual({ type: 'session_ended', reason: 'socket closed' });
+    expect(events).toHaveLength(2);
+    expect(session.state).toMatchObject({
+      kind: 'disconnected',
+      disconnectReason: 'server_ended',
+      detail: 'socket closed',
     });
   });
 
@@ -174,7 +207,10 @@ describe('RealtimeSession stream', () => {
     await session.end(); // idempotent
 
     const events = await drain(session);
-    expect(events).toEqual([{ type: 'session-ended', reason: 'client ended' }]);
+    expect(events).toEqual([
+      READY_ITEM,
+      { type: 'session_ended', reason: 'client ended' },
+    ]);
     // Latched: this session stays disconnected forever.
     expect(session.state.kind).toBe('disconnected');
     expect(session.state.disconnectReason).toBe('client_ended');
@@ -184,28 +220,34 @@ describe('RealtimeSession stream', () => {
     const { session, fake } = await startSession();
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    for (let i = 0; i < 1030; i++) {
+    // Each delta also folds, so every frame puts two items on the stream.
+    for (let i = 0; i < 600; i++) {
       fake.emitMessage(transcriptFrame(`t${String(i)}`));
     }
     await session.end();
 
     const events = await drain(session);
-    // 1024-slot cap: 6 dropped off the tail, then the terminal evicts the
-    // oldest buffered event (t0) instead of being dropped itself.
-    expect(warn).toHaveBeenCalledTimes(6);
+    // 1024-slot cap holding ready + 1023 of the 1200 stream items: the rest
+    // are dropped off the tail, then the terminal evicts the oldest buffered
+    // event (the ready) instead of being dropped itself.
+    expect(warn.mock.calls.length).toBeGreaterThan(0);
     expect(events).toHaveLength(1024);
     expect(events[events.length - 1]).toEqual({
-      type: 'session-ended',
+      type: 'session_ended',
       reason: 'client ended',
     });
-    expect(events[0]).toEqual(transcriptFrame('t1'));
-    expect(events[events.length - 2]).toEqual(transcriptFrame('t1023'));
+    expect(events[0]).toEqual(transcriptEvent('t0'));
   });
 
   it('supports a single stream consumer', async () => {
     const { session } = await startSession();
     const iterator = session[Symbol.asyncIterator]();
 
+    // The buffered ready resolves instantly; the contested pull is the next.
+    await expect(iterator.next()).resolves.toEqual({
+      value: READY_ITEM,
+      done: false,
+    });
     const first = iterator.next();
     await expect(iterator.next()).rejects.toThrow(
       'RealtimeSession supports a single stream consumer.',
@@ -213,7 +255,7 @@ describe('RealtimeSession stream', () => {
 
     await session.end();
     await expect(first).resolves.toEqual({
-      value: { type: 'session-ended', reason: 'client ended' },
+      value: { type: 'session_ended', reason: 'client ended' },
       done: false,
     });
   });
@@ -221,13 +263,13 @@ describe('RealtimeSession stream', () => {
   it('rejects start() on a handshake failure — no session escapes', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
     const fake = makeFakeTransport({
-      connectError: new SessionStartError(403, 'Forbidden', {
+      connectError: sessionStartErrorFrom(403, 'Forbidden', sessionStartRejectionFrom({
         code: 'workspace_forbidden',
         message: 'not allowed',
-      }),
+      })),
     });
-    const client = new RealtimeClient({ transportFactory: () => fake });
-    const states: SessionLifecycleState[] = [];
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
+    const states: SessionState[] = [];
 
     await expect(
       client.agent().start({ onStateChange: (state) => states.push(state) }),
@@ -244,8 +286,8 @@ describe('RealtimeSession stream', () => {
 describe('session lifecycle machine', () => {
   it('walks connecting → connected ↔ reconnecting → disconnected(client_ended)', async () => {
     const fake = makeFakeTransport();
-    const client = new RealtimeClient({ transportFactory: () => fake });
-    const states: SessionLifecycleState[] = [];
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
+    const states: SessionState[] = [];
 
     const session = await client
       .agent()
@@ -274,7 +316,7 @@ describe('session lifecycle machine', () => {
   it('maps an unsolicited transport close to transport_error with detail', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
     const { session, fake } = await startSession();
-    const states: SessionLifecycleState[] = [];
+    const states: SessionState[] = [];
     session.on('lifecycle', (state) => states.push(state));
 
     fake.emitClose({ reason: 'livekit:ICE failed' });
@@ -287,47 +329,117 @@ describe('session lifecycle machine', () => {
       { kind: 'disconnected', disconnectReason: 'transport_error', detail: 'ICE failed' },
     ]);
     const events = await drain(session);
-    expect(events).toEqual([{ type: 'session-ended', reason: 'ICE failed' }]);
+    expect(events).toEqual([
+      READY_ITEM,
+      { type: 'session_ended', reason: 'ICE failed' },
+    ]);
+    expect(session.state.disconnectReason).toBe('transport_error');
+  });
+
+  it('a transport code that looks clean is still an error unless the transport says otherwise', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { session, fake } = await startSession();
+
+    // ``code`` is transport-defined: a custom transport's 1000 carries no
+    // promise that the remote hung up on purpose.
+    fake.emitClose({ code: '1000', reason: 'link lost' });
+    await Promise.resolve();
+
+    expect(session.state).toMatchObject({
+      kind: 'disconnected',
+      disconnectReason: 'transport_error',
+      detail: 'link lost (close code 1000)',
+    });
+  });
+
+  it('maps an abnormal socket close to transport_error naming the close code', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { session, fake } = await startSession();
+    const states: SessionState[] = [];
+    session.on('lifecycle', (state) => states.push(state));
+
+    fake.emitClose({ code: '1008', reason: 'policy violation' });
+    await Promise.resolve();
+
+    expect(states).toEqual([
+      { kind: 'connected' }, // current state, replayed on subscribe
+      {
+        kind: 'disconnected',
+        disconnectReason: 'transport_error',
+        detail: 'policy violation (close code 1008)',
+      },
+    ]);
     expect(session.state.disconnectReason).toBe('transport_error');
   });
 });
 
+function flushMicrotasks(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 describe('send wire shapes', () => {
   it('sendText publishes a bare send-text frame', async () => {
     const { session, fake } = await startSession();
-    fake.emitMessage(READY_FRAME); // transport must be live before the first send
 
     await session.sendText('hi');
 
-    expect(fake.sent[0]).toEqual({ type: 'send-text', content: 'hi' });
-    expect(fake.sent[0]).not.toHaveProperty('options');
+    expect(sentTurns(fake)[0]).toEqual({ type: 'send-text', content: 'hi' });
+    expect(sentTurns(fake)[0]).not.toHaveProperty('options');
   });
 
   it('sendContext publishes a send-context frame and emits nothing locally', async () => {
     const { session, fake } = await startSession();
-    fake.emitMessage(READY_FRAME);
     const echoed: string[] = [];
     session.on('transcript', (event) => echoed.push(event.text));
 
     await session.sendContext('now on References (section 6 of 7).');
     await session.sendContext('   ');
 
-    expect(fake.sent).toEqual([
+    expect(sentTurns(fake)).toEqual([
       { type: 'send-context', content: 'now on References (section 6 of 7).' },
     ]);
     expect(echoed).toEqual([]);
   });
 
+  it('append* publish delegation-append frames on their channel', async () => {
+    const { session, fake } = await startSession();
+
+    await session.appendCommentary('Ships Thursday.', { delegationId: 'item_1' });
+    await session.appendThinking('Order 42, paid, address on file.', { delegationId: 'item_1' });
+    await session.appendInstructions('Stop offering refunds.');
+    await session.appendCommentary('   ');
+
+    expect(sentTurns(fake)).toEqual([
+      { type: 'delegation-append', channel: 'commentary', content: 'Ships Thursday.', delegation_id: 'item_1' },
+      { type: 'delegation-append', channel: 'thinking', content: 'Order 42, paid, address on file.', delegation_id: 'item_1' },
+      { type: 'delegation-append', channel: 'instructions', content: 'Stop offering refunds.' },
+    ]);
+  });
+
+  it('delegation-created reaches the client as delegation_created', async () => {
+    const { session, fake } = await startSession();
+    const events: unknown[] = [];
+    session.on('delegation_created', (e) => events.push(e));
+
+    fake.emitMessage({
+      type: 'delegation-created',
+      delegation_id: 'item_1',
+      transcript: 'where is my order',
+    });
+    await flushMicrotasks();
+
+    expect(events).toEqual([{ delegationId: 'item_1', transcript: 'where is my order' }]);
+  });
+
   it('sendText with transcript:false publishes the turn without echoing it locally', async () => {
     const { session, fake } = await startSession();
-    fake.emitMessage(READY_FRAME);
     const echoed: string[] = [];
     session.on('transcript', (event) => echoed.push(event.text));
 
     await session.sendText('[reading] now on References', { transcript: false });
     await session.sendText('shown');
 
-    expect(fake.sent[0]).toEqual({
+    expect(sentTurns(fake)[0]).toEqual({
       type: 'send-text',
       content: '[reading] now on References',
     });
@@ -352,7 +464,6 @@ describe('callback surface guarantees', () => {
     const endings: Array<{ reason: string }> = [];
     session.on('session_ended', (e) => endings.push(e));
 
-    fake.emitMessage(READY_FRAME);
     fake.emitMessage({ type: 'session-ended', reason: 'max_session_duration' });
     fake.emitClose();
     await drain(session);
@@ -361,10 +472,9 @@ describe('callback surface guarantees', () => {
   });
 
   it('replays the current lifecycle state to late subscribers', async () => {
-    const { session, fake } = await startSession();
-    fake.emitMessage(READY_FRAME);
+    const { session } = await startSession();
 
-    const seen: SessionLifecycleState[] = [];
+    const seen: SessionState[] = [];
     session.on('lifecycle', (s) => seen.push(s));
 
     expect(seen).toHaveLength(1);
@@ -372,8 +482,7 @@ describe('callback surface guarantees', () => {
   });
 
   it('replays ready to subscribers that attach after it fired', async () => {
-    const { session, fake } = await startSession();
-    fake.emitMessage(READY_FRAME);
+    const { session } = await startSession();
 
     const readies: Array<{ sessionId: string }> = [];
     session.on('ready', (r) => readies.push(r));

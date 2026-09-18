@@ -64,9 +64,10 @@ curl -sL -o pipeline/models/pose_landmarker_lite.task --create-dirs \
 cp .env.example .env
 ```
 
-You need a Cosmo API key to start a voice session (paste it into the form, or
-put it in `.env`). `GEMINI_API_KEY` is optional but does most of the
-interesting work; without it stage 2 is skipped and the UI says so.
+Voice sessions need no key: the dev server mints short-lived tokens from the
+credential `cosmo init` stored (run it once; a key pasted into the form
+overrides). `GEMINI_API_KEY` is optional but does most of the interesting
+work; without it stage 2 is skipped and the UI says so.
 
 ## Run
 

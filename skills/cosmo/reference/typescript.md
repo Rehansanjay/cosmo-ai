@@ -12,7 +12,7 @@ import { RealtimeClient } from 'cosmo-ai';
 // file. A browser page instead gets { token: ... } — a minted JWT or a
 // TokenSource, never an API key.
 const client = new RealtimeClient({});
-const session = await client.agent({ instructions: 'You are terse.', voice: 'Puck' }).start();
+const session = await client.agent({ instructions: 'You are terse.', model: 'grok', voice: 'ara' }).start();
 
 for await (const event of session) {
   switch (event.type) {
@@ -26,8 +26,9 @@ for await (const event of session) {
 ## Gotchas
 
 - **Next.js route handlers / server components**: import from
-  **`cosmo-ai/server`** — the root entry carries the React bindings and
-  will not load under the `react-server` bundler condition.
+  **`cosmo-ai/server`** — the credential-holding surface, with no session or
+  agent API. The React bindings are at `cosmo-ai/react`, a client boundary a
+  server component must not import.
 - **Two event vocabularies, on purpose**: iteration yields wire frames
   with kebab-case names (`{ type: 'session-ended' }`); the
   `session.on(...)` callback layer is the normalized UI surface with
@@ -37,17 +38,39 @@ for await (const event of session) {
   already-fired `ready`) replayed — attaching handlers after
   `agent.start()` resolves just works. Iteration stays the canonical
   form; reach for `on` only on code you don't own.
-- **Tools**: `tool({...})` from `cosmo-ai/tool` with `zodInput` from
+- **Tools**: `clientTool({...})` from `cosmo-ai/tool` with `zodInput` from
   `cosmo-ai/tool/zod` — the Zod schema drives the model-facing JSON
   Schema and validation; never hand-write a schema.
-- **Slow tools**: `tool({ background: true, handler: async (args, job) =>
+- **Slow tools**: `backgroundClientTool({ handler: async (args, job) =>
   … })`. The handler returns `void` — `job.ack('on it')` releases the
   reply so the agent keeps talking, then `await job.complete({ result,
   summary })` or `await job.fail({ error })` delivers the outcome
   whenever the work lands.
+- **Background voices / the agent answering other speakers**:
+  `client.agent({ audio: { noiseCancellation: 'voice_focus' } })` — off by
+  default; the tradeoff and the rest of the `audio` block:
+  [core.md](core.md). The browser's own noise suppression and auto-gain
+  control stay off (they duck speech during double-talk and break
+  barge-in) and are not configurable, so this flag is the lever.
+- **Wrong-language transcripts / the agent flipping languages**: there
+  is no `language` field to set — not on the agent options, a model
+  block, or anywhere else; don't invent one. The control is
+  `instructions` — the wording and what the platform already does:
+  [core.md](core.md).
 - **React**: wrap in `RealtimeProvider` and use the shipped hooks
   and components — the docs list them; don't rebuild transcript or
   mic-level plumbing by hand.
+- **Screen share**: `session.startScreenShare()` is what puts the screen
+  in front of the agent; render the "you are sharing this" preview from
+  `useScreenShare().stream` (or `session.getScreenShareStream()`). Never
+  call `getDisplayMedia` yourself — that capture stays local, so the
+  preview may render but the agent sees nothing. For small text or what
+  the user is pointing at, the agent needs the close-up tool — see
+  [core.md](core.md).
+- **Websocket transport**: `new RealtimeClient({ transport: 'websocket' })`
+  reaches a local OSS `cosmo-server`; managed Cosmo serves WebRTC only.
+  Outside the browser, `COSMO_TRANSPORT` sets the lane when the option is
+  omitted. What the socket refuses: [core.md](core.md).
 
 ## Ship it
 

@@ -6,7 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vite
 
 import { TokenSource } from '../token_source';
 import { RealtimeClient } from '../realtime_client';
-import { CredentialError, MintTokenError } from '../auth';
+import { CredentialsError } from '../auth';
+import { TokenSourceError } from '../token_source';
 
 const TOKEN_URL = 'https://myapp.example.com/token';
 
@@ -76,17 +77,27 @@ describe('TokenSource.endpoint wire shape', () => {
     });
   });
 
+  it('accepts a URL instance and POSTs its href', async () => {
+    (global.fetch as Mock).mockResolvedValueOnce(okResponse(mintBody(DAY_MS)));
+    const jwt = await TokenSource.endpoint(new URL(TOKEN_URL))._getJwt();
+    expect(jwt).toBe(`jwt-${DAY_MS}`);
+    expect((global.fetch as Mock).mock.calls[0][0]).toBe(TOKEN_URL);
+  });
+
   it('refuses a plaintext remote endpoint at construction', () => {
     expect(() => TokenSource.endpoint('http://myapp.example.com/token')).toThrow(
-      MintTokenError,
+      CredentialsError,
+    );
+    expect(() => TokenSource.endpoint(new URL('http://myapp.example.com/token'))).toThrow(
+      CredentialsError,
     );
     expect(() => TokenSource.endpoint('http://localhost:8787/token')).not.toThrow();
     expect(() => TokenSource.endpoint('/api/cosmo/token')).not.toThrow();
   });
 
   it('refuses non-http schemes even on loopback', () => {
-    expect(() => TokenSource.endpoint('ftp://localhost/token')).toThrow(MintTokenError);
-    expect(() => TokenSource.endpoint('ws://localhost/token')).toThrow(MintTokenError);
+    expect(() => TokenSource.endpoint('ftp://localhost/token')).toThrow(CredentialsError);
+    expect(() => TokenSource.endpoint('ws://localhost/token')).toThrow(CredentialsError);
   });
 
   it.each([
@@ -95,7 +106,7 @@ describe('TokenSource.endpoint wire shape', () => {
     ['backslashes', '\\\\tokens.example/token'],
     ['mixed slash', '/\\tokens.example/token'],
   ])('refuses scheme-relative URLs (%s) — they resolve to a foreign host', (_name, url) => {
-    expect(() => TokenSource.endpoint(url)).toThrow(MintTokenError);
+    expect(() => TokenSource.endpoint(url)).toThrow(TypeError);
   });
 
   it('still accepts true relative paths', () => {
@@ -116,8 +127,9 @@ describe('TokenSource.endpoint wire shape', () => {
       errorResponse(403, { error: { type: 'api_error', message: 'nope' } }),
     );
     await expect(TokenSource.endpoint(TOKEN_URL)._getJwt()).rejects.toMatchObject({
-      name: 'MintTokenError',
-      code: 'api_error',
+      name: 'TokenSourceError',
+      code: 'request_rejected',
+      serverCode: 'api_error',
     });
   });
 
@@ -128,13 +140,17 @@ describe('TokenSource.endpoint wire shape', () => {
       }),
     );
     await expect(TokenSource.endpoint(TOKEN_URL)._getJwt()).rejects.toMatchObject({
-      code: 'user_token_disabled',
+      code: 'request_rejected', serverCode: 'user_token_disabled',
       message: 'off',
     });
   });
 
   it.each([
-    ['network failure', () => (global.fetch as Mock).mockRejectedValueOnce(new TypeError('down'))],
+    [
+      'network failure',
+      () => (global.fetch as Mock).mockRejectedValueOnce(new TypeError('down')),
+      'request_failed',
+    ],
     [
       'non-JSON success body',
       () =>
@@ -145,40 +161,40 @@ describe('TokenSource.endpoint wire shape', () => {
             throw new SyntaxError('bad json');
           },
         } as unknown as Response),
+      'invalid_response',
     ],
     [
       'missing jwt / expires_at',
       () => (global.fetch as Mock).mockResolvedValueOnce(okResponse({ jwt: '' })),
+      'invalid_response',
     ],
-  ])('maps %s to token_source_failed', async (_name, arrange) => {
+  ])('maps %s to the code for what failed', async (_name, arrange, expected) => {
     arrange();
     await expect(TokenSource.endpoint(TOKEN_URL)._getJwt()).rejects.toMatchObject({
-      name: 'MintTokenError',
-      code: 'token_source_failed',
+      name: 'TokenSourceError',
+      code: expected,
     });
   });
 });
 
 describe('TokenSource.custom', () => {
-  it('accepts a Date or an RFC 3339 string for expiresAt', async () => {
-    const asDate = TokenSource.custom(async () => ({
+  it('accepts a MintedToken and passes tokenId through', async () => {
+    const source = TokenSource.custom(async () => ({
       jwt: 'j1',
       expiresAt: new Date(Date.now() + DAY_MS),
+      tokenId: 'tok-1',
     }));
-    const asString = TokenSource.custom(async () => ({
-      jwt: 'j2',
-      expiresAt: new Date(Date.now() + DAY_MS).toISOString(),
-    }));
-    expect(await asDate._getJwt()).toBe('j1');
-    expect(await asString._getJwt()).toBe('j2');
+    expect(await source._getJwt()).toBe('j1');
   });
 
-  it('rejects a malformed fetcher result with token_source_failed', async () => {
-    const source = TokenSource.custom(
-      async () => ({ jwt: 'j', expiresAt: 'not-a-date' }) as never,
-    );
+  it.each([
+    ['string expiresAt', { jwt: 'j', expiresAt: new Date().toISOString() }],
+    ['invalid Date', { jwt: 'j', expiresAt: new Date('not-a-date') }],
+    ['empty jwt', { jwt: '', expiresAt: new Date(Date.now() + DAY_MS) }],
+  ])('rejects a malformed fetcher result (%s) with fetcher_failed', async (_name, result) => {
+    const source = TokenSource.custom(async () => result as never);
     await expect(source._getJwt()).rejects.toMatchObject({
-      code: 'token_source_failed',
+      code: 'fetcher_failed',
     });
   });
 });
@@ -243,7 +259,7 @@ describe('cache and refresh', () => {
       .mockResolvedValueOnce(okResponse(mintBody(DAY_MS)));
     const source = TokenSource.endpoint(TOKEN_URL);
 
-    await expect(source._getJwt()).rejects.toBeInstanceOf(MintTokenError);
+    await expect(source._getJwt()).rejects.toBeInstanceOf(TokenSourceError);
     expect(await source._getJwt()).toBe(`jwt-${DAY_MS}`);
   });
 });
@@ -256,14 +272,14 @@ describe('RealtimeClient with a TokenSource credential', () => {
           apiKey: 'sk-secret',
           token: TokenSource.endpoint(TOKEN_URL),
         }),
-    ).toThrow(CredentialError);
+    ).toThrow(CredentialsError);
   });
 
   it('cannot mint', async () => {
     const client = new RealtimeClient({ token: TokenSource.endpoint(TOKEN_URL) });
     await expect(client.mintToken('user-1')).rejects.toMatchObject({
       name: 'MintTokenError',
-      code: 'no_api_key',
+      code: 'missing_api_key',
     });
     expect(global.fetch).not.toHaveBeenCalled();
   });

@@ -8,14 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from cosmo_ai import RealtimeClient
+from cosmo_ai import CredentialsError, CredentialsErrorCode, RealtimeClient
 from cosmo_ai._internal.credentials_file import resolve_credential, resolve_path
-from cosmo_ai.errors import (
-    CredentialsExpiredError,
-    CredentialsFileError,
-    CredentialsMismatchError,
-    CredentialsNotFoundError,
-)
 
 _VALID_FILE = """\
 version = 1
@@ -50,7 +44,7 @@ def test_default_path_is_home_dot_cosmo() -> None:
 def test_unreadable_file_is_a_file_error(tmp_path: Path) -> None:
     path = tmp_path / "credentials"
     path.mkdir()  # a directory: read_text raises IsADirectoryError (OSError)
-    with pytest.raises(CredentialsFileError) as exc_info:
+    with pytest.raises(CredentialsError) as exc_info:
         resolve_credential({"COSMO_CREDENTIALS_FILE": str(path)})
     assert exc_info.value.code == "file_invalid"
     assert str(path) in str(exc_info.value)
@@ -58,7 +52,7 @@ def test_unreadable_file_is_a_file_error(tmp_path: Path) -> None:
 
 def test_missing_file_error_names_every_option(tmp_path: Path) -> None:
     path = tmp_path / "credentials"
-    with pytest.raises(CredentialsNotFoundError) as exc_info:
+    with pytest.raises(CredentialsError) as exc_info:
         resolve_credential({"COSMO_CREDENTIALS_FILE": str(path)})
     message = str(exc_info.value)
     assert "COSMO_API_KEY" in message
@@ -97,7 +91,7 @@ def test_client_conflicting_env_base_url_is_refused(
     monkeypatch.delenv("COSMO_API_KEY", raising=False)
     monkeypatch.setenv("COSMO_BASE_URL", "http://localhost:8123")
     monkeypatch.setenv("COSMO_CREDENTIALS_FILE", str(path))
-    with pytest.raises(CredentialsMismatchError) as exc_info:
+    with pytest.raises(CredentialsError) as exc_info:
         RealtimeClient()
     message = str(exc_info.value)
     assert "http://localhost:8123" in message
@@ -120,7 +114,7 @@ def test_client_without_any_credential_raises_not_found(
 ) -> None:
     monkeypatch.delenv("COSMO_API_KEY", raising=False)
     monkeypatch.setenv("COSMO_CREDENTIALS_FILE", str(tmp_path / "credentials"))
-    with pytest.raises(CredentialsNotFoundError):
+    with pytest.raises(CredentialsError):
         RealtimeClient()
 
 
@@ -132,7 +126,7 @@ def test_client_with_expired_file_key_raises_expired(
     )
     monkeypatch.delenv("COSMO_API_KEY", raising=False)
     monkeypatch.setenv("COSMO_CREDENTIALS_FILE", str(path))
-    with pytest.raises(CredentialsExpiredError) as exc_info:
+    with pytest.raises(CredentialsError) as exc_info:
         RealtimeClient()
     assert "cosmo login" in str(exc_info.value)
 
@@ -158,3 +152,25 @@ def test_client_explicit_token_cannot_mint(
     monkeypatch.delenv("COSMO_BASE_URL", raising=False)
     client = RealtimeClient(token="jwt_y")
     assert client._can_mint is False
+
+
+def test_an_api_key_in_the_token_slot_is_refused() -> None:
+    """The incident path: a pasted key in ``token=`` would be honored as a
+    bearer by the backend and shipped to end users. It fails at construction
+    instead, naming the right parameter."""
+    # CredentialsError is a ValueError, so asserting the base would pass
+    # whether or not the guard is typed. Assert the code.
+    with pytest.raises(CredentialsError, match="api_key") as caught:
+        RealtimeClient(token="cosmo_" + "a" * 64)
+    assert caught.value.code is CredentialsErrorCode.API_KEY_IN_TOKEN_SLOT
+
+
+def test_both_credentials_at_once_is_refused() -> None:
+    with pytest.raises(CredentialsError) as caught:
+        RealtimeClient(api_key="cosmo_" + "a" * 64, token="cosmo_pat_" + "b" * 32)
+    assert caught.value.code is CredentialsErrorCode.CONFLICTING_CREDENTIALS
+
+
+def test_minted_jwts_and_acts_as_user_tokens_pass_the_token_slot() -> None:
+    RealtimeClient(token="eyJhbGciOiJIUzI1NiJ9.payload.sig")
+    RealtimeClient(token="cosmo_pat_" + "b" * 32)

@@ -7,6 +7,7 @@
  * dependency (like ``verify.ts`` and ``transport/dial.ts``).
  */
 
+import { RealtimeError, ApiError } from './errors';
 import { log } from './logger';
 import { parseErrorDetail } from '../transport/error_detail';
 
@@ -28,14 +29,27 @@ export type UsageStatus = 'pending' | 'recorded' | 'unavailable' | (string & {})
  *  and modality. The live ``cosmo.usage`` event's counters plus the input
  *  and output totals, with the same cumulative semantics. */
 export type SessionTokenUsage = {
+  /** Every input token, across all modalities. */
   inputTokens: number;
+  /** Every output token, across all modalities. */
   outputTokens: number;
+  /** Input plus output, as the provider reports it. */
   totalTokens: number;
+  /** Audio the model was given. */
   inputAudioTokens: number;
+  /** Text the model was given. */
   inputTextTokens: number;
+  /** Images the model was given. */
   inputImageTokens: number;
+  /** Input served from the provider's cache. Already counted in
+   *  ``inputTokens`` — a subset, not an addition. */
   inputCachedTokens: number;
+  /** Audio the model produced. On a session running ``audio.output: false``
+   *  this depends on the provider: one with a native text-only mode produces
+   *  none, while one without keeps generating speech that is discarded, and
+   *  those tokens still accrue. */
   outputAudioTokens: number;
+  /** Text the model produced. */
   outputTextTokens: number;
 };
 
@@ -46,30 +60,58 @@ export type SessionTokenUsage = {
  *  ``recorded``, at which point the numbers are final. ``tokens`` is null
  *  when the provider reports none. */
 export type SessionUsage = {
+  /** Where the session itself ended up. */
   status: SessionStatus;
+  /** Whether the usage summary exists yet. Poll while this is ``pending``;
+   *  stop on ``unavailable``. */
   usageStatus: UsageStatus;
+  /** Wall-clock length of the session, set once it ends. */
   durationSeconds: number | null;
+  /** How many turns the conversation took. */
   turnCount: number | null;
+  /** How long the user was speaking. */
   userSpeakingSeconds: number | null;
+  /** How long the agent was speaking. */
   agentSpeakingSeconds: number | null;
+  /** Which model provider actually ran the session, after the server
+   *  resolved ``model``. */
   provider: string | null;
+  /** The concrete model id that ran, which a family alias resolves to. */
   model: string | null;
+  /** The token breakdown. ``null`` when the provider reported none — that is
+   *  absence of reporting, not zero usage. */
   tokens: SessionTokenUsage | null;
 };
 
-/** ``code`` carried on :class:`UsageError`. The server's slug when the
- *  rejection carried one, or a client-side synthetic (``transport_error``,
- *  ``invalid_response``). Open-ended — treat unknown codes defensively. */
-export type UsageErrorCode = string;
+/** How far a usage read got before it failed.
+ *
+ *  Closed: every one is thrown by this SDK, so it changes only when the SDK
+ *  does. It says what happened to the attempt, never why the server refused —
+ *  that is the server's own slug, an open set, on `ApiError.serverCode`. */
+export type UsageErrorCode =
+  /** The request did not produce a usable answer — a network failure or
+   *  timeout, or a redirect, which is refused rather than followed so a
+   *  credential is never re-sent to another origin. */
+  | 'request_failed'
+  /** The server refused. `serverCode` carries its own slug for why. */
+  | 'request_rejected'
+  /** The server answered, but not with a body this SDK could parse. */
+  | 'invalid_response'
+  /** The SDK refused to make the call — this session carries no usage
+   *  surface. Nothing reached the server. */
+  | 'invalid_request';
 
 /** ``usage()`` failed. */
-export class UsageError extends Error {
+export class UsageError extends ApiError {
+  /** Always ``'UsageError'``. */
   readonly name = 'UsageError';
+  /** How far the attempt got. A closed set this SDK throws — switch on it.
+   *  The server's own rejection slug, an open set, is on `serverCode`. */
   readonly code: UsageErrorCode;
 
-  constructor(code: UsageErrorCode, message: string) {
-    super(message || code);
-    this.code = code;
+  constructor(options: { code: UsageErrorCode; message: string; serverCode?: string }) {
+    super(options.message || options.code, { serverCode: options.serverCode });
+    this.code = options.code;
   }
 }
 
@@ -80,8 +122,8 @@ export type GetUsageArgs = {
 };
 
 /** Place the authenticated usage GET. Server rejections raise
- *  :class:`UsageError` carrying the server slug; a network failure raises
- *  ``transport_error`` and a malformed success raises
+ *  :class:`UsageError` carrying the server slug on `serverCode`; a network failure raises
+ *  ``request_failed`` and a malformed success raises
  *  ``invalid_response``. */
 export async function getUsage(args: GetUsageArgs): Promise<SessionUsage> {
   let response: Response;
@@ -91,10 +133,10 @@ export async function getUsage(args: GetUsageArgs): Promise<SessionUsage> {
       headers: await args.getAuthHeaders(),
     });
   } catch (err) {
-    throw new UsageError(
-      'transport_error',
-      err instanceof Error ? err.message : 'Usage request failed to send.',
-    );
+    throw new UsageError({
+      code: 'request_failed',
+      message: err instanceof Error ? err.message : 'Usage request failed to send.',
+    });
   }
   if (!response.ok) {
     const { code, message } = await parseErrorDetail(response);
@@ -103,20 +145,20 @@ export async function getUsage(args: GetUsageArgs): Promise<SessionUsage> {
       status: response.status,
       code,
     });
-    throw new UsageError(code, message);
+    throw new UsageError({ code: 'request_rejected', message, serverCode: code });
   }
   let body: unknown;
   try {
     body = await response.json();
   } catch (err) {
-    throw new UsageError(
-      'invalid_response',
-      err instanceof Error ? err.message : 'Usage response was not JSON.',
-    );
+    throw new UsageError({
+      code: 'invalid_response',
+      message: err instanceof Error ? err.message : 'Usage response was not JSON.',
+    });
   }
   const usage = extractSessionUsage(body);
   if (usage === null) {
-    throw new UsageError('invalid_response', 'Usage response had an unexpected shape.');
+    throw new UsageError({ code: 'invalid_response', message: 'Usage response had an unexpected shape.' });
   }
   return usage;
 }

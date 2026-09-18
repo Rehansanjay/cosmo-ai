@@ -41,12 +41,14 @@ src/
 
 ```bash
 npm install
-cp .env.example .env   # add your API key, point at your backend
+cosmo init             # once — signs in and stores the credential /token mints with
 npm run dev
 ```
 
-The API key needs the `realtime:use` scope; the same key authenticates the
-realtime session and the board-vision endpoint. Against a local backend set
+The page mints short-lived tokens from its own `/token` route; the same
+token authenticates the realtime session and the board-vision endpoint (an
+API key pasted into the Connection panel overrides it). Against a local
+backend `cp .env.example .env` and set
 `VITE_COSMO_BASE_URL=https://localhost:8000`.
 
 A 720p JPEG is plenty for the vision endpoint — the detector reads boards

@@ -37,10 +37,8 @@ else:  # pragma: no cover - exercised on 3.10 CI
     import tomli as tomllib  # type: ignore[no-redef]
 
 from cosmo_ai.errors import (
-    CredentialsExpiredError,
-    CredentialsFileError,
-    CredentialsMismatchError,
-    CredentialsNotFoundError,
+    CredentialsErrorCode,
+    CredentialsError,
 )
 
 CREDENTIALS_VERSION = 1
@@ -103,8 +101,8 @@ def _resolve(
 
     profile = environ.get(PROFILE_ENV_VAR) or DEFAULT_PROFILE
     if file_text is None:
-        raise CredentialsNotFoundError(
-            code="no_credential",
+        raise CredentialsError(
+            code=CredentialsErrorCode.NO_CREDENTIAL,
             message=(
                 "No Cosmo credential found. Pass api_key= or token=, set "
                 f"{API_KEY_ENV_VAR}, or sign in with: cosmo login\n"
@@ -130,8 +128,8 @@ def _reject_base_url_conflict(
     fail as an unexplained 401. Refuse with the remediation instead."""
     if env_base is None or _origin_key(env_base) == _origin_key(stored_base):
         return
-    raise CredentialsMismatchError(
-        code="base_url_mismatch",
+    raise CredentialsError(
+        code=CredentialsErrorCode.BASE_URL_MISMATCH,
         message=(
             f"COSMO_BASE_URL is {env_base}, but the stored key for profile "
             f"'{profile}' was issued by {stored_base} ({path_display}).\n"
@@ -165,8 +163,8 @@ def _load_profile(
     try:
         document = tomllib.loads(file_text)
     except tomllib.TOMLDecodeError as exc:
-        raise CredentialsFileError(
-            code="file_invalid",
+        raise CredentialsError(
+            code=CredentialsErrorCode.FILE_INVALID,
             message=(
                 f"{path_display} is not valid TOML: {exc}\n"
                 f"  Move it aside or delete it, then run: cosmo login"
@@ -178,8 +176,8 @@ def _load_profile(
     raw_entry: Any = document.get(profile)
     if not isinstance(raw_entry, dict):
         present = sorted(k for k, v in document.items() if isinstance(v, dict))
-        raise CredentialsNotFoundError(
-            code="profile_not_found",
+        raise CredentialsError(
+            code=CredentialsErrorCode.PROFILE_NOT_FOUND,
             message=(
                 f"No '{profile}' credentials in {path_display}.\n"
                 f"  Profiles present: {', '.join(present) or '(none)'}\n"
@@ -196,8 +194,8 @@ def _load_profile(
         else:
             missing.append(name)
     if missing:
-        raise CredentialsFileError(
-            code="file_invalid",
+        raise CredentialsError(
+            code=CredentialsErrorCode.FILE_INVALID,
             message=(
                 f"Profile '{profile}' in {path_display} is missing: "
                 f"{', '.join(missing)}.\n  Run: cosmo login"
@@ -209,8 +207,8 @@ def _load_profile(
 def _reject_unreadable_version(document: dict[str, Any], path_display: str) -> None:
     version = document.get(_VERSION_KEY)
     if version is None:
-        raise CredentialsFileError(
-            code="file_invalid",
+        raise CredentialsError(
+            code=CredentialsErrorCode.FILE_INVALID,
             message=(
                 f"{path_display} predates the versioned credentials format.\n"
                 f"  Run: cosmo login   (rewrites it, keeping a .bak copy)"
@@ -219,8 +217,8 @@ def _reject_unreadable_version(document: dict[str, Any], path_display: str) -> N
     # `isinstance(True, int)` is True in Python, so state the whole shape
     # rather than only the ceiling — mirrors the CLI reader.
     if isinstance(version, bool) or not isinstance(version, int) or version < 1:
-        raise CredentialsFileError(
-            code="file_invalid",
+        raise CredentialsError(
+            code=CredentialsErrorCode.FILE_INVALID,
             message=(
                 f"{path_display}: '{_VERSION_KEY}' must be a positive integer, "
                 f"found {version!r}.\n"
@@ -228,8 +226,8 @@ def _reject_unreadable_version(document: dict[str, Any], path_display: str) -> N
             ),
         )
     if version > CREDENTIALS_VERSION:
-        raise CredentialsFileError(
-            code="file_invalid",
+        raise CredentialsError(
+            code=CredentialsErrorCode.FILE_INVALID,
             message=(
                 f"{path_display} was written by a newer Cosmo CLI (format "
                 f"{version}; this SDK understands {CREDENTIALS_VERSION}).\n"
@@ -243,16 +241,16 @@ def _reject_expired(
 ) -> None:
     expiry = _parse_rfc3339(expires_at)
     if expiry is None:
-        raise CredentialsFileError(
-            code="file_invalid",
+        raise CredentialsError(
+            code=CredentialsErrorCode.FILE_INVALID,
             message=(
                 f"Profile '{profile}' in {path_display} has an unreadable "
                 f"expires_at: {expires_at!r}.\n  Run: cosmo login"
             ),
         )
     if now >= expiry:
-        raise CredentialsExpiredError(
-            code="expired",
+        raise CredentialsError(
+            code=CredentialsErrorCode.EXPIRED,
             message=(
                 f"The stored API key for profile '{profile}' expired at "
                 f"{expires_at} ({path_display}).\n  Run: cosmo login"
@@ -278,8 +276,8 @@ def _read_text(path: Path) -> str | None:
     except FileNotFoundError:
         return None
     except OSError as exc:
-        raise CredentialsFileError(
-            code="file_invalid",
+        raise CredentialsError(
+            code=CredentialsErrorCode.FILE_INVALID,
             message=(
                 f"Cannot read {path}: {exc.strerror or exc}.\n"
                 f"  Fix its permissions, or point {FILE_ENV_VAR} elsewhere."

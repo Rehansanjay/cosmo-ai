@@ -27,10 +27,9 @@ npm run server
 npm run dev
 ```
 
-Open the Vite URL, open a PDF or paste a link, then click **Start talking**
-and paste a Cosmo API key with the `realtime:use` scope (Developer platform →
-API keys in the Cosmo web app). `cp .env.example .env` to skip the pasting on
-every run.
+Open the Vite URL, open a PDF or paste a link, then click **Start talking**.
+No key needed: the dev server mints short-lived tokens from the credential
+`cosmo init` stored (run it once if you haven't).
 
 ## Deploying it
 
@@ -94,7 +93,7 @@ Body text arrives through five client tools (`src/agent/tools.ts`):
 | `search_document` | where a phrase appears, as snippets with section indices |
 | `get_outline` | the section list, no body text |
 
-On top of that the app pushes `[reading] …` notes (`client.sendContext(...)`)
+On top of that the app pushes `[reading] …` notes (`session.sendContext(...)`)
 when you scroll to a new section or select text, so the agent's idea of "here"
 stays current. `sendContext` is the primitive for exactly this: the note lands
 in the model's context without becoming a turn, so the agent never speaks up

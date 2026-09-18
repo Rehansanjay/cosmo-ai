@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cosmo-ai-sdk"
-version = "0.5.1"
+version = "0.6.0"
 description = "Cosmo Realtime SDK — typed event-stream client for voice + multimodal sessions"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -43,7 +43,13 @@ Source = "https://github.com/socratic-ai/cosmo-ai/tree/main/python"
 livekit = []
 audio = []
 mcp = ["mcp>=1.14,<2"]
-dev = ["pytest", "pytest-asyncio", "mypy", "ruff"]
+# The websocket transport (``transport="websocket"``), for reaching a
+# self-hosted cosmo-server that runs sessions in its own process. Not a hard
+# dependency: a session against Cosmo never opens one. The floor is the
+# release that put ``close_code`` and ``close_reason`` on the asyncio
+# connection, which is how a clean close is told from a fault.
+websocket = ["websockets>=14.1"]
+dev = ["pytest", "pytest-asyncio", "mypy", "ruff", "websockets>=14.1"]
 
 [tool.setuptools]
 license-files = ["LICENSE", "NOTICE", "THIRD-PARTY-LICENSES.md"]
@@ -70,7 +76,11 @@ check_untyped_defs = true
 # selection can grow across releases (0.16.0 did). New rule families are
 # adopted deliberately, not by release drift.
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F"]
+# D1xx: a public class, function or method without a docstring. The rest
+# of pydocstyle is style opinion (blank lines, imperative mood, trailing
+# periods) and is deliberately left out.
+select = ["E4", "E7", "E9", "F", "D101", "D102", "D103", "D104", "D106"]
 
 [tool.ruff.lint.per-file-ignores]
 "**/__init__.py" = ["F401"]
+"tests/**" = ["D101", "D102", "D103", "D104", "D106"]

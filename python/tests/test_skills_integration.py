@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from cosmo_ai._internal.protocol import ClientTool
 from cosmo_ai.skills import Skill
-from cosmo_ai.tools import ClientTool
 
 from .fakes import start_body
 

@@ -2,6 +2,12 @@
 
 import { useCallback, useState } from 'react';
 import {
+  RealtimeClient,
+  TokenSource,
+  type RealtimeClientOptions,
+  type RealtimeSession,
+} from 'cosmo-ai';
+import {
   RealtimeProvider,
   RealtimeAudio,
   MicToggle,
@@ -9,11 +15,8 @@ import {
   useTranscript,
   useToolCalls,
   useTransportState,
-  RealtimeClient,
-  type RealtimeClientOptions,
-  type RealtimeSession,
-} from 'cosmo-ai';
-import { tool } from 'cosmo-ai/tool';
+} from 'cosmo-ai/react';
+import { clientTool } from 'cosmo-ai/tool';
 import { zodInput } from 'cosmo-ai/tool/zod';
 import { z } from 'zod/v4';
 
@@ -32,7 +35,7 @@ function setCosmoBaseUrl(baseUrl: string): void {
   tag.setAttribute('content', baseUrl);
 }
 
-const getLocalTime = tool({
+const getLocalTime = clientTool({
   name: 'get_local_time',
   description: 'Returns the local wall-clock time.',
   input: zodInput(
@@ -57,18 +60,17 @@ function SessionForm({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (apiKey) onStart(apiKey, baseUrl);
+    onStart(apiKey, baseUrl);
   };
 
   return (
     <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 8, maxWidth: 400 }}>
-      <label style={{ fontWeight: 600 }}>API Key</label>
+      <label style={{ fontWeight: 600 }}>API Key (optional — the /token route is used when empty)</label>
       <input
         type="password"
         value={apiKey}
         onChange={(e) => setApiKey(e.target.value)}
         placeholder="cosmo_..."
-        required
         style={{ padding: '6px 8px', fontFamily: 'monospace' }}
       />
       <label style={{ fontWeight: 600 }}>Base URL</label>
@@ -171,8 +173,13 @@ export function App() {
     async (apiKey: string, baseUrl: string) => {
       setConnecting(true);
       setCosmoBaseUrl(baseUrl);
-      const opts: RealtimeClientOptions = { apiKey };
-      const client = new RealtimeClient(opts);
+      // Empty box → the app's own /token route (the vite.config tokenRoute
+      // plugin in dev). Never inline a key here — this file is committed,
+      // and a build would publish it.
+      const options: RealtimeClientOptions = apiKey.trim()
+        ? { apiKey }
+        : { token: TokenSource.endpoint('/token') };
+      const client = new RealtimeClient(options);
       try {
         setSession(await client.agent({ tools: [getLocalTime] }).start());
       } finally {
@@ -192,7 +199,7 @@ export function App() {
       {session == null ? (
         <SessionForm onStart={handleStart} disabled={connecting} />
       ) : (
-        <RealtimeProvider session={session} maxTranscriptLength={50}>
+        <RealtimeProvider session={session}>
           <SessionView />
         </RealtimeProvider>
       )}

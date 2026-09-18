@@ -3,30 +3,41 @@
  * for opening sessions.
  *
  * Build an agent once (``client.agent({instructions, voice, tools})``) and
- * start any number of sessions from it (``agent.start()``). Python
+ * start any number of sessions from it (``agent.start()``), or prepare one
+ * ahead of its start (``agent.prepareSession()``). Python
  * (``cosmo_ai.Agent``) is the reference for shape and semantics.
  */
 
 import type {
   InterruptionSensitivity,
+  NoiseCancellation,
   EndOfSpeechSensitivity,
   InlineAgentConfig,
   CatalogAgentConfig,
   SemanticEagerness,
   SessionConfig,
   SessionParams,
-  SilenceTimeout as SilenceTimeout,
+  GrokReasoningEffort,
+  OpenAiLiveReasoningEffort as OpenAILiveReasoningEffort,
+  OpenAiLiveDelegation as OpenAILiveDelegation,
+  OpenAiLiveServiceTier as OpenAILiveServiceTier,
+  OpenAiLiveToolChoice as OpenAILiveToolChoice,
+  OpenAiLiveVerbosity as OpenAILiveVerbosity,
   ThinkingLevel,
-} from '../wire/types.gen';
+} from '../protocol';
 
 import { SDK_NAME, SDK_VERSION } from '../constants';
+import { ToolDefinitionError } from '../tool/errors';
+import { HookError } from './hooks';
 import { isSdkClientTool } from '../tool/sdk_tool';
-import type { ScreenLocateTool } from '../tool/screen';
+import type { ScreenCaptureHandler } from '../tool/screen';
+import type { PreparedRoomRef } from '../transport/prepared_room';
 import type { ClientToolJob } from './client_tool_jobs';
 import { Hook, HookEngine, type ServerHook, resolveHooks } from './hooks';
+import { log } from './logger';
 import type { RealtimeClient } from './realtime_client';
 import type { RealtimeSession } from './session';
-import type { SessionLifecycleState } from './state';
+import type { SessionState } from './state';
 import {
   type Skill,
   buildLoadSkillTool,
@@ -36,9 +47,11 @@ import {
 
 /** An async client-tool handler: the returned object is the tool result
  *  reported back to the agent. Throw to surface a tool error. ``args`` is
- *  the decoded tool-call arguments. */
+ *  the decoded tool-call arguments. ``signal`` is aborted when the agent
+ *  withdraws the call or the session ends. */
 export type ClientToolHandler = (
   args: Record<string, unknown>,
+  signal?: AbortSignal,
 ) => Promise<Record<string, unknown> | null | undefined | void>;
 
 /** A background client-tool handler: ack the call with ``job.ack(note)``
@@ -51,11 +64,11 @@ export type BackgroundClientToolHandler = (
 ) => Promise<void>;
 
 /** A tool the client executes locally: the SDK declares it at session
- *  start and the server routes matching invocations back over the
- *  transport RPC bridge. Attach a ``handler`` to execute the tool; a spec
- *  without one is still declared to the agent but not locally executable
- *  (the invocation surfaces only as a ``tool-invocation`` event). */
-export type ClientToolSpec = {
+ *  start, the server routes matching invocations back over the transport
+ *  RPC bridge, and the ``handler`` runs them — a declared tool always
+ *  carries its execution. For a method the server invokes over RPC without
+ *  advertising it to the model, use ``session.registerRpcMethod``. */
+export type ClientTool = {
   kind: 'client';
   background?: undefined;
   name: string;
@@ -63,15 +76,15 @@ export type ClientToolSpec = {
   /** JSON-Schema object describing the tool's arguments. */
   parameters: Record<string, unknown>;
   /** Local execution callback — never serialized to the wire. */
-  handler?: ClientToolHandler;
+  handler: ClientToolHandler;
 };
 
 /** A long-running client tool, declared explicitly (the cross-SDK,
  *  arity-free shape): the handler acks the call immediately and delivers
  *  its terminal result later through the ``ClientToolJob``. Serializes to
- *  the same ``kind: 'client'`` wire shape as ``ClientToolSpec`` — the
+ *  the same ``kind: 'client'`` wire shape as ``ClientTool`` — the
  *  server infers deferral from the reply, so nothing on the wire changes. */
-export type BackgroundClientToolSpec = {
+export type BackgroundClientTool = {
   kind: 'client';
   background: true;
   name: string;
@@ -79,31 +92,31 @@ export type BackgroundClientToolSpec = {
   /** JSON-Schema object describing the tool's arguments. */
   parameters: Record<string, unknown>;
   /** Local execution callback — never serialized to the wire. */
-  handler?: BackgroundClientToolHandler;
+  handler: BackgroundClientToolHandler;
 };
 
 /** Opt-in to the server-executed web-search tool. The server owns the
  *  model-facing declaration — zero-config. */
-export type WebSearchToolSpec = {
+export type WebSearchTool = {
   kind: 'web_search';
 };
 
 /** Opt-in to the server-executed frame-examination tool: reads the
  *  freshest frame of the published video at full resolution to answer a
  *  fine-detail question. Zero-config. */
-export type ExamineImageToolSpec = {
+export type ExamineImageTool = {
   kind: 'examine_image';
 };
 
 /** Opt-in to the server-executed object locator that returns boxes — one
  *  per matching instance. Zero-config. */
-export type DetectObjectsToolSpec = {
+export type DetectObjectsTool = {
   kind: 'detect_objects';
 };
 
 /** Opt-in to the server-executed object locator that returns points.
  *  Zero-config. */
-export type PointAtObjectToolSpec = {
+export type PointAtObjectTool = {
   kind: 'point_at_object';
 };
 
@@ -111,19 +124,102 @@ export type PointAtObjectToolSpec = {
  *  itself. Zero-config. Ending binds the call, not just the agent — every
  *  leg drops — and the spoken goodbye is allowed to finish first. Without
  *  it the agent can't hang up. */
-export type EndCallToolSpec = {
+export type EndCallTool = {
   kind: 'end_call';
 };
 
-export type RealtimeTool =
-  | ClientToolSpec
-  | BackgroundClientToolSpec
-  | WebSearchToolSpec
-  | ExamineImageToolSpec
-  | DetectObjectsToolSpec
-  | PointAtObjectToolSpec
+/** Opt-in to the server-kept speaker log of the room: a diarizing
+ *  transcript runs beside the model, and the agent can read the last few
+ *  seconds back with one stable label per voice (``S0``, ``S1``, …). It
+ *  binds labels to people from what they say about themselves. Zero-config. */
+export type SpeakerLogTool = {
+  kind: 'speaker_log';
+};
+
+/** Opt-in to the server-executed screen locator, ``cosmo_screen_locate``.
+ *
+ *  The other server-tool opt-ins are bare kinds because the server already has
+ *  what they need. This one does not: it grounds against a screenshot and an
+ *  element list only the client can produce, so seeing the screen is its
+ *  configuration. It is not a client tool — the model never calls it, and the
+ *  SDK answers the locator's capture RPC from ``capture`` instead. */
+export type ScreenLocateTool = {
+  /** Discriminates this arm of the ``AgentToolPayload`` union. */
+  kind: 'screen_locate';
+  /** Snapshot the screen the locator grounds against. The element list is an
+   *  allowlist by construction: the model can only ever be handed something
+   *  put in it, and an empty list resolves to no match. */
+  capture: ScreenCaptureHandler;
+};
+
+/** Brand that keeps a hand-written object literal from passing as an
+ *  ``AgentTool``; only a tool constructor can mint one. Type-level only;
+ *  nothing extra is serialized. @internal */
+declare const AGENT_TOOL_BRAND: unique symbol;
+
+/** Anything that can be handed to ``client.agent({tools})``. Every tool is
+ *  built by calling its constructor, so this is the only tool type a caller
+ *  ever names — the type is opaque, and the per-tool shapes it stands for
+ *  are internal. */
+export type AgentTool = {
+  readonly [AGENT_TOOL_BRAND]: true;
+};
+
+/** The structural union behind the opaque {@link AgentTool}: what the
+ *  constructors build and the wire lowering narrows on. @internal */
+export type AgentToolPayload =
+  | ClientTool
+  | BackgroundClientTool
+  | WebSearchTool
+  | ExamineImageTool
+  | DetectObjectsTool
+  | PointAtObjectTool
   | ScreenLocateTool
-  | EndCallToolSpec;
+  | EndCallTool
+  | SpeakerLogTool;
+
+/** Constructor-only door from the structural payload to the opaque public
+ *  type. The brand is type-level, so the runtime object is the payload
+ *  itself. @internal */
+export function mintAgentTool(payload: AgentToolPayload): AgentTool {
+  return payload as unknown as AgentTool;
+}
+
+/** The inverse door: recover the structural payload the lowering and
+ *  handler registration narrow on. @internal */
+export function agentToolPayload(tool: AgentTool): AgentToolPayload {
+  return tool as unknown as AgentToolPayload;
+}
+
+/** Web search, run on Cosmo's backend. */
+export function webSearchTool(): AgentTool {
+  return mintAgentTool({ kind: 'web_search' });
+}
+
+/** Examine the freshest published video frame at full resolution. */
+export function examineImageTool(): AgentTool {
+  return mintAgentTool({ kind: 'examine_image' });
+}
+
+/** Read who said what from the room's speaker-labelled transcript. */
+export function speakerLogTool(): AgentTool {
+  return mintAgentTool({ kind: 'speaker_log' });
+}
+
+/** Locate a named object in the frame, returning one box per instance. */
+export function detectObjectsTool(): AgentTool {
+  return mintAgentTool({ kind: 'detect_objects' });
+}
+
+/** Locate a named object in the frame, returning points. */
+export function pointAtObjectTool(): AgentTool {
+  return mintAgentTool({ kind: 'point_at_object' });
+}
+
+/** Let the agent hang up the call itself. */
+export function endCallTool(): AgentTool {
+  return mintAgentTool({ kind: 'end_call' });
+}
 
 /** Tuning for the ``cosmo_vad`` turn detector. Every knob names the
  *  detector's own machinery, so a caller always knows which endpointer a
@@ -139,9 +235,10 @@ export type CosmoVadConfig = {
   maxHoldMs?: number;
 };
 
-/** Gemini-realtime model knobs. Valid only when ``model`` runs on Gemini;
- *  the ``provider`` discriminator makes setting these for another provider a
- *  type error rather than a silent no-op.
+/** The Gemini-realtime provider with its knobs. Assigning this block to
+ *  ``model`` picks the provider; the ``provider`` discriminator makes setting
+ *  a Gemini knob for another provider a type error rather than a silent
+ *  no-op.
  *
  *  ``turnDetection`` selects which detector ends the user's turn, and each
  *  detector owns its knobs: ``endOfSpeechSensitivity``, ``silenceDurationMs``
@@ -149,8 +246,13 @@ export type CosmoVadConfig = {
  *  ``cosmoVad`` block tunes ``cosmo_vad``. The union makes pairing a knob
  *  with the other detector a type error; the server rejects the same pairing
  *  rather than silently ignoring it. */
-export type GeminiModelOptions = {
+export type GeminiModel = {
+  /** Names the provider this block configures. Always ``gemini``;
+   *  the constructor stamps it, so you never write it yourself. */
   provider: 'gemini';
+  /** Concrete Gemini model to run. Unset runs the provider default. A model
+   *  id that is not a Gemini model is rejected at session start. */
+  modelId?: string;
   /** Sampling temperature (0–2) — higher is more varied, lower more
    *  deterministic. Unset uses the provider default. */
   temperature?: number;
@@ -198,16 +300,21 @@ export type GeminiModelOptions = {
     }
 );
 
-/** OpenAI-Realtime model knobs. OpenAI Realtime pins its own sampling and
- *  token limits, so only turn-taking is tunable here.
+/** The OpenAI-Realtime provider with its knobs. OpenAI Realtime pins its own
+ *  sampling and token limits, so only turn-taking is tunable here.
  *
  *  ``turnDetection`` decides which of the remaining knobs apply: ``eagerness``
  *  belongs to ``semantic_vad``, the two window knobs to ``server_vad``. The
  *  union makes pairing one with the other detector a type error; the server
  *  rejects the same pairing rather than silently ignoring it. */
-export type OpenAIModelOptions =
+export type OpenAIModel =
   | {
-      provider: 'openai';
+      /** Names the provider this block configures. Always ``openai``;
+   *  the constructor stamps it, so you never write it yourself. */
+  provider: 'openai';
+      /** Concrete OpenAI Realtime model to run. Unset runs the provider
+       *  default. */
+      modelId?: string;
       /** Ends the turn after a fixed window of silence. Unset keeps the
        *  provider default, which is this detector. */
       turnDetection?: 'server_vad';
@@ -218,7 +325,12 @@ export type OpenAIModelOptions =
       eagerness?: never;
     }
   | {
-      provider: 'openai';
+      /** Names the provider this block configures. Always ``openai``;
+   *  the constructor stamps it, so you never write it yourself. */
+  provider: 'openai';
+      /** Concrete OpenAI Realtime model to run. Unset runs the provider
+       *  default. */
+      modelId?: string;
       /** Ends the turn as soon as the utterance reads as complete. */
       turnDetection: 'semantic_vad';
       /** How eagerly the classifier closes the user's turn — ``high``
@@ -228,19 +340,72 @@ export type OpenAIModelOptions =
       prefixPaddingMs?: never;
     };
 
-/** OpenAI-Realtime mini-tier model knobs — the same API on a faster, cheaper
- *  model, and equally untunable today. */
-export type OpenAIMiniModelOptions = {
+/** The OpenAI-Realtime mini tier — the same API on a faster, cheaper model,
+ *  and equally untunable today. */
+export type OpenAIMiniModel = {
+  /** Names the provider this block configures. Always ``openai_mini``;
+   *  the constructor stamps it, so you never write it yourself. */
   provider: 'openai_mini';
+  /** Concrete mini-tier model to run. Unset runs the provider default. */
+  modelId?: string;
 };
 
-/** xAI Grok Voice model knobs. Grok pins its own sampling and token limits,
- *  so only turn-taking is tunable here.
+/** OpenAI's GPT Live full-duplex voice model. It listens and speaks at once
+ *  and decides itself when each turn starts and ends, so no turn detector is
+ *  tunable here; tool calls and reasoning are delegated to a backend
+ *  Responses model, which is what the knobs configure. Audio only: a session
+ *  on it ignores video and screen frames. A ``voice_…`` id on the agent's
+ *  ``voice`` selects an authorized custom voice. */
+export type OpenAILiveModel = {
+  /** Names the provider this block configures. Always ``openai_live``;
+   *  the constructor stamps it, so you never write it yourself. */
+  provider: 'openai_live';
+  /** Concrete GPT Live model to run. Unset runs the provider default. */
+  modelId?: string;
+  /** The Responses model tool calls and reasoning are delegated to, from
+   *  the server's allowlist of small tiers; a model outside it is rejected
+   *  at session start. Unset runs the provider default. */
+  responsesModel?: string;
+  /** Instructions for the Responses model, distinct from the voice model's.
+   *  Unset gives it the agent's own instructions. */
+  responsesInstructions?: string;
+  /** How hard the Responses model reasons on delegated work. Unset keeps
+   *  OpenAI's default. */
+  reasoningEffort?: OpenAILiveReasoningEffort;
+  /** How much the Responses model writes back for the voice model to say.
+   *  Unset keeps OpenAI's default. */
+  verbosity?: OpenAILiveVerbosity;
+  /** Whether a delegated turn must call a tool. Unset lets the model decide
+   *  (``auto``). */
+  toolChoice?: OpenAILiveToolChoice;
+  /** Whether one delegated turn may call several tools at once. Unset keeps
+   *  OpenAI's default. */
+  parallelToolCalls?: boolean;
+  /** Cap on tokens one delegated response may generate (16–32768). Unset
+   *  keeps OpenAI's default. */
+  maxOutputTokens?: number;
+  /** OpenAI processing tier for delegated work. Unset keeps OpenAI's
+   *  default. */
+  serviceTier?: OpenAILiveServiceTier;
+  /** Who does the work the voice model hands off. Unset is ``responses``.
+   *  Under ``client`` and ``cosmo`` the ``responses*`` knobs are unused and
+   *  the agent may declare no tools. */
+  delegation?: OpenAILiveDelegation;
+};
+
+/** The xAI Grok Voice provider with its knobs. Grok pins its own sampling and
+ *  token limits; turn-taking, reasoning effort, and playback speed are
+ *  tunable here.
  *
- *  Grok runs one detector — a fixed silence window — so both knobs always
- *  apply. Naming any other detector is rejected at session start. */
-export type GrokModelOptions = {
+ *  Grok runs one detector — a fixed silence window — so the turn-taking
+ *  knobs always apply. Naming any other detector is rejected at session
+ *  start. */
+export type GrokModel = {
+  /** Names the provider this block configures. Always ``grok``;
+   *  the constructor stamps it, so you never write it yourself. */
   provider: 'grok';
+  /** Concrete Grok Voice model to run. Unset runs the provider default. */
+  modelId?: string;
   /** Ends the turn after a fixed window of silence — the only detector Grok
    *  offers, and what unset selects. */
   turnDetection?: 'server_vad';
@@ -248,17 +413,71 @@ export type GrokModelOptions = {
   silenceDurationMs?: number;
   /** Audio (ms, 0–5000) kept from before speech was detected. */
   prefixPaddingMs?: number;
+  /** Whether the model reasons before speaking. Grok's own default is
+   *  ``high``, which buys deliberate answers at multi-second turn latency;
+   *  ``none`` answers immediately. Unset keeps Grok's default. */
+  reasoningEffort?: GrokReasoningEffort;
+  /** Playback-rate multiplier for the agent's speech (0.7–1.5). Unset keeps
+   *  normal speed. */
+  speed?: number;
+  /** Milliseconds of user silence after a response before the server
+   *  re-engages the user, re-arming after every response. Unset never
+   *  re-engages. */
+  idleTimeoutMs?: number;
 };
 
-/** Provider-scoped model knobs, discriminated on ``provider``. Each knob is
- *  honored only by its provider — ``thinkingLevel`` lives only on the Gemini
- *  block — so an illegal pairing is a type error. ``model`` selects the
- *  concrete model within the chosen provider. */
-export type ModelOptions =
-  | GeminiModelOptions
-  | OpenAIModelOptions
-  | OpenAIMiniModelOptions
-  | GrokModelOptions;
+/** The block form of ``RealtimeModel``, discriminated on ``provider``. The
+ *  provider a knob belongs to owns it — ``thinkingLevel`` lives only on the
+ *  Gemini block — so an illegal pairing is a type error. */
+export type RealtimeModelBlock =
+  | GeminiModel
+  | OpenAIModel
+  | OpenAIMiniModel
+  | OpenAILiveModel
+  | GrokModel;
+
+/** What runs on the other end. The string form is a provider family alias
+ *  ('gemini', 'openai', 'openai_mini', 'openai_live', …) running that provider's default
+ *  model, or a concrete model id. The block form picks the provider, carries
+ *  its knobs, and optionally pins the concrete model via ``modelId``. One
+ *  field names the provider exactly once, so a model/knob provider mismatch
+ *  is unrepresentable. */
+export type RealtimeModel = string | RealtimeModelBlock;
+
+/** Each arm of a block type minus the ``provider`` tag the constructor
+ *  stamps. Distributes over the arms so detector-scoped knobs keep their
+ *  scoping — a flattening ``Omit`` would let an illegal pairing typecheck. */
+type WithoutProvider<T> = T extends { provider: string }
+  ? Omit<T, 'provider'>
+  : never;
+
+/** Builds a ``GeminiModel`` block, stamping the ``provider`` tag so the
+ *  caller names the provider once by calling the constructor — the same
+ *  once-naming Python's class and Swift's case give. The tagged literal
+ *  stays valid; it is the wire shape this returns. */
+export const GeminiModel = (
+  options: WithoutProvider<GeminiModel> = {},
+): GeminiModel => ({ provider: 'gemini', ...options }) as GeminiModel;
+
+/** Builds an ``OpenAIModel`` block, stamping the ``provider`` tag. */
+export const OpenAIModel = (
+  options: WithoutProvider<OpenAIModel> = {},
+): OpenAIModel => ({ provider: 'openai', ...options }) as OpenAIModel;
+
+/** Builds an ``OpenAIMiniModel`` block, stamping the ``provider`` tag. */
+export const OpenAIMiniModel = (
+  options: WithoutProvider<OpenAIMiniModel> = {},
+): OpenAIMiniModel => ({ provider: 'openai_mini', ...options });
+
+/** Builds an ``OpenAILiveModel`` block, stamping the ``provider`` tag. */
+export const OpenAILiveModel = (
+  options: WithoutProvider<OpenAILiveModel> = {},
+): OpenAILiveModel => ({ provider: 'openai_live', ...options });
+
+/** Builds a ``GrokModel`` block, stamping the ``provider`` tag. */
+export const GrokModel = (
+  options: WithoutProvider<GrokModel> = {},
+): GrokModel => ({ provider: 'grok', ...options });
 
 /** How the agent sounds — the prebuilt voice and the per-run speaking
  *  style. Accepted anywhere a plain voice-id string is, when a speaking
@@ -270,26 +489,18 @@ export type VoiceConfig = {
   speakingStyle?: string;
 };
 
-/** Background-ambience bed mixed into the assistant's OUTPUT audio.
- *  Presence of the object enables the bed; omit it for none. */
-export type AmbienceConfig = {
-  /** Named ambience bed to play; unset uses the default bed. */
-  track?: 'office';
-  /** Bed level relative to full scale (dB, -60..0); sits under speech. */
-  gainDb?: number;
-};
-
 /** The agent's audio pipeline, configured once — not per run. */
 export type AudioConfig = {
   /** Whether the agent emits audio. ``false`` runs the session text-only:
    *  input transcription and text output are unaffected. Rejected at
    *  session start when the resolved model cannot run text-only. */
   output?: boolean;
-  /** Apply background-voice cancellation to the user's inbound audio.
-   *  Off unless set to ``true``. */
-  noiseCancellation?: boolean;
-  /** Background-ambience bed on the assistant's output; present = enabled. */
-  ambience?: AmbienceConfig;
+  /** Which filter cleans the user's inbound audio before the model hears
+   *  it. ``'denoise'`` removes noise and keeps every voice, for a microphone
+   *  several people share; ``'voice_focus'`` also removes competing voices,
+   *  keeping only the one it judges primary, for a single speaker. Unset is
+   *  ``'off'``. */
+  noiseCancellation?: NoiseCancellation;
 };
 
 /** The inline persona — what the agent is, independent of any one run.
@@ -299,30 +510,28 @@ export type AudioConfig = {
 export type AgentConfig = {
   /** System instructions. Replaces the server's neutral default when set. */
   instructions?: string;
-  /** Concrete model to run, within the provider named by ``modelOptions``.
-   *  Unknown or workspace-unavailable values are rejected at session start. */
-  model?: string;
-  /** Provider-scoped model knobs (sampling, reasoning depth, turn-taking),
-   *  discriminated on ``provider``. Each knob is honored only by its provider,
-   *  so an illegal pairing is a type error. Unset keeps every provider default. */
-  modelOptions?: ModelOptions;
+  /** What runs on the other end: a family alias or concrete model id (string
+   *  form), or a provider block carrying that provider's knobs and an optional
+   *  concrete ``modelId``. Unknown or workspace-unavailable values are
+   *  rejected at session start. */
+  model?: RealtimeModel;
   /** How the agent sounds: the voice id as a plain string, or a
    *  ``VoiceConfig`` when a speaking style rides along. */
   voice?: string | VoiceConfig;
   /** Tool set for the session: client-executed specs plus server-tool
    *  opt-ins. Unset → the session runs with no tools. */
-  tools?: RealtimeTool[];
+  tools?: AgentTool[];
   /** How readily user audio barges in over the assistant. */
   interruptionSensitivity?: InterruptionSensitivity;
   /** Opening line the assistant speaks as soon as the model session opens.
    *  Part of the persona: what this agent says to open a call. A resumed
    *  session never re-greets. */
   greeting?: string;
-  /** The agent's audio pipeline — output emission, inbound noise
-   *  cancellation, and the ambience bed. Part of the agent config so an
+  /** The agent's audio pipeline — output emission and inbound noise
+   *  cancellation. Part of the agent config so an
    *  agent's audio handling is configured once, not per run. Unset sends no
    *  audio block at all, so every knob keeps its server default —
-   *  ``noiseCancellation`` among them, which is off. */
+   *  ``noiseCancellation`` among them, which is ``'off'``. */
   audio?: AudioConfig;
   /** Skills for this agent: the skill menu is folded into the instructions
    *  at ``start()`` and a ``cosmo_sdk_load_skill`` client tool serves skill
@@ -347,7 +556,7 @@ export type CatalogAgentOptions = {
   /** Client-executed declarations (plus server-tool opt-ins), used
    *  verbatim as the session's tool set — the stored agent config carries
    *  no tools, so nothing is merged in. */
-  tools?: RealtimeTool[];
+  tools?: AgentTool[];
   /** Per-run voice: the override id as a plain string, or a ``VoiceConfig``
    *  carrying a speaking style. The voice id is the one cosmetic exception
    *  to "stored config runs verbatim" — it never changes what the agent
@@ -405,7 +614,7 @@ export type SessionStartOptions = {
    *  connect begins, so the callback sees the full state prefix — states
    *  that fire before ``start()`` resolves included. Stops at this run's
    *  terminal state. */
-  onStateChange?: (state: SessionLifecycleState) => void;
+  onStateChange?: (state: SessionState) => void;
   /** Receive the session before its connect begins — the same object
    *  ``start()`` resolves to. Callbacks attached here are in place before
    *  any event can fire, which is the only way to observe events the
@@ -430,31 +639,24 @@ function toWireVoice(
   return prune({ name: voice.name, speaking_style: voice.speakingStyle });
 }
 
-/** Wire form of ``audio``. An explicitly present ``ambience`` survives as
- *  ``{}`` even with every knob unset — presence is what enables the bed. */
+/** Wire form of ``audio``. */
 function toWireAudio(audio: AudioConfig | undefined):
   | {
       output?: boolean;
-      noise_cancellation?: boolean;
-      ambience?: { track?: 'office'; gain_db?: number };
+      noise_cancellation?: NoiseCancellation;
     }
   | undefined {
   if (audio === undefined) return undefined;
-  const ambience =
-    audio.ambience === undefined
-      ? undefined
-      : (prune({ track: audio.ambience.track, gain_db: audio.ambience.gainDb }) ?? {});
   return prune({
     output: audio.output,
     noise_cancellation: audio.noiseCancellation,
-    ambience,
   });
 }
 
 /** The wire form of a client tool: the declared spec with every local-only
  *  execution field (``handler``, the ``background`` marker) excluded by
  *  type, so a new local field cannot leak onto the wire unnoticed. */
-type WireClientTool = Omit<ClientToolSpec, 'handler' | 'background'>;
+type WireClientTool = Omit<ClientTool, 'handler' | 'background'>;
 
 /** Zero-config typed server-tool opt-ins serialize as their bare kind —
  *  including ``screen_locate``, whose local capture handler is stripped the
@@ -466,14 +668,15 @@ type WireServerToolOptIn = {
     | 'detect_objects'
     | 'point_at_object'
     | 'screen_locate'
-    | 'end_call';
+    | 'end_call'
+    | 'speaker_log';
 };
 
 /** Strip local-only fields (``handler``, ``capture``, the ``background``
  *  marker) so the wire body carries only the declared spec — a background tool
  *  serializes identically to a plain client tool. */
 function toWireTool(
-  tool: RealtimeTool,
+  tool: AgentToolPayload,
 ): WireServerToolOptIn | WireClientTool {
   if (
     tool.kind === 'web_search' ||
@@ -481,7 +684,8 @@ function toWireTool(
     tool.kind === 'detect_objects' ||
     tool.kind === 'point_at_object' ||
     tool.kind === 'screen_locate' ||
-    tool.kind === 'end_call'
+    tool.kind === 'end_call' ||
+    tool.kind === 'speaker_log'
   ) {
     return { kind: tool.kind };
   }
@@ -489,16 +693,20 @@ function toWireTool(
   return { kind: 'client', name, description, parameters };
 }
 
-/** Map the ergonomic (camelCase) model options onto the wire's provider-scoped
- *  block. Only the selected provider's knobs cross the wire. */
-function toWireModelOptions(
-  mo: ModelOptions,
-): NonNullable<InlineAgentConfig['model_options']> {
+/** Map the ergonomic (camelCase) model onto its wire form. The string form
+ *  crosses as-is; a block sends only the selected provider's knobs. */
+function toWireModel(
+  mo: RealtimeModel,
+): NonNullable<InlineAgentConfig['model']> {
+  if (typeof mo === 'string') {
+    return mo;
+  }
   switch (mo.provider) {
     case 'gemini':
       return {
         provider: 'gemini',
         ...prune({
+          model_id: mo.modelId,
           temperature: mo.temperature,
           max_output_tokens: mo.maxOutputTokens,
           thinking_level: mo.thinkingLevel,
@@ -525,6 +733,7 @@ function toWireModelOptions(
     case 'openai':
       return {
         provider: 'openai',
+        ...prune({ model_id: mo.modelId }),
         ...prune(
           mo.turnDetection === 'semantic_vad'
             ? { turn_detection: mo.turnDetection, eagerness: mo.eagerness }
@@ -536,14 +745,34 @@ function toWireModelOptions(
         ),
       };
     case 'openai_mini':
-      return { provider: 'openai_mini' };
+      return { provider: 'openai_mini', ...prune({ model_id: mo.modelId }) };
+    case 'openai_live':
+      return {
+        provider: 'openai_live',
+        ...prune({
+          model_id: mo.modelId,
+          responses_model: mo.responsesModel,
+          responses_instructions: mo.responsesInstructions,
+          reasoning_effort: mo.reasoningEffort,
+          verbosity: mo.verbosity,
+          tool_choice: mo.toolChoice,
+          parallel_tool_calls: mo.parallelToolCalls,
+          max_output_tokens: mo.maxOutputTokens,
+          service_tier: mo.serviceTier,
+          delegation: mo.delegation,
+        }),
+      };
     case 'grok':
       return {
         provider: 'grok',
         ...prune({
+          model_id: mo.modelId,
           turn_detection: mo.turnDetection,
           silence_duration_ms: mo.silenceDurationMs,
           prefix_padding_ms: mo.prefixPaddingMs,
+          reasoning_effort: mo.reasoningEffort,
+          speed: mo.speed,
+          idle_timeout_ms: mo.idleTimeoutMs,
         }),
       };
   }
@@ -561,7 +790,11 @@ function applySkills(config: AgentConfig): AgentConfig {
   const instructions = config.instructions
     ? `${config.instructions}\n\n${menu}`
     : menu;
-  return { ...config, instructions, tools: [...(config.tools ?? []), loadTool] };
+  return {
+    ...config,
+    instructions,
+    tools: [...(config.tools ?? []), mintAgentTool(loadTool)],
+  };
 }
 
 /** Client-tool names reserved for the tools the SDK ships itself. The SDK
@@ -575,15 +808,19 @@ export const SDK_TOOL_NAME_PREFIX = 'cosmo_sdk_';
  *  rather than surfacing as the server's 422 at session start. The SDK's own
  *  renderers pass by construction — see ``markSdkClientTool`` — so taking an
  *  SDK tool's exact name is rejected like any other squat. */
-function assertNoReservedToolNames(tools: RealtimeTool[] | undefined): void {
+function assertNoReservedToolNames(
+  tools: readonly AgentToolPayload[] | undefined,
+): void {
   for (const tool of tools ?? []) {
     if (tool.kind !== 'client') continue;
     if (!tool.name.startsWith(SDK_TOOL_NAME_PREFIX)) continue;
     if (isSdkClientTool(tool)) continue;
-    throw new Error(
-      `${tool.name}: the ${SDK_TOOL_NAME_PREFIX} prefix is reserved for tools ` +
+    throw new ToolDefinitionError({
+      code: 'invalid_tool_name',
+      message:
+        `${tool.name}: the ${SDK_TOOL_NAME_PREFIX} prefix is reserved for tools ` +
         'the SDK ships — rename your tool',
-    );
+    });
   }
 }
 
@@ -591,12 +828,13 @@ function assertNoReservedToolNames(tools: RealtimeTool[] | undefined): void {
  *  wire body. ``undefined`` fields are omitted (server defaults apply). */
 export function buildAgentSessionConfig(
   config: ResolvedAgentConfig,
-  opts: SessionStartOptions & { serverHooks?: ServerHook[] },
+  options: SessionStartOptions & { serverHooks?: ServerHook[] },
 ): SessionConfig {
-  assertNoReservedToolNames(config.tools);
+  const toolPayloads = config.tools?.map(agentToolPayload);
+  assertNoReservedToolNames(toolPayloads);
   const wireTools =
-    config.tools !== undefined && config.tools.length > 0
-      ? config.tools.map(toWireTool)
+    toolPayloads !== undefined && toolPayloads.length > 0
+      ? toolPayloads.map(toWireTool)
       : undefined;
 
   let agent: CatalogAgentConfig | InlineAgentConfig | undefined;
@@ -605,14 +843,21 @@ export function buildAgentSessionConfig(
     // split keeps stored config out at the type level — guard here so a
     // derived or hand-built config with stored fields fails before it
     // touches the wire.
+    // Server hooks are refused as a hook problem, the same way Python's
+    // resolve_hooks refuses them, so one catch covers hook registration
+    // whichever guard rejects it.
+    if ((options.serverHooks ?? []).length > 0) {
+      throw new HookError({
+        code: 'server_hook_not_allowed',
+        message: 'a catalog agent runs its stored config verbatim — server hooks cannot ride along',
+      });
+    }
     const offending = [
       ['instructions', config.instructions],
       ['model', config.model],
-      ['modelOptions', config.modelOptions],
       ['interruptionSensitivity', config.interruptionSensitivity],
       ['greeting', config.greeting],
       ['audio', config.audio],
-      ['hooks (server)', (opts.serverHooks ?? []).length > 0 ? opts.serverHooks : undefined],
     ]
       .filter(([, value]) => value !== undefined)
       .map(([key]) => key);
@@ -634,14 +879,10 @@ export function buildAgentSessionConfig(
   } else {
     const fields = prune({
       instructions: config.instructions,
-      model: config.model,
-      model_options:
-        config.modelOptions !== undefined
-          ? toWireModelOptions(config.modelOptions)
-          : undefined,
+      model: config.model !== undefined ? toWireModel(config.model) : undefined,
       voice: toWireVoice(config.voice),
       interruption_sensitivity: config.interruptionSensitivity,
-      hooks: (opts.serverHooks ?? []).length > 0 ? opts.serverHooks : undefined,
+      hooks: (options.serverHooks ?? []).length > 0 ? options.serverHooks : undefined,
       tools: wireTools,
       greeting: config.greeting,
       audio: toWireAudio(config.audio),
@@ -650,13 +891,13 @@ export function buildAgentSessionConfig(
   }
 
   const session: SessionParams = {
-    store_recording: opts.storeRecording,
-    store_audio: opts.storeAudio,
-    store_transcript: opts.storeTranscript,
-    store_video: opts.storeVideo,
+    store_recording: options.storeRecording,
+    store_audio: options.storeAudio,
+    store_transcript: options.storeTranscript,
+    store_video: options.storeVideo,
     experimental:
-      opts.resumeSessionId !== undefined
-        ? { resume_session_id: opts.resumeSessionId }
+      options.resumeSessionId !== undefined
+        ? { resume_session_id: options.resumeSessionId }
         : undefined,
   };
 
@@ -668,10 +909,63 @@ export function buildAgentSessionConfig(
   };
 }
 
+/**
+ * A configured persona, ready to open sessions from.
+ *
+ * ```ts
+ * const agent = client.agent({ instructions: 'Be brief.', tools: [...] });
+ * const session = await agent.start();
+ * ```
+ *
+ * Built by ``client.agent()`` (an inline persona) or
+ * ``client.catalogAgent()`` (one stored in the workspace). The instance is
+ * frozen at construction, so its fields cannot be reassigned, and its
+ * configuration reads back off it (``agent.instructions``, ``agent.voice``,
+ * …). The freeze is shallow: values you passed in are held by reference,
+ * not copied, so mutating an array or object you handed to ``agent()``
+ * still changes what later starts send.
+ *
+ * Reusable: call ``start()`` as many times as you like, concurrently if you
+ * want, and each call returns its own independent ``RealtimeSession``. Use
+ * ``prepareSession()`` instead when you know a session is coming and want it
+ * to start faster.
+ */
 export class RealtimeAgent {
   private readonly client: RealtimeClient;
-  /** Resolved persona (client defaults already applied). Frozen. */
-  readonly config: Readonly<ResolvedAgentConfig>;
+  /** The resolved persona, kept whole for the fold at ``start()``. The
+   *  fields below are the caller's view of it. */
+  private readonly resolved: Readonly<ResolvedAgentConfig>;
+
+  /** Catalog handle this agent was built from, if any. */
+  readonly name?: string;
+  /** Values bound into the catalog agent's stored template. */
+  readonly inputs?: Record<string, string>;
+  /** System instructions as given. Unset means the server's default runs —
+   *  this never reads back the server's own text. */
+  readonly instructions?: string;
+  /** What was requested, verbatim: the alias or id string, or the provider
+   *  block. Unset leaves the choice to the server, and this does not tell you
+   *  what it chose — read the session's usage summary for that. */
+  readonly model?: RealtimeModel;
+  /** The voice as given, string id or ``VoiceConfig``. */
+  readonly voice?: string | VoiceConfig;
+  /** Tools as given, in declaration order. This is the configured list,
+   *  not the effective one: when ``skills`` are set, ``start()`` appends the
+   *  load-skill tool, and that addition is not reflected here. */
+  readonly tools?: AgentTool[];
+  /** Barge-in setting as given. */
+  readonly interruptionSensitivity?: InterruptionSensitivity;
+  /** Opening line, if one was set. */
+  readonly greeting?: string;
+  /** Audio pipeline settings as given. */
+  readonly audio?: AudioConfig;
+  /** Skills as given. Names are checked for duplicates when the agent is
+   *  built, but the list is otherwise verbatim — this SDK does no directory
+   *  expansion, so every skill is one you constructed. */
+  readonly skills?: Skill[];
+  /** Hooks as declared, both kinds in one array: ``Hook`` runs in-process
+   *  here, ``ServerHook`` is sent for the server to run. */
+  readonly hooks?: (Hook | ServerHook)[];
 
   /** @internal — construct via ``client.agent()`` / ``client.catalogAgent()``. */
   constructor(client: RealtimeClient, config: ResolvedAgentConfig) {
@@ -681,36 +975,173 @@ export class RealtimeAgent {
     resolveSkills(config.skills);
     resolveHooks(config.hooks);
     this.client = client;
-    this.config = Object.freeze({ ...config });
+    this.resolved = Object.freeze({ ...config });
+    this.name = config.name;
+    this.inputs = config.inputs;
+    this.instructions = config.instructions;
+    this.model = config.model;
+    this.voice = config.voice;
+    this.tools = config.tools;
+    this.interruptionSensitivity = config.interruptionSensitivity;
+    this.greeting = config.greeting;
+    this.audio = config.audio;
+    this.skills = config.skills;
+    this.hooks = config.hooks;
+    // The persona is fixed at creation. `readonly` is compile-time only, so
+    // the freeze is what actually holds it — it used to sit on the config
+    // object these fields replaced.
+    Object.freeze(this);
   }
 
-  /** Open one session from this persona. Resolves once the transport is
-   *  connected (room joined); wait for the ``ready`` event before the
-   *  first send. Rejects on handshake or transport failure — the caller
+  /** Open one session from this persona. Resolves once the session is
+   *  ready — the server's handshake has landed and every session method is
+   *  usable immediately. Rejects on any failure to get there — the caller
    *  never receives a session for a run that failed to start. A server
    *  rejection throws the most specific ``SessionStartError`` subclass
-   *  (``SessionBusyError``, ``SessionEntitlementError``, ``SessionConfigError``,
-   *  ``VersionMismatchError``); a request that never reached the server
-   *  throws ``SessionStartTransportError``. Each start is independent —
-   *  sessions from one client run concurrently. */
-  async start(opts: SessionStartOptions = {}): Promise<RealtimeSession> {
-    const { clientHooks, serverHooks } = resolveHooks(this.config.hooks);
-    const effective = applySkills(this.config);
-    const config = buildAgentSessionConfig(effective, { ...opts, serverHooks });
-    const tools = effective.tools ?? [];
-    return this.client._startSession({
+   *  (``SessionStartError``, ``SessionStartError``, ``SessionStartError``,
+   *  ``SessionStartError``); a request that never reached the server
+   *  throws ``SessionStartError``; a room that closes before
+   *  ready throws ``SessionStartError`` (the server's pre-close error
+   *  frame rides on ``detail``); a ready handshake that never arrives is
+   *  torn down after a bounded wait and throws ``SessionStartError``.
+   *  Each start is independent — sessions from one client run concurrently. */
+  async start(options: SessionStartOptions = {}): Promise<RealtimeSession> {
+    return this.client._startSession(this.startArgs(options));
+  }
+
+  /** Prepare one session ahead of its start, so it starts faster. Reserves
+   *  a room in the background immediately; the returned ``PreparedSession``
+   *  joins it while the session request is still in flight when you call
+   *  ``prepared.start()``, instead of waiting for a room to be allocated.
+   *  Prepare as early as the app knows a session is coming — while the rest
+   *  of its setup runs — and start when the user is ready. ``options`` are
+   *  the same per-run options ``start()`` takes; they are fixed here, and
+   *  the start takes none.
+   *
+   *  Purely an accelerator: a reservation that failed, lapsed, or is
+   *  declined by the server leaves the start on the ordinary path, with the
+   *  same result as ``start()``. Throws when this client's sessions do not
+   *  run in rooms (the ``websocket`` transport, or a custom
+   *  ``transportFactory``). */
+  prepareSession(options: SessionStartOptions = {}): PreparedSession {
+    if (!this.client._canPrepareRooms) {
+      throw new Error(
+        'prepareSession needs the default webrtc transport; other lanes have no rooms to prepare',
+      );
+    }
+    return new PreparedSession(this.client, this.startArgs(options));
+  }
+
+  private startArgs(options: SessionStartOptions): StartSessionArgs {
+    const { clientHooks, serverHooks } = resolveHooks(this.hooks);
+    const effective = applySkills(this.resolved);
+    const config = buildAgentSessionConfig(effective, { ...options, serverHooks });
+    const tools = (effective.tools ?? []).map(agentToolPayload);
+    return {
       config,
-      publishMicrophone: opts.publishMicrophone ?? true,
-      onStateChange: opts.onStateChange,
-      onSession: opts.onSession,
+      publishMicrophone: options.publishMicrophone ?? true,
+      onStateChange: options.onStateChange,
+      onSession: options.onSession,
       clientTools: tools.filter(
-        (tool): tool is ClientToolSpec | BackgroundClientToolSpec =>
+        (tool): tool is ClientTool | BackgroundClientTool =>
           tool.kind === 'client',
       ),
       screenLocate: tools.find(
         (tool): tool is ScreenLocateTool => tool.kind === 'screen_locate',
       ),
       hooks: clientHooks.length > 0 ? new HookEngine(clientHooks) : undefined,
-    });
+    };
+  }
+}
+
+/** Everything one start needs, folded from the persona and the per-run
+ *  options. Built once by ``RealtimeAgent``, so a prepared session can hold
+ *  it until it is started. @internal */
+type StartSessionArgs = Parameters<RealtimeClient['_startSession']>[0];
+
+// The server's prepared join token and room both live 30 minutes; a room
+// older than this is presumed lapsed and dropped rather than risking a join
+// against a reclaimed room. Matches the Python and Swift guards. A held
+// reservation is renewed a minute before that, so the replacement lands
+// while the old room is still good.
+const PREPARED_ROOM_MAX_AGE_MS = 26 * 60 * 1000;
+const PREPARED_ROOM_REFRESH_MS = PREPARED_ROOM_MAX_AGE_MS - 60 * 1000;
+
+/** One session prepared ahead of its start, from
+ *  ``agent.prepareSession()``: a room reserved in the background that
+ *  ``start()`` joins while the session request is still in flight.
+ *
+ *  The reservation is refreshed in the background until the handle is
+ *  started or closed, so one held for hours stays warm. ``start()`` is
+ *  single-use — prepare another session for another start — and a handle
+ *  that will never be started should be ``close()``d so the refresh stops. */
+export class PreparedSession {
+  readonly #client: RealtimeClient;
+  readonly #args: StartSessionArgs;
+  #room: PreparedRoomRef | null = null;
+  #inflight: Promise<PreparedRoomRef | null>;
+  #refresh: ReturnType<typeof setTimeout> | null = null;
+  #consumed = false;
+
+  /** @internal — construct via ``agent.prepareSession()``. */
+  constructor(client: RealtimeClient, args: StartSessionArgs) {
+    this.#client = client;
+    this.#args = args;
+    this.#inflight = this.#reserve();
+  }
+
+  /** Land a reservation, then schedule its renewal before the room lapses;
+   *  one the server declines ends the refresh and the start runs
+   *  ordinarily. */
+  async #reserve(): Promise<PreparedRoomRef | null> {
+    const room = await this.#client._prepareRoom();
+    if (room === null || this.#consumed) return room;
+    this.#room = room;
+    const timer = setTimeout(() => {
+      this.#inflight = this.#reserve();
+    }, PREPARED_ROOM_REFRESH_MS);
+    // A held reservation must not keep a Node process alive on its own.
+    if (typeof timer === 'object' && 'unref' in timer) timer.unref();
+    this.#refresh = timer;
+    return room;
+  }
+
+  /** Start the prepared session. Resolves and rejects exactly as
+   *  ``agent.start()`` does; throws on a second call — the handle is
+   *  single-use. */
+  async start(): Promise<RealtimeSession> {
+    if (this.#consumed) {
+      throw new Error('PreparedSession.start is single-use — prepare another session.');
+    }
+    this.#consumed = true;
+    this.#stopRefresh();
+    const connectStartedAt = performance.now();
+    // A reservation still in flight is worth the wait: the room it is about
+    // to produce still takes the join off the critical path.
+    const room = (await this.#inflight) ?? this.#room;
+    this.#room = null;
+    let prepared: PreparedRoomRef | undefined;
+    if (room !== null) {
+      if (Date.now() - room.preparedAt > PREPARED_ROOM_MAX_AGE_MS) {
+        log.debug('[realtime] reserved room lapsed — starting unprepared');
+      } else {
+        prepared = room;
+      }
+    }
+    return this.#client._startSession({ ...this.#args, prepared, connectStartedAt });
+  }
+
+  /** Drop the reservation and stop refreshing it. A no-op once started. */
+  close(): void {
+    this.#consumed = true;
+    this.#stopRefresh();
+    this.#room = null;
+  }
+
+  #stopRefresh(): void {
+    if (this.#refresh !== null) {
+      clearTimeout(this.#refresh);
+      this.#refresh = null;
+    }
   }
 }

@@ -7,6 +7,11 @@
  *
  *     import { setLogLevel } from 'cosmo-ai';
  *     setLogLevel('debug');   // or 'silent' for nothing at all
+ *
+ * Outside the browser the starting level also comes from `COSMO_LOG_LEVEL`,
+ * so a developer can turn the SDK verbose without editing their app:
+ *
+ *     COSMO_LOG_LEVEL=debug node ./agent.js
  */
 
 export type LogLevel = 'silent' | 'error' | 'warn' | 'info' | 'debug';
@@ -19,13 +24,34 @@ const RANK: Record<LogLevel, number> = {
   debug: 4,
 };
 
-let current: LogLevel = 'warn';
+const DEFAULT_LEVEL: LogLevel = 'warn';
 
-/** Set how much the SDK logs. Applies to every SDK logger immediately. */
+/** The environment's requested level, or null when it asked for nothing.
+ *
+ * An unrecognized value is ignored rather than fatal: a typo in a debugging
+ * env var must not stop the app from starting. `process` is absent in a
+ * browser bundle, where an env var has no meaning anyway.
+ */
+function levelFromEnvironment(): LogLevel | null {
+  const raw =
+    typeof process !== 'undefined'
+      ? process.env?.COSMO_LOG_LEVEL?.trim().toLowerCase()
+      : undefined;
+  return raw && raw in RANK ? (raw as LogLevel) : null;
+}
+
+let current: LogLevel = levelFromEnvironment() ?? DEFAULT_LEVEL;
+
+/** Set how much the SDK logs. Applies to every SDK logger immediately.
+ *
+ * An explicit call outranks `COSMO_LOG_LEVEL` — the app's own decision is
+ * the later, more specific one.
+ */
 export function setLogLevel(level: LogLevel): void {
   current = level;
 }
 
+/** The level the SDK is logging at right now. */
 export function getLogLevel(): LogLevel {
   return current;
 }

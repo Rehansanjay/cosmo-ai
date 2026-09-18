@@ -7,7 +7,7 @@ Two deliberately different policies live here:
 * **Strict builder pipeline** (``build_tool_parameters`` /
   ``emit_model_schema``) for authored tools (`cosmo_ai.tools`):
   inline refs, silently drop only what doesn't change what the model should
-  produce, and raise :class:`ToolSchemaError` at construction for anything
+  produce, and raise :class:`ToolDefinitionError` at construction for anything
   the dialect cannot express — otherwise the model would keep producing args
   that bounce at runtime.
 * **Permissive sanitizer** (``sanitize_schema_permissive``) for the MCP
@@ -28,7 +28,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from cosmo_ai.errors import ToolSchemaError
+from cosmo_ai.errors import ToolDefinitionError, ToolDefinitionErrorCode
 
 SCHEMA_ALLOWED_KEYS = frozenset(
     {
@@ -183,13 +183,13 @@ def _inline_refs(schema: dict[str, Any], *, tool_name: str) -> dict[str, Any]:
             del out["$ref"]
             def_name = ref.removeprefix("#/$defs/")
             if def_name == ref or def_name not in defs:
-                raise ToolSchemaError(
-                    code="forbidden_key",
+                raise ToolDefinitionError(
+                    code=ToolDefinitionErrorCode.FORBIDDEN_KEY,
                     message=f"{tool_name}: unresolvable $ref {ref!r}",
                 )
             if def_name in stack:
-                raise ToolSchemaError(
-                    code="recursive_schema",
+                raise ToolDefinitionError(
+                    code=ToolDefinitionErrorCode.RECURSIVE_SCHEMA,
                     message=(
                         f"{tool_name}: recursive model {def_name!r} cannot be "
                         f"expressed in the tool-schema dialect; {_ESCAPE_HATCH_HINT}"
@@ -229,8 +229,8 @@ def _normalize_node(node: Any, *, tool_name: str) -> Any:
                 if value is False
                 else "schema-valued 'additionalProperties' (a map type)"
             )
-            raise ToolSchemaError(
-                code="additional_properties_forbidden",
+            raise ToolDefinitionError(
+                code=ToolDefinitionErrorCode.ADDITIONAL_PROPERTIES_FORBIDDEN,
                 message=(
                     f"{tool_name}: {detail} cannot be expressed in the "
                     f"tool-schema dialect; use default extra-key handling, "
@@ -260,21 +260,21 @@ def _check_node(
     node: Any, *, depth: int, counts: dict[str, int], tool_name: str
 ) -> None:
     """Dialect gate, mirroring the backend's ``_schema_violation``. Raises
-    :class:`ToolSchemaError` with a stable ``code`` on the first violation."""
+    :class:`ToolDefinitionError` with a stable ``code`` on the first violation."""
     if depth > _SCHEMA_MAX_DEPTH:
-        raise ToolSchemaError(
-            code="max_depth_exceeded",
+        raise ToolDefinitionError(
+            code=ToolDefinitionErrorCode.MAX_DEPTH_EXCEEDED,
             message=f"{tool_name}: schema nesting exceeds depth {_SCHEMA_MAX_DEPTH}",
         )
     if not isinstance(node, dict):
-        raise ToolSchemaError(
-            code="node_not_object",
+        raise ToolDefinitionError(
+            code=ToolDefinitionErrorCode.NODE_NOT_OBJECT,
             message=f"{tool_name}: schema node is not an object",
         )
     for key, value in node.items():
         if key not in SCHEMA_ALLOWED_KEYS:
-            raise ToolSchemaError(
-                code="forbidden_key",
+            raise ToolDefinitionError(
+                code=ToolDefinitionErrorCode.FORBIDDEN_KEY,
                 message=(
                     f"{tool_name}: schema key {key!r} is not in the restricted "
                     f"tool-schema dialect; {_ESCAPE_HATCH_HINT}"
@@ -282,48 +282,48 @@ def _check_node(
             )
         if key == "type":
             if value not in _SCHEMA_ALLOWED_TYPES:
-                raise ToolSchemaError(
-                    code="forbidden_type",
+                raise ToolDefinitionError(
+                    code=ToolDefinitionErrorCode.FORBIDDEN_TYPE,
                     message=f"{tool_name}: schema type {value!r} is not allowed",
                 )
         elif key == "description":
             if not isinstance(value, str):
-                raise ToolSchemaError(
-                    code="invalid_text",
+                raise ToolDefinitionError(
+                    code=ToolDefinitionErrorCode.INVALID_TEXT,
                     message=f"{tool_name}: schema description is not a string",
                 )
             reason = text_violation(value, allow_newlines=True)
             if reason is not None:
-                raise ToolSchemaError(
-                    code="invalid_text",
+                raise ToolDefinitionError(
+                    code=ToolDefinitionErrorCode.INVALID_TEXT,
                     message=f"{tool_name}: schema description {reason}",
                 )
         elif key == "required":
             if not isinstance(value, list) or not all(
                 isinstance(item, str) for item in value
             ):
-                raise ToolSchemaError(
-                    code="invalid_required",
+                raise ToolDefinitionError(
+                    code=ToolDefinitionErrorCode.INVALID_REQUIRED,
                     message=f"{tool_name}: schema 'required' is not a list of strings",
                 )
         elif key == "enum":
             if not isinstance(value, list) or not all(
                 isinstance(item, (str, int, float, bool)) for item in value
             ):
-                raise ToolSchemaError(
-                    code="invalid_enum",
+                raise ToolDefinitionError(
+                    code=ToolDefinitionErrorCode.INVALID_ENUM,
                     message=f"{tool_name}: schema 'enum' is not a list of scalars",
                 )
         elif key == "properties":
             if not isinstance(value, dict):
-                raise ToolSchemaError(
-                    code="invalid_properties",
+                raise ToolDefinitionError(
+                    code=ToolDefinitionErrorCode.INVALID_PROPERTIES,
                     message=f"{tool_name}: schema 'properties' is not an object",
                 )
             counts["properties"] += len(value)
             if counts["properties"] > _SCHEMA_MAX_PROPERTIES:
-                raise ToolSchemaError(
-                    code="max_properties_exceeded",
+                raise ToolDefinitionError(
+                    code=ToolDefinitionErrorCode.MAX_PROPERTIES_EXCEEDED,
                     message=(
                         f"{tool_name}: schema exceeds "
                         f"{_SCHEMA_MAX_PROPERTIES} properties"
@@ -333,8 +333,8 @@ def _check_node(
                 if not isinstance(prop_name, str) or text_violation(
                     prop_name, allow_newlines=False
                 ):
-                    raise ToolSchemaError(
-                        code="invalid_text",
+                    raise ToolDefinitionError(
+                        code=ToolDefinitionErrorCode.INVALID_TEXT,
                         message=(
                             f"{tool_name}: schema property name is not a clean string"
                         ),
@@ -346,8 +346,8 @@ def _check_node(
             _check_node(value, depth=depth + 1, counts=counts, tool_name=tool_name)
         elif key == "anyOf":
             if not isinstance(value, list):
-                raise ToolSchemaError(
-                    code="invalid_any_of",
+                raise ToolDefinitionError(
+                    code=ToolDefinitionErrorCode.INVALID_ANY_OF,
                     message=f"{tool_name}: schema 'anyOf' is not a list",
                 )
             for variant in value:
@@ -356,29 +356,29 @@ def _check_node(
             if isinstance(value, str):
                 reason = text_violation(value, allow_newlines=False)
                 if reason is not None:
-                    raise ToolSchemaError(
-                        code="invalid_text",
+                    raise ToolDefinitionError(
+                        code=ToolDefinitionErrorCode.INVALID_TEXT,
                         message=f"{tool_name}: schema default {reason}",
                     )
             elif not isinstance(value, (int, float, bool, type(None))):
-                raise ToolSchemaError(
-                    code="invalid_default",
+                raise ToolDefinitionError(
+                    code=ToolDefinitionErrorCode.INVALID_DEFAULT,
                     message=f"{tool_name}: schema 'default' must be a scalar",
                 )
         elif key in _SCHEMA_NUMERIC_KEYS:
             if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ToolSchemaError(
-                    code="invalid_bound",
+                raise ToolDefinitionError(
+                    code=ToolDefinitionErrorCode.INVALID_BOUND,
                     message=f"{tool_name}: schema {key!r} is not a number",
                 )
 
 
 def check_schema_dialect(schema: Any, *, tool_name: str) -> None:
-    """Raise :class:`ToolSchemaError` unless ``schema`` is a top-level object
+    """Raise :class:`ToolDefinitionError` unless ``schema`` is a top-level object
     schema entirely within the restricted dialect."""
     if not isinstance(schema, dict) or schema.get("type") != "object":
-        raise ToolSchemaError(
-            code="top_level_not_object",
+        raise ToolDefinitionError(
+            code=ToolDefinitionErrorCode.TOP_LEVEL_NOT_OBJECT,
             message=f"{tool_name}: parameters must declare top-level type 'object'",
         )
     _check_node(schema, depth=1, counts={"properties": 0}, tool_name=tool_name)

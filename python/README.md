@@ -18,10 +18,7 @@ pip install cosmo-ai-sdk
 
 > **Beta.** The SDK is pre-1.0: minor releases may include breaking API
 > changes, called out in the
-> [changelog](https://platform.askcosmo.ai/docs/meta/changelog). We will tag 1.0 once the session
-> event stream, tool authoring, and credential APIs have gone a full release
-> cycle without breaking changes. Pin a minor version (e.g.
-> `cosmo-ai-sdk~=0.5.0`) if you need stability.
+> [changelog](https://platform.askcosmo.ai/docs/meta/changelog).
 
 Requires Python 3.10+. One install covers everything: the media transport
 (`livekit>=1.1.12`), microphone capture via `set_microphone_enabled`, and
@@ -37,21 +34,23 @@ usable input device. Servers that never touch OS audio don't need it.
 
 ---
 
-## Teach your agent
+## Teach your agent first
 
-One [Agent Skill](https://agentskills.io) covers the whole Cosmo SDK
-family (TypeScript, Python, Swift): the current SDK API, the credential
-and login rules, and the production token flow. It teaches coding agents
-(Claude Code, Cursor, Codex CLI, Gemini CLI, …) — install it once per
-machine or project:
+If a coding agent is writing this code, install the Agent Skill before the
+quickstart:
 
 ```bash
 npx skills add socratic-ai/cosmo-ai
 ```
 
+One [Agent Skill](https://agentskills.io) covers the whole Cosmo SDK family
+(TypeScript, Python, Swift): the current SDK API, the credential and login
+rules, and the production token flow. It works with Claude Code, Cursor,
+Codex CLI, Gemini CLI, and anything else that reads the skills format.
+
 Agents can also read the docs directly:
-https://platform.askcosmo.ai/docs (`/llms.txt`, `/llms-full.txt`, and an
-MCP endpoint at `/docs/api/mcp`).
+https://platform.askcosmo.ai/docs (`/docs/llms.txt`, `/docs/llms-full.txt`, and
+an MCP endpoint at `/docs/api/mcp`).
 
 ## Quickstart
 
@@ -87,8 +86,10 @@ async def main() -> None:
             match event:
                 case ReadyEvent():
                     print(f"ready — session {event.session_id}")
-                case TranscriptDeltaEvent(is_final=True):
-                    # Compare against the enum, not a bare string.
+                case TranscriptDeltaEvent(is_final=True) if event.text:
+                    # A console is append-only: print each completed turn
+                    # once, off the raw delta stream. A UI renders the
+                    # session-owned ``session.transcript`` wholesale instead.
                     who = "agent" if event.role is TranscriptRole.ASSISTANT else "you"
                     print(f"[{who}] {event.text}")
                 case UsageEvent():
@@ -129,9 +130,9 @@ Construct the client with at most one credential:
   `COSMO_PROFILE`). The `cosmo` CLI installs with `pipx install cosmo-cli`.
   A stored credential brings along the `base_url` it was
   issued for; a `COSMO_BASE_URL` naming a different backend is refused
-  rather than obeyed. Raises `CredentialsError`
-  (`CredentialsNotFoundError` / `CredentialsFileError` /
-  `CredentialsExpiredError`) when nothing usable resolves.
+  rather than obeyed. Raises `CredentialsError` when
+  nothing usable resolves; `.code` names which (`NO_CREDENTIAL`,
+  `PROFILE_NOT_FOUND`, `FILE_INVALID`, `EXPIRED`, `BASE_URL_MISMATCH`).
 
 For multi-user apps, mint on your backend and connect on the client:
 
@@ -167,8 +168,8 @@ no charge. Use it as a startup check or a CI smoke test:
 ```python
 info = await client.verify()          # raises VerifyError if the credential is bad
 info.workspace                        # which workspace (and so which environment)
-info.scopes                           # e.g. ["realtime:use"]
-info.can_start_sessions               # False -> valid credential, missing realtime:use
+info.scopes                           # e.g. ["realtime:start"]
+info.can_start_sessions               # False -> valid credential, missing realtime:start
 info.realtime_voice_available         # False -> no default voice stack configured here
 ```
 
@@ -210,6 +211,13 @@ are lowercase (`"user"` / `"assistant"`). The wire spells them uppercase and
 decoding accepts either casing, so compare against the enum member rather than
 a string literal.
 
+The session also folds the transcript for you: `session.transcript` is the
+coalesced conversation so far — one `TranscriptItem` per turn (`id`, `role`,
+`text`, `is_final`) — and a `TranscriptUpdatedEvent` carrying the complete
+updated list is yielded after every change. The value survives `end()`, so
+the whole conversation stays readable after the run. The raw
+`TranscriptDeltaEvent` stream remains available underneath.
+
 `UsageEvent` (`cosmo.usage`) carries **cumulative** token counts for the
 session, split by direction and modality — each event supersedes the last. A
 provider that reports no usage emits none, so absence is not zero.
@@ -245,14 +253,25 @@ logging.getLogger("cosmo_ai").setLevel(logging.DEBUG)
 Records carry structured key/value context (the SDK uses `structlog`), and an
 app that configures `structlog` gets them rendered in its own format.
 
+To turn it on without touching the app, set `COSMO_LOG_LEVEL` to `silent`,
+`error`, `warn`, `info`, or `debug`:
+
+```bash
+COSMO_LOG_LEVEL=debug python agent.py
+```
+
+That attaches a stderr handler to the namespace at that level and stops the
+SDK's records propagating to the root logger, so its output is one copy in one
+format. At `debug` each session also reports its connect-latency breakdown.
+
 ## Public API
 
 ### `RealtimeClient`
 
 | Member | Description |
 |---|---|
-| `RealtimeClient(api_key=... \| token=..., http_client=None)` | Construct with at most one credential — with neither, the SDK resolves `COSMO_API_KEY`, then the `cosmo login` credentials file (see [Credentials](#credentials--end-user-tokens)). The base URL defaults to `https://platform.askcosmo.ai`; override it with the `COSMO_BASE_URL` environment variable for local development. `http_client` injects your own `httpx.AsyncClient` (custom CA/TLS, proxies, mTLS, transport) — the SDK uses but never closes it. Reuse across sessions; close the owned client with `aclose()` / `async with` |
-| `agent(*, instructions=None, model=None, model_options=None, voice=None, tools=None, interruption_sensitivity=None, greeting=None, audio=None, mcp=None, skills=None, hooks=None)` | Build a reusable inline `RealtimeAgent` — the persona (see [`RealtimeAgent`](#realtimeagent)), including its opening `greeting` and its `audio` pipeline (`AudioConfig`: `output`, `noise_cancellation`, `ambience`). `voice` is the voice id as a plain string, or a `VoiceConfig(name=..., speaking_style=...)`. `tools` is a list of `ClientTool` / typed server opt-ins (`WebSearchTool`, `ExamineImageTool`, `DetectObjectsTool`, `PointAtObjectTool`, `EndCallTool`); `mcp` / `skills` / `hooks` attach the concepts described in their sections below. Fields left `None` fall back to the server default — `audio.noise_cancellation` among them, which is off, so the agent hears the raw microphone signal. Pass `AudioConfig(noise_cancellation=True)` when the microphone will hear more than one voice; the isolated signal is also what turn-taking reads, so measure endpointing on your own audio before leaving it on |
+| `RealtimeClient(api_key=... \| token=..., transport=None, http_client=None)` | Construct with at most one credential — with neither, the SDK resolves `COSMO_API_KEY`, then the `cosmo login` credentials file (see [Credentials](#credentials--end-user-tokens)). The base URL defaults to `https://platform.askcosmo.ai`; override it with the `COSMO_BASE_URL` environment variable for local development. `transport` picks how media travels: `"webrtc"` (the default) or `"websocket"`, which carries the session over a single socket and needs `cosmo-ai-sdk[websocket]`; `"livekit"` remains a deprecated alias of `"webrtc"`. The `COSMO_TRANSPORT` environment variable sets it when the argument is omitted. It runs only against an OSS `cosmo-server` on your own machine, which is a local development server; managed Cosmo does not serve the websocket route. `http_client` injects your own `httpx.AsyncClient` (custom CA/TLS, proxies, mTLS, transport) — the SDK uses but never closes it. Reuse across sessions; close the owned client with `aclose()` / `async with` |
+| `agent(*, instructions=None, model=None, voice=None, tools=None, interruption_sensitivity=None, greeting=None, audio=None, mcp=None, skills=None, hooks=None)` | Build a reusable inline `RealtimeAgent` — the persona (see [`RealtimeAgent`](#realtimeagent)), including its opening `greeting` and its `audio` pipeline (`AudioConfig`: `output`, `noise_cancellation`). `model` is a provider family alias or concrete model id as a plain string (`"gemini"`), or a provider block carrying that provider's knobs and an optional concrete `model_id` (`GeminiModel(model_id="gemini-live", temperature=0.7)`, `OpenAIModel`, `OpenAIMiniModel`, `GrokModel`). `voice` is the voice id as a plain string, or a `VoiceConfig(name=..., speaking_style=...)`. `tools` is a list of `client_tool(...)` / typed server opt-ins (`web_search_tool()`, `examine_image_tool()`, `detect_objects_tool()`, `point_at_object_tool()`, `end_call_tool()`); `mcp` / `skills` / `hooks` attach the concepts described in their sections below. Fields left `None` fall back to the server default — `audio.noise_cancellation` among them, which is off, so the agent hears the raw microphone signal. Pass `AudioConfig(noise_cancellation=NoiseCancellation.DENOISE)` when several people share the microphone, or `NoiseCancellation.VOICE_FOCUS` when one speaker should be isolated from the rest of the room; the filtered signal is also what turn-taking reads, so measure endpointing on your own audio before leaving it on. Both modes apply to managed WebRTC sessions; a phone leg (`session.dial(...)` or an inbound call) gets a lighter noise suppressor whatever the mode, which removes background noise but does not single out competing voices. There is no language parameter anywhere on this surface — the native-audio models these sessions run on pick their working language from the audio, and no provider setting pins it; write the rule into `instructions` instead (managed sessions add default language-stability guidance that defers to instruction-level rules — steering, not a guarantee) |
 | `catalog_agent(name, *, inputs=None, voice=None, tools=None, mcp=None, hooks=None)` | Build an `RealtimeAgent` that runs a workspace catalog agent by machine handle; the stored config runs verbatim. `inputs` fills the agent's declared input fields; `voice` (string or `VoiceConfig`) overrides the stored voice for this run only; `tools` / `mcp` add client-executed declarations. There are no other persona parameters — sending stored config with a catalog launch is a type error |
 | `mint_token(external_user_id)` | Mint a short-lived end-user JWT (`-> MintedToken{jwt, expires_at}`). Requires an `api_key` credential; raises `MintTokenError` otherwise |
 | `verify()` | Check the credential without starting a session (`-> CredentialInfo`). Free — see [Verifying a credential](#verifying-a-credential). Raises `VerifyError` if the credential is rejected |
@@ -265,14 +284,15 @@ sessions.
 
 | Member | Description |
 |---|---|
-| `start(*, resume_session_id=None, store_recording=None, on_state_change=None)` | Open a session: POST `session/start` (a `session-config` payload) + LiveKit join. These are the per-run, transport-level options (resume, recording opt-out, lifecycle observer); persona fields — including `greeting` and the `audio` pipeline — ride unchanged from the agent (build another agent to change them). Returns a `SessionHandle` that is an **async context manager** (`async with agent.start() as session:` — ends the session on exit) and is also awaitable (`session = await agent.start()` if you own the lifecycle). Raises `VersionMismatchError` when the server refuses the protocol version, `SessionStartError` for any other rejection |
+| `start(*, resume_session_id=None, store_recording=None, on_state_change=None)` | Open a session: POST `session/start` (a `session-config` payload) + LiveKit join. These are the per-run, transport-level options (resume, recording opt-out, lifecycle observer); persona fields — including `greeting` and the `audio` pipeline — ride unchanged from the agent (build another agent to change them). Returns a `SessionHandle` that is an **async context manager** (`async with agent.start() as session:` — ends the session on exit) and is also awaitable (`session = await agent.start()` if you own the lifecycle). Raises `SessionStartError` on any failure to reach a live session; its closed `code` names which — `VERSION_MISMATCH` when the server refuses the protocol version |
 
 ### `RealtimeSession`
 
 | Member | Description |
 |---|---|
 | `async for event in session` | The typed event stream (see above) |
-| `send_text(content)` | Send a text turn the agent answers. For a session that never speaks, configure the agent with `audio=AudioConfig(output=False)` |
+| `transcript` | The coalesced conversation so far, one `TranscriptItem` per turn; survives `end()` |
+| `send_text(content, transcript=True)` | Send a text turn the agent answers; the text lands in `session.transcript` as its own closed user turn unless `transcript=False`. For a session that never speaks, configure the agent with `audio=AudioConfig(output=False)` |
 | `send_context(content)` | Give the agent context without asking it anything: no turn, no speech, no transcript entry. For live application state |
 | `set_muted(muted)` | Toggle the server-side mic gate |
 | `ping()` | Heartbeat; server replies with a `PongEvent` event |
@@ -285,7 +305,7 @@ sessions.
 | `set_agent_playback_volume(volume)` | Software gain 0…1 for OS playback (clamped; `0` mutes). Affects only `set_speaker_enabled` output, never `agent_audio()` frames; may be set before the speaker is enabled |
 | `agent_audio()` | Async-iterate the agent's decoded voice as 16-bit mono PCM `AgentAudioFrame`s (`cosmo_ai.audio`) — record it, pipe it to telephony, or feed a custom player. Multiple concurrent iterators each get every frame; a stalled consumer drops its oldest. Finishes when the session ends |
 | `audio_levels()` | Async-iterate `AudioLevels(mic, agent)` (`cosmo_ai.audio`) RMS levels (0…1) at ~20 Hz, latest-value. Iterating activates agent-audio decode; fields read `0.0` while their source is inactive |
-| `start_audio_stream(source)` / `stop_audio_stream()` | Publish a caller-owned `rtc.AudioSource` as the session's voice and keep feeding it frames yourself — for audio the SDK cannot capture itself (synthetic generator, WAV replay, load tests, hosts with no input device). One voice per session: raises `AudioPublishAlreadyActiveError` while the microphone or another stream is publishing |
+| `start_audio_stream(source)` / `stop_audio_stream()` | Publish a caller-owned `PcmAudioSource` as the session's voice and keep feeding it frames yourself through `source.capture_frame(...)` — for audio the SDK cannot capture itself (synthetic generator, WAV replay, load tests, hosts with no input device). A frame is anything carrying `data`, `sample_rate` and `num_channels`, so `livekit.rtc.AudioFrame` works as-is; feed them at the pace they would play. `PcmAudioSource` publishes on either transport, an `rtc.AudioSource` on the room transport only. One voice per session: raises `SessionStateError` (code `AUDIO_PUBLISH_ALREADY_ACTIVE`) while the microphone or another stream is publishing |
 | `dial(phone_number)` | Place an outbound phone call into this session — the callee joins as a SIP participant (see [Outbound calling](#outbound-calling)) |
 | `usage()` | Fetch this session's usage summary over REST (`-> SessionUsage`) — duration, talk time, and token counts — during the session or after it ends. `usage_status` reports whether the detailed summary is there — `PENDING` while it may still land, `RECORDED` once the numbers are final, `UNAVAILABLE` when none was written and none will be; `tokens` is `None` when the provider doesn't report token usage. Raises `UsageError`. `client.get_session_usage(session_id)` is the client-level form |
 | `start_screen_share()` / `push_screen_share_frame(frame)` / `stop_screen_share()` | Screen-share publish |
@@ -303,7 +323,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from cosmo_ai import WebSearchTool, tool
+from cosmo_ai import web_search_tool, tool
 
 
 class WeatherInput(BaseModel):
@@ -318,7 +338,7 @@ async def get_weather(input: WeatherInput) -> dict[str, Any]:
 
 
 agent = client.agent(
-    tools=[get_weather, WebSearchTool()],
+    tools=[get_weather, web_search_tool()],
 )
 async with agent.start() as session:
     async for event in session:
@@ -332,7 +352,7 @@ async with agent.start() as session:
   and description limits, and the emitted schema against the backend's
   restricted JSON-Schema dialect. A model whose schema the server would
   reject (regex `pattern`s, `format`s, recursive models, `extra="forbid"`, …)
-  raises `ToolSchemaError` at import/startup instead of surfacing in
+  raises `ToolDefinitionError` at import/startup instead of surfacing in
   `ReadyEvent.rejected_tools` mid-connect.
 - **Malformed model calls never reach your code.** Arguments are validated
   with `Model.model_validate` first; a failure becomes a sanitized
@@ -345,21 +365,37 @@ async with agent.start() as session:
   `async def fn(input: Model, job: ClientToolJob)` and follows the unchanged
   job contract (`job.ack(...)`, then `job.complete(...)` / `job.fail(...)`).
 
-The decorator lowers to a plain `ClientTool`, which stays public in
-`cosmo_ai.tools` as the advanced escape hatch — hand-write one to
-control the raw JSON Schema yourself (its handler then receives an
-unvalidated `dict`):
+The decorator lowers to a plain client tool. `client_tool(...)` builds the same
+thing without one, for the cases a decorator cannot reach — a closure, a bound
+method, or a tool built in a loop. It takes either form of schema:
 
 ```python
-from cosmo_ai.tools import ClientTool
+from cosmo_ai.tools import client_tool
 
-ClientTool(
+# input=: the typed form, same as the decorator. The handler receives the
+# validated model instance.
+client_tool(
+    name="get_weather",
+    description="Look up the forecast.",
+    input=WeatherInput,
+    handler=fetch_weather,  # async (args: WeatherInput) -> dict
+)
+
+# parameters=: the escape hatch, to control the raw JSON Schema yourself.
+# The handler then receives an unvalidated dict.
+client_tool(
     name="get_local_time",
     description="Returns the local wall-clock time.",
     parameters={"type": "object", "properties": {}, "required": []},
     handler=get_local_time,  # async (args: dict) -> dict
 )
 ```
+
+`background_client_tool(...)` takes the same two forms; its handler
+additionally receives the `ClientToolJob`. Both mirror Swift's
+`AgentTool.clientTool(name:description:input:handler:)` /
+`(…parameters:handler:)` and TypeScript's `clientTool({ input })` /
+`clientTool({ parameters })`.
 
 When the agent invokes a client tool the SDK calls the handler and reports
 the returned dict back as the result; raise to surface a tool error. The
@@ -368,9 +404,9 @@ the wire. Every client tool carries a handler — constructing a spec without
 one is a validation error, since a declared tool the client cannot execute
 would fail on every invocation.
 
-Typed opt-in classes enable built-in server-executed tools — `WebSearchTool`
-(web search), `ExamineImageTool` (full-resolution frame examination),
-`DetectObjectsTool` / `PointAtObjectTool` (object locators), `EndCallTool` (the agent
+Typed opt-in classes enable built-in server-executed tools — `web_search_tool()`
+(web search), `examine_image_tool()` (full-resolution frame examination),
+`detect_objects_tool()` / `point_at_object_tool()` (object locators), `end_call_tool()` (the agent
 hangs up itself). Each is zero-config: the server
 owns the model-facing declaration; you only opt in.
 
@@ -404,8 +440,8 @@ The two publish under different LiveKit sources, which is how the backend
 tells them apart: a camera feed is described to the model as one, and the
 screen tools stay anchored to actual screen shares. **One video publish at a
 time** — a second `add_video_stream`, or a `start_screen_share` while a stream
-is live, raises `VideoPublishAlreadyActiveError` (`from cosmo_ai import
-VideoPublishAlreadyActiveError`).
+is live, raises `SessionStateError` with code `VIDEO_PUBLISH_ALREADY_ACTIVE`
+(`from cosmo_ai import SessionStateError, SessionStateErrorCode`).
 
 `push` is safe to call from whatever thread your capture loop runs on; the
 publish it triggers is handed to the session's event loop.
@@ -418,16 +454,16 @@ frame, so dimensions resolve from the source rather than from the arguments.
 
 ### Drawing on the user's live view
 
-`draw_box` / `draw_point` are the renderer half of the locate-then-draw pair.
-A locator (`DetectObjectsTool` / `PointAtObjectTool`) returns candidate boxes
+`draw_box_tool` / `draw_point_tool` are the renderer half of the locate-then-draw pair.
+A locator (`detect_objects_tool()` / `point_at_object_tool()`) returns candidate boxes
 or points to the model; the model picks the one matching what it is looking at
 and passes it to the renderer, which draws it over the user's live camera or
 screen preview. You supply one function of request → outcome; the SDK owns the
 name, description, schema, decode, and reply shape.
 
 ```python
-from cosmo_ai import DetectObjectsTool
-from cosmo_ai.tools import DrawBoxRequest, DrawOutcome, draw_box
+from cosmo_ai import detect_objects_tool
+from cosmo_ai.tools import DrawBoxRequest, DrawOutcome, draw_box_tool
 
 
 def on_draw(request: DrawBoxRequest) -> DrawOutcome:   # sync or async
@@ -440,7 +476,7 @@ def on_draw(request: DrawBoxRequest) -> DrawOutcome:   # sync or async
     return DrawOutcome(shown=True)
 
 
-agent = client.agent(tools=[DetectObjectsTool(), draw_box(on_draw)])
+agent = client.agent(tools=[detect_objects_tool(), draw_box_tool(on_draw)])
 ```
 
 - **Coordinates are normalized** to the frame the model was shown — `[0,1]`,
@@ -453,18 +489,18 @@ agent = client.agent(tools=[DetectObjectsTool(), draw_box(on_draw)])
   says out loud, not an error code — a box reported as shown but invisible
   leaves the model talking about something the user cannot see.
 
-`draw_point` follows the same contract with a `DrawPointRequest`. The two exist
+`draw_point_tool` follows the same contract with a `DrawPointRequest`. The two exist
 side by side because they answer different questions: a box around a leaf
 includes everything behind it, where a marked point says one thing.
 
 ### Locating on the shared screen
 
-`screen_locate` turns on the server-side screen locator, and
-`screen_click_element` / `screen_highlight_element` act on what it finds. The
+`screen_locate_tool` turns on the server-side screen locator, and
+`screen_click_element_tool` / `screen_highlight_element_tool` act on what it finds. The
 locator resolves a natural-language description ("the Save button") to a specific
 on-screen control and hands the model a `found_element` handle; the model passes
 that handle back to a renderer, which resolves it to the element it addresses.
-Unlike `DetectObjectsTool`, the locator needs a screen to look at, so declaring
+Unlike `detect_objects_tool()`, the locator needs a screen to look at, so declaring
 it means supplying a `capture` handler:
 
 ```python
@@ -473,8 +509,8 @@ from cosmo_ai.tools import (
     ScreenClickOutcome,
     ScreenClickTarget,
     ScreenElement,
-    screen_click_element,
-    screen_locate,
+    screen_click_element_tool,
+    screen_locate_tool,
 )
 
 
@@ -496,10 +532,10 @@ def on_click(target: ScreenClickTarget) -> ScreenClickOutcome:   # sync or async
     return ScreenClickOutcome(clicked=True)
 
 
-agent = client.agent(tools=[screen_locate(grab), screen_click_element(on_click)])
+agent = client.agent(tools=[screen_locate_tool(grab), screen_click_element_tool(on_click)])
 ```
 
-- **`screen_locate` is never advertised.** The model cannot call it — the
+- **`screen_locate_tool` is never advertised.** The model cannot call it — the
   server's `cosmo_screen_locate` does, and the SDK answers its capture RPC from
   your `capture` handler. It reaches the wire as the bare `{kind:
   "screen_locate"}`; the handler is local-only and stays off the wire. Supplying
@@ -513,15 +549,15 @@ agent = client.agent(tools=[screen_locate(grab), screen_click_element(on_click)]
 - **A stale handle declines, it doesn't act.** A handle the cache can no longer
   resolve returns `clicked=False` with a reason telling the model to locate
   again, rather than clicking a different control.
-- **`screen_click_element` is server-gated.** Clicking acts on the user's
+- **`screen_click_element_tool` is server-gated.** Clicking acts on the user's
   machine, so it sits behind a desktop-control policy that defaults off: a
   session that cannot run it starts without it and echoes the drop on
   `ReadyEvent.rejected_tools` under `cosmo_sdk_screen_click_element`. A dropped
-  renderer is simply never invoked. The locator and `screen_highlight_element`
+  renderer is simply never invoked. The locator and `screen_highlight_element_tool`
   are ungated.
 
-`screen_highlight_element` highlights an element without acting on it (same
-`found_element` contract). `screen_highlight_box` is the default way to point at
+`screen_highlight_element_tool` highlights an element without acting on it (same
+`found_element` contract). `screen_highlight_box_tool` is the default way to point at
 something: the model gives a box as fractions of the surface and your handler
 draws it directly — no capture, no lookup. Both highlights answer in the same
 `ScreenHighlightOutcome(shown=True, exact=...)`, so the model learns whether the
@@ -531,7 +567,7 @@ highlight snapped onto a real control or only its estimate.
 from cosmo_ai.tools import (
     ScreenHighlightBoxRequest,
     ScreenHighlightOutcome,
-    screen_highlight_box,
+    screen_highlight_box_tool,
 )
 
 
@@ -540,7 +576,7 @@ def on_box(request: ScreenHighlightBoxRequest) -> ScreenHighlightOutcome:
     return ScreenHighlightOutcome(shown=True, exact=landed)
 
 
-agent = client.agent(tools=[screen_highlight_box(on_box)])
+agent = client.agent(tools=[screen_highlight_box_tool(on_box)])
 ```
 
 If your app shows the frames it publishes, `box_rect` / `point_position`
@@ -578,15 +614,16 @@ async with agent.start() as session:        # session only — no participants y
 ```
 
 - **Number format** — E.164 (`+` then 8–15 digits); the SDK fast-fails a
-  malformed number with `DialError(code="invalid_phone_number")` before any
+  malformed number with `DialError(code=DialErrorCode.INVALID_REQUEST)` before any
   request.
 - **Enablement** — outbound calling must be enabled for the workspace
-  (`phone_calls_disabled` otherwise); the same `realtime:use` credential that
-  opened the session authorizes the dial.
+  (`phone_calls_disabled` otherwise); the dial itself needs the `realtime:dial`
+  scope on the API key that opened the session.
 - **Limits** — calls count against the workspace's weekly per-user minute limit.
-- **Errors** — server rejections raise `DialError` with the server's slug
-  (`phone_calls_disabled`, `minute_limit_exceeded`, `session_not_live`,
-  `forbidden`, …).
+- **Errors** — server rejections raise `DialError` with
+  `code=DialErrorCode.REQUEST_REJECTED` and the server's own slug on
+  `server_code` (`phone_calls_disabled`, `minute_limit_exceeded`,
+  `session_not_live`, …).
 - **Return** — `DialResult{dial_id}`, a handle to the queued call. The call
   rings asynchronously; watch `session` events for the conversation.
 
@@ -622,12 +659,35 @@ agent = client.agent(
 ```
 
 A missing or malformed config file and duplicate server names raise
-`McpConfigError` when the agent is built, not mid-call. Requires the `mcp`
-extra: `pip install 'cosmo-ai-sdk[mcp]'` (a live connect without it raises
-`McpExtraNotInstalledError`). v1 supports **stdio** servers; remote (`http`/`sse`)
-entries in `.mcp.json` are skipped with a warning so the file stays shareable
-with harnesses that support them. An `McpStdioServer` runs an arbitrary local
-command — trust your config.
+`McpError` when the agent is built, not mid-call; a connection or tool failure
+raises the same type mid-call. `code` names which failure it was — match on it
+rather than on the message:
+
+```python
+from cosmo_ai.mcp import McpError, McpErrorCode
+
+try:
+    agent = client.agent(mcp="./mcp.json")
+except McpError as err:
+    if err.code is McpErrorCode.NOT_A_FILE:
+        ...
+```
+
+The codes are `not_a_file`, `cannot_read`, `invalid_json`, `missing_servers`,
+`invalid_server_entry`, `missing_command`, `invalid_args`, `invalid_env`,
+`invalid_cwd`, `duplicate_server_name`, `extra_not_installed`, `connection_failed`,
+`invalid_response`, `server_error` and `tool_error`.
+
+A server that fails to launch, initialize, or list its tools is skipped with a
+warning rather than raised — the session starts without its tools, so one bad
+entry in a shared config doesn't take the call down. Failures reach you once a
+server is connected.
+
+Requires the `mcp` extra: `pip install 'cosmo-ai-sdk[mcp]'` (a live connect
+without it raises `McpError` coded `extra_not_installed`). v1 supports
+**stdio** servers; remote (`http`/`sse`) entries in `.mcp.json` are skipped
+with a warning so the file stays shareable with harnesses that support them.
+An `McpStdioServer` runs an arbitrary local command — trust your config.
 
 ---
 
@@ -679,13 +739,13 @@ See `hooks_agent.py` in the [examples repo](https://github.com/socratic-ai/cosmo
 | Module | Contents |
 |---|---|
 | `cosmo_ai.client` | `RealtimeClient`, `SessionHandle` (the return of `RealtimeAgent.start`; both re-exported at the root) |
-| `cosmo_ai.session` | `RealtimeSession`, `RealtimeSessionState`, `DisconnectReason` |
+| `cosmo_ai.session` | `RealtimeSession`, `SessionState`, `DisconnectReason` |
 | `cosmo_ai.audio` | `AgentAudioFrame`, `AudioLevels`, `AGENT_AUDIO_SAMPLE_RATE` — the payload types you consume from `agent_audio()` / `audio_levels()` |
-| `cosmo_ai.tools` | `tool` (also re-exported at the root), the renderer tools the SDK ships — the draw pair (`draw_box`, `draw_point`, `DrawBoxRequest`, `DrawPointRequest`, `DrawOutcome`, `NormalizedBox`, `NormalizedPoint`) and the screen tools (`screen_locate`, `screen_click_element`, `screen_highlight_element`, `screen_highlight_box`, with `ScreenCapture`, `ScreenElement`, `ScreenClickTarget`, `ScreenClickOutcome`, `ScreenHighlightTarget`, `ScreenBox`, `ScreenHighlightBoxRequest`, `ScreenHighlightOutcome`) — plus advanced authoring: `ClientTool`, `BackgroundClientTool`, `ClientToolJob`, `ToolSchemaError`, `ToolInputValidationError` |
-| `cosmo_ai.skills` | `Skill`, `SkillParseError`, `SkillsInput` — the `skills=` argument takes a directory or a `Sequence[Skill]` |
-| `cosmo_ai.mcp` | `McpStdioServer`, `McpConfigError`, `McpExtraNotInstalledError`, `McpInput` — the `mcp=` argument takes a `.mcp.json` path or a list of servers |
+| `cosmo_ai.tools` | `tool` (also re-exported at the root), the renderer tools the SDK ships — the draw pair (`draw_box_tool`, `draw_point_tool`, `DrawBoxRequest`, `DrawPointRequest`, `DrawOutcome`, `NormalizedBox`, `NormalizedPoint`) and the screen tools (`screen_locate_tool`, `screen_click_element_tool`, `screen_highlight_element_tool`, `screen_highlight_box_tool`, with `ScreenCapture`, `ScreenElement`, `ScreenClickTarget`, `ScreenClickOutcome`, `ScreenHighlightTarget`, `ScreenBox`, `ScreenHighlightBoxRequest`, `ScreenHighlightOutcome`) — plus advanced authoring: `ClientTool`, `BackgroundClientTool`, `ClientToolJob`, `ToolDefinitionError`, `ToolInputValidationError` |
+| `cosmo_ai.skills` | `Skill`, `SkillError`, `SkillErrorCode`, `SkillsInput`, `parse_skill_md` — the `skills=` argument takes a directory or a `Sequence[Skill]`; `parse_skill_md` builds a `Skill` from SKILL.md text you already hold |
+| `cosmo_ai.mcp` | `McpStdioServer`, `McpError`, `McpErrorCode`, `McpInput` — the `mcp=` argument takes a `.mcp.json` path or a list of servers |
 | `cosmo_ai.hooks` | the four seam decorators (`@hooks.session_start`, `@hooks.pre_tool_use(matcher=…)`, …), `Hook`, the context/result types, the `ToolOk`/`ToolError`/`ToolDenied` outcomes, and the server hooks (`SilenceTimeout`, `Say`, `EndCall`) |
-| `cosmo_ai.errors` | `RealtimeError` (the base every SDK error extends), `SessionStartError`, `VersionMismatchError`, `MintTokenError`, `VerifyError`, `DialError`, `NotConnectedError`, `VideoPublishAlreadyActiveError`, `ToolSchemaError`, `ToolInputValidationError`, `AudioUnavailableError`, `ExtraNotInstalledError` (the `mcp` extra; see `McpExtraNotInstalledError`) |
+| `cosmo_ai.errors` | `RealtimeError` (the base every SDK error extends), `ApiError` (the base every backend call throws), `SessionStartError`, `SessionStartErrorCode`, `MintTokenError`, `TokenSourceError`, `VerifyError`, `DialError`, `SessionStateError`, `ToolDefinitionError`, `ToolInputValidationError`, `AudioUnavailableError` |
 
 The wire models (internal, `_internal/protocol.py`) are hand-written Pydantic
 mirrors of the published OpenAPI spec and are kept pinned to it, so drift
@@ -736,7 +796,7 @@ Acknowledge they want to activate. Ask web or app, then one step at a time.
 Directory semantics: a directory that itself contains a `SKILL.md` is that one
 skill; otherwise each `<child>/SKILL.md` is a skill. A directory yielding no
 skills logs a warning and attaches none (an empty per-user skills folder is a
-valid state); a missing path or malformed SKILL.md raises `SkillParseError`
+valid state); a missing or unreadable path, or a malformed SKILL.md, raises `SkillError`
 when the agent is built, not mid-call. Unknown frontmatter keys (`tier`,
 `allowed-tools`, `license`, …) are ignored, so files authored for other
 harnesses stay valid.

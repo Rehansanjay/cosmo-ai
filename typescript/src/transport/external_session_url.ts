@@ -7,6 +7,8 @@
  * dependency — these are plain string helpers.
  */
 
+import { CredentialsError } from '../core/auth';
+
 export const EXTERNAL_REALTIME_SESSION_PATH = '/api/v1/external/realtime/session';
 export const EXTERNAL_AUTH_TOKEN_PATH = '/api/v1/external/auth/token';
 export const EXTERNAL_REALTIME_VERIFY_PATH = '/api/v1/external/realtime/verify';
@@ -25,13 +27,26 @@ export function assertSupportedBaseUrl(baseUrl: string): void {
     throw new Error(`baseUrl must be an absolute origin, got ${JSON.stringify(baseUrl)}`);
   }
   if (parsed.protocol !== 'https:' && !LOCAL_HOSTS.has(parsed.hostname)) {
-    throw new Error('baseUrl must use https:// (http is allowed only for localhost)');
+    throw new CredentialsError({
+      code: 'insecure_base_url',
+      message: 'baseUrl must use https:// (http is allowed only for localhost)',
+    });
   }
 }
 
 /** Canonical external session-start URL composed from a ``baseUrl`` origin. */
 export function composeStartUrl(baseUrl: string): string {
   return `${baseUrl.replace(/\/+$/, '')}${EXTERNAL_REALTIME_SESSION_PATH}/start`;
+}
+
+export function composeWebSocketStartUrl(baseUrl: string): string {
+  return `${baseUrl.replace(/\/+$/, '')}${EXTERNAL_REALTIME_SESSION_PATH}/ws-start`;
+}
+
+/** Canonical prepare-room URL (``POST session/prepare-room``) composed from a
+ *  ``baseUrl`` origin — the reservation behind ``agent.prepareSession()``. */
+export function composePrepareRoomUrl(baseUrl: string): string {
+  return `${baseUrl.replace(/\/+$/, '')}${EXTERNAL_REALTIME_SESSION_PATH}/prepare-room`;
 }
 
 /** Canonical external dial URL composed from a ``baseUrl`` origin and the live

@@ -39,7 +39,7 @@ function renderSession(fakes: FakeTransport[]) {
   return renderHook(() =>
     useRealtimeSession({
       makeAgent: (client: RealtimeClient) => client.agent({ instructions: 'be terse' }),
-      clientOptions: { transportFactory: () => fakes[run++] },
+      clientOptions: { apiKey: 'test-key', transportFactory: () => fakes[run++] },
     }),
   );
 }
@@ -117,21 +117,20 @@ describe('useRealtimeSession', () => {
   });
 
   it('surfaces server-rejected tools as typed specs plus the warning', async () => {
-    const fake = makeFakeTransport();
-    const { result } = renderSession([fake]);
-
-    await act(async () => {
-      await result.current.start();
-    });
-    act(() => {
-      fake.emitMessage({
+    const fake = makeFakeTransport({
+      readyFrame: {
         type: 'ready',
         session_id: 'sess-fake',
         rejected_tools: [
           { name: 'examine_image', reason: 'not configured' },
           { name: 'detect_objects', reason: 'not configured' },
         ],
-      });
+      },
+    });
+    const { result } = renderSession([fake]);
+
+    await act(async () => {
+      await result.current.start();
     });
 
     expect(result.current.rejectedTools).toEqual([
@@ -209,22 +208,23 @@ describe('useRealtimeSession', () => {
     });
     expect(result.current.phase).toBe('starting');
 
-    await act(async () => {
-      await result.current.end();
-    });
-    expect(result.current.phase).toBe('ending');
-
-    release();
     let returned!: RealtimeSessionStartResult;
     await act(async () => {
+      await result.current.end();
       returned = await pending;
     });
 
+    // The cancel reaches the in-flight session itself, so the run is over
+    // before the gated connect resolves — nothing is held for the rest of
+    // the ready budget, and the transport never came up at all.
     expect(returned).toEqual({ ok: false, reason: 'ended', error: null });
+    expect(fake.lastConfig()).toBeUndefined();
     await waitFor(() => expect(result.current.phase).toBe('idle'));
     expect(result.current.client).toBeNull();
-    // The never-owned client still released its microphone.
-    await waitFor(() => expect(fake.lastDisconnectOpts()).not.toBeUndefined());
+
+    // Releasing the gate afterwards changes nothing: the run is over.
+    release();
+    await waitFor(() => expect(result.current.phase).toBe('idle'));
   });
 
   it('disconnects a start that resolves after the owner unmounted', async () => {
@@ -238,11 +238,12 @@ describe('useRealtimeSession', () => {
     expect(result.current.phase).toBe('starting');
 
     unmount();
-    release();
     const returned = await pending;
 
+    // Unmount tears the in-flight run down without waiting out its connect.
     expect(returned).toEqual({ ok: false, reason: 'ended', error: null });
-    await waitFor(() => expect(fake.lastDisconnectOpts()).not.toBeUndefined());
+    expect(fake.lastConfig()).toBeUndefined();
+    release();
   });
 
   it('clears the previous run leftovers on the next start', async () => {

@@ -1,0 +1,29 @@
+{
+  "name": "cosmo-runners",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "cosmo-ai": "latest",
+    "livekit-client": "^2",
+    "react": "^19",
+    "react-dom": "^19",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^4",
+    "tsx": "^4",
+    "typescript": "^5",
+    "vite": "^6"
+  },
+  "description": "Commentate on a board game with AI — a voice commentator for a push-your-luck dice game"
+}

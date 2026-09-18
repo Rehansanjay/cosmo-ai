@@ -21,7 +21,7 @@ from livekit import rtc
 
 from cosmo_ai._internal.logging import get_logger
 from cosmo_ai.audio import MicrophoneCapture
-from cosmo_ai.errors import AudioUnavailableError
+from cosmo_ai.errors import AudioUnavailableError, AudioUnavailableErrorCode
 
 logger: structlog.stdlib.BoundLogger = get_logger(__name__)
 
@@ -48,6 +48,25 @@ def _to_platform_options(capture: MicrophoneCapture) -> Any:
     )
 
 
+def _capture_failure_code(platform: Any) -> AudioUnavailableErrorCode:
+    """Which capture failure the platform will actually attest to.
+
+    An empty recording-device list is the one answer the Audio Device Module
+    gives reliably. A device that exists but will not open is either a refused
+    permission or one another process holds exclusively, and neither the ADM
+    nor PortAudio separates those — so it stays ``"audio_unavailable"`` rather
+    than a guess that reads like a diagnosis.
+    """
+    if platform is None:
+        return AudioUnavailableErrorCode.AUDIO_UNAVAILABLE
+    try:
+        if not platform.recording_devices():
+            return AudioUnavailableErrorCode.MIC_NOT_FOUND
+    except Exception:  # enumeration itself failed — nothing to attribute
+        return AudioUnavailableErrorCode.AUDIO_UNAVAILABLE
+    return AudioUnavailableErrorCode.AUDIO_UNAVAILABLE
+
+
 class MicAudioSource:
     """Streams the default input device into one LiveKit audio source.
 
@@ -63,7 +82,7 @@ class MicAudioSource:
         self.level: float = 0.0
 
     @property
-    def livekit_source(self) -> Any:
+    def audio_source(self) -> Any:
         """The ADM-backed source to hand to ``publish_audio_source``. Available
         only between ``start`` and ``stop``."""
         if self._source is None:
@@ -82,9 +101,10 @@ class MicAudioSource:
             platform = rtc.PlatformAudio()
             source = platform.create_audio_source(_to_platform_options(self._capture))
         except Exception as exc:
+            code = _capture_failure_code(platform)
             self._close_platform(platform)
             raise AudioUnavailableError(
-                f"could not open an input device for capture: {exc}"
+                f"could not open an input device for capture: {exc}", code=code
             ) from exc
         self._platform = platform
         self._source = source

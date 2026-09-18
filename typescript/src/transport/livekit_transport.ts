@@ -25,7 +25,7 @@
  * is ``RealtimeTransport`` in ``./types.ts``.
  */
 
-import { AudioPublishAlreadyActiveError } from '../core/errors';
+import { SessionStateError, RealtimeError } from '../core/errors';
 import { log } from '../core/logger';
 import {
   ConnectionState,
@@ -33,6 +33,7 @@ import {
   LocalAudioTrack,
   LocalVideoTrack,
   type LocalTrackPublication,
+  type Participant,
   ParticipantKind,
   RemoteTrack,
   Room,
@@ -56,14 +57,15 @@ import type {
   VideoStreamHandle,
   VideoStreamOptions,
 } from './types';
+import type { PreparedConnectOptions } from './prepared_room';
 import {
-  SessionStartTransportError,
+  SessionStartError,
   parseRetryAfter,
   parseSessionStartErrorDetail,
   sessionStartErrorFrom,
 } from './session_start_error';
 import { describeFetchFailure } from './fetch_failure';
-import type { SessionResponse } from '../wire/types.gen';
+import type { SessionResponse } from '../protocol';
 import type { SessionConnectTimings } from '../core/state';
 
 function isLkTestStub(): boolean {
@@ -87,9 +89,20 @@ const ROOM_OPTIONS = {
   },
 } as const;
 
-export class LiveKitConnectTimeoutError extends Error {
+/** A connect that ``disconnect()`` or an unsolicited room loss overtook. */
+class ConnectAbortedError extends RealtimeError {
+  readonly name = 'ConnectAbortedError';
+}
+
+export class LiveKitConnectTimeoutError extends RealtimeError {
   readonly name = 'LiveKitConnectTimeoutError';
 }
+
+/** Participant attribute on the agent carrying the external ``ready`` frame
+ *  verbatim. Attributes are room state delivered to every joiner — including
+ *  one that joins after the agent came up, which the one-shot data-channel
+ *  frame never reaches. */
+const READY_ATTRIBUTE = 'cosmo.ready';
 
 export class LiveKitTransport implements RealtimeTransport {
   private room: Room | null = null;
@@ -105,6 +118,10 @@ export class LiveKitTransport implements RealtimeTransport {
    *  Held so we can re-attach to a new element if ``attachAudioElement`` is
    *  called after the ``TrackSubscribed`` event has already fired. */
   private primaryAudioTrack: RemoteTrack | null = null;
+  /** Cached ``MediaStream`` wrapping ``primaryAudioTrack``. Rebuilt only when
+   *  the track changes, so a consumer can compare it by reference. */
+  private outputStream: MediaStream | null = null;
+  private readonly outputStreamListeners = new Set<() => void>();
   /** Additional simultaneously-subscribed remote audio tracks, each on its
    *  OWN hidden ``<audio>`` element. A LiveKit room can carry several
    *  remote audio tracks a participant must hear at once — e.g. on an
@@ -113,6 +130,19 @@ export class LiveKitTransport implements RealtimeTransport {
    *  pattern; a single shared element can only play one track at a time. */
   private extraAudioElements = new Map<RemoteTrack, HTMLAudioElement>();
   private isClosingByUs = false;
+  /** Set by an unsolicited disconnect of a room that had joined while a
+   *  connect is still in progress: the room the connect is building on is
+   *  already gone. A join that never completed does not count — livekit
+   *  emits ``Disconnected`` for a failed ``connect()`` too, and that case
+   *  keeps its fallback. */
+  private connectLost: string | null = null;
+  private connecting = false;
+  /** The room whose ``connect()`` has resolved during the current connect. */
+  private joinedRoom: Room | null = null;
+  /** True once a ``ready`` frame was emitted off the agent's participant
+   *  attribute, so attribute re-reads (reconnects, later changes) don't
+   *  re-emit it. */
+  private readyAttributeSeen = false;
   /** True once this client published its mic and declared itself the
    *  session's voice — reconnects re-send ``bind-input`` while set. */
   private voiceBound = false;
@@ -140,22 +170,64 @@ export class LiveKitTransport implements RealtimeTransport {
 
   async connect(options: RealtimeConnectOptions): Promise<void> {
     if (this.room) return;
+    this.connecting = true;
+    this.connectLost = null;
+    this.joinedRoom = null;
     try {
       await this._connectInner(options);
     } catch (err) {
       await this.disconnect();
       throw err;
+    } finally {
+      this.connecting = false;
     }
   }
 
-  private async _connectInner(options: RealtimeConnectOptions): Promise<void> {
+  private async _connectInner(options: PreparedConnectOptions): Promise<void> {
     // Reuse across reconnect: a previous disconnect set isClosingByUs=true
     // so the matching ``onClose`` was suppressed; clear it now so the
     // NEW session's unsolicited disconnects fire onClose listeners.
     this.isClosingByUs = false;
-    const startedAt = performance.now();
-    const session = await this._startSession(options);
+    this.readyAttributeSeen = false;
+    const startedAt = options.startedAt ?? performance.now();
+    const prepared = options.prepared ?? null;
+    let preparedJoin: Promise<void> | null = null;
+    let preparedJoinDoneAt = 0;
+    if (prepared !== null) {
+      // Join the reserved room while the start POST is in flight; the
+      // response is judged first, so a rejection here must wait its turn.
+      const shell = this.buildRoomShell();
+      preparedJoin = this.joinWithTimeout(shell, prepared.livekitUrl, prepared.token).then(
+        () => {
+          preparedJoinDoneAt = performance.now();
+        },
+      );
+      preparedJoin.catch(() => {});
+    }
+    let session: SessionResponse;
+    try {
+      session = await this._startSession(options);
+    } catch (err) {
+      // Only a 403 is the server refusing the ref itself (the grant no
+      // longer matches this identity). Anything else — including a gateway
+      // 5xx — may have opened a session already, and a start is not
+      // idempotent.
+      if (
+        prepared === null ||
+        !(err instanceof SessionStartError) ||
+        err.code === 'version_mismatch' ||
+        err.status !== 403
+      ) {
+        throw err;
+      }
+      this.throwIfClosedDuringConnect();
+      log.warn('[livekit-transport] start rejected with a prepared ref — retrying unprepared', err);
+      if (this.room !== null) this.abandonRoom(this.room);
+      preparedJoin = null;
+      session = await this._startSession({ ...options, prepared: undefined });
+    }
     const wsDoneAt = performance.now();
+    this.throwIfClosedDuringConnect();
     if (options.onSessionStarted) {
       try {
         options.onSessionStarted(session.session_id);
@@ -164,35 +236,51 @@ export class LiveKitTransport implements RealtimeTransport {
       }
     }
 
-    const room = new Room(ROOM_OPTIONS);
-    this.room = room;
-
-    // Use the host-supplied <audio> element if a consumer called
-    // attachAudioElement before connect (the React <RealtimeAudio/>
-    // primitive does so on mount). Otherwise fall back to a hidden
-    // element we own + clean up ourselves on disconnect.
-    this.audioElement = this.hostAudioElement ?? this.createFallbackAudioElement();
-
-    this._wireRoomEvents(room);
-    // Bind every pre-connect RPC registration before the join so a tool
-    // invocation arriving the instant the room connects finds its handler.
-    for (const [name, handler] of this.pendingRpcMethods) {
-      this.bindRpcMethodToRoom(room, name, handler);
+    let joinStartedAt = startedAt;
+    let joined = false;
+    if (prepared !== null && preparedJoin !== null) {
+      if (session.room_name === prepared.roomName) {
+        try {
+          await preparedJoin;
+          this.throwIfClosedDuringConnect();
+          joined = true;
+        } catch (err) {
+          if (err instanceof ConnectAbortedError) throw err;
+          log.warn(
+            '[livekit-transport] prepared join failed — joining the dispatched room',
+            err,
+          );
+        }
+      } else {
+        log.warn('[livekit-transport] prepared room not honored — joining the dispatched room', {
+          prepared: prepared.roomName,
+          dispatched: session.room_name,
+        });
+      }
+    }
+    let roomDoneAt: number;
+    if (joined) {
+      roomDoneAt = preparedJoinDoneAt;
+    } else {
+      // Serial path, and every prepared fallback: join on the response's
+      // own credentials, in a fresh room shell.
+      this.throwIfClosedDuringConnect();
+      if (this.room !== null) this.abandonRoom(this.room);
+      joinStartedAt = performance.now();
+      const shell = this.buildRoomShell();
+      await this.joinWithTimeout(shell, session.livekit_url, session.token);
+      roomDoneAt = performance.now();
     }
     this.pendingRpcMethods.clear();
-
-    // Bound the SDP / ICE phase so a hung LiveKit edge never silently
-    // leaves the UI in `requesting_mic` forever.
-    await Promise.race([
-      room.connect(session.livekit_url, session.token),
-      new Promise<never>((_resolve, reject) => {
-        setTimeout(
-          () => reject(new LiveKitConnectTimeoutError('LiveKit room connect timed out')),
-          15000,
-        );
-      }),
-    ]);
-    const roomDoneAt = performance.now();
+    const room = this.room;
+    if (room === null) throw new Error('room shell lost during connect');
+    // The agent may already be up: its readiness attribute arrives with the
+    // join-time participant state, where its one-shot ready frame would
+    // already have been missed. (Optional-chained for the room stubs the
+    // tests connect, which carry no participant map.)
+    for (const participant of room.remoteParticipants?.values() ?? []) {
+      this.maybeEmitReadyAttribute(participant);
+    }
     // Skip mic acquisition entirely when the client asked not to publish
     // (outbound phone dials). The SIP participant is the audio source;
     // publishing the browser mic adds a parallel track that the LiveKit
@@ -201,8 +289,15 @@ export class LiveKitTransport implements RealtimeTransport {
     // by the time it fires the mic has already been publishing for
     // the warm-up window.
     const publishesMic = options.publishMicrophone !== false;
+    const micStartedAt = performance.now();
     if (publishesMic) {
       await room.localParticipant.setMicrophoneEnabled(true);
+      // The permission prompt outlives the session that asked for it: a
+      // ``disconnect()`` landing while the dialog is open stops only the
+      // tracks the room already knew about, and this one arrives after.
+      // Hand it back before unwinding — otherwise the caller is left
+      // holding a live microphone belonging to no session.
+      await this.releaseMicrophoneIfAbandoned(room);
       // Declare this participant the session's voice. Best-effort: the
       // server auto-links the sole non-agent participant until a bind
       // arrives, so a lost frame degrades gracefully — but keep the
@@ -214,14 +309,113 @@ export class LiveKitTransport implements RealtimeTransport {
     // no-publish session (outbound dial) reports ``micMs: 0`` rather than
     // shortening the total.
     const connectReadyAt = performance.now();
+    // On the prepared path the start and the join overlap, so ``wsMs`` and
+    // ``roomMs`` each measure their own leg and the three no longer sum to
+    // the total.
     this.connectTimings = {
       wsMs: wsDoneAt - startedAt,
-      roomMs: roomDoneAt - wsDoneAt,
-      micMs: publishesMic ? connectReadyAt - roomDoneAt : 0,
+      roomMs: roomDoneAt - joinStartedAt,
+      micMs: publishesMic ? connectReadyAt - micStartedAt : 0,
       totalConnectMs: connectReadyAt - startedAt,
+      readyMs: null,
       serverTimings: session.timings ?? null,
     };
-    options.onConnectTimings?.(this.connectTimings);
+    options.onConnectTimings?.(this.connectTimings, startedAt);
+  }
+
+  /** ``disconnect()`` can run while a connect is still awaiting the start
+   *  POST or a join; the connect must not then build and publish into a
+   *  fresh room nobody will ever tear down. */
+  private throwIfClosedDuringConnect(): void {
+    if (this.isClosingByUs) {
+      throw new ConnectAbortedError('LiveKit transport was closed before its connect completed');
+    }
+    if (this.connectLost !== null) {
+      throw new ConnectAbortedError(`LiveKit room was lost before its connect completed (${this.connectLost})`);
+    }
+  }
+
+  /** Release a microphone acquired for a connect that has since been
+   *  abandoned, then unwind through ``throwIfClosedDuringConnect``.
+   *
+   *  Unpublishing with ``stopOnUnpublish`` is the only verb that ends the
+   *  capture: ``setMicrophoneEnabled(false)`` mutes the publication and, for
+   *  any source but a screen share, leaves the device open unless the room
+   *  opted into ``stopMicTrackOnMute`` — which this transport deliberately
+   *  does not, so a mid-session mute keeps the device and needs no second
+   *  permission prompt to come back.
+   *
+   *  A failure here is logged rather than raised: the abort is the error the
+   *  caller needs to see. */
+  private async releaseMicrophoneIfAbandoned(room: Room): Promise<void> {
+    if (!this.isClosingByUs && this.connectLost === null) return;
+    try {
+      const track = room.localParticipant.getTrackPublication(Track.Source.Microphone)?.track;
+      if (track !== undefined) {
+        await room.localParticipant.unpublishTrack(track, true);
+      }
+    } catch (err) {
+      log.error('[livekit-transport] releasing an abandoned microphone failed', err);
+    }
+    this.throwIfClosedDuringConnect();
+  }
+
+  /** A wired room ready to join: constructed, events attached, and every
+   *  pre-connect RPC registration bound (the map is cleared only once the
+   *  final room of the connect is known, so a fallback shell re-binds). */
+  private buildRoomShell(): Room {
+    const room = new Room(ROOM_OPTIONS);
+    this.room = room;
+    // Use the host-supplied <audio> element if a consumer called
+    // attachAudioElement before connect (the React <RealtimeAudio/>
+    // primitive does so on mount). Otherwise fall back to a hidden
+    // element we own + clean up ourselves on disconnect.
+    if (this.audioElement === null) {
+      this.audioElement = this.hostAudioElement ?? this.createFallbackAudioElement();
+    }
+    this._wireRoomEvents(room);
+    for (const [name, handler] of this.pendingRpcMethods) {
+      this.bindRpcMethodToRoom(room, name, handler);
+    }
+    return room;
+  }
+
+  /** Bound the SDP / ICE phase so a hung LiveKit edge never silently
+   *  leaves the UI in `requesting_mic` forever. */
+  private async joinWithTimeout(room: Room, url: string, token: string): Promise<void> {
+    try {
+      await Promise.race([
+        room.connect(url, token),
+        new Promise<never>((_resolve, reject) => {
+          setTimeout(
+            () => reject(new LiveKitConnectTimeoutError('LiveKit room connect timed out')),
+            15000,
+          );
+        }),
+      ]);
+    } catch (err) {
+      // The server accepted the session and the join is what failed, so this
+      // carries no verdict from it. Raw vendor errors used to escape `start()`
+      // here, which broke the guarantee that every failed start is a
+      // `SessionStartError`; the original rides on `cause`.
+      throw new SessionStartError({
+        code: 'join_failed',
+        message: err instanceof Error ? err.message : String(err),
+        cause: err,
+      });
+    }
+    this.joinedRoom = room;
+  }
+
+  /** Drop a room whose join lost — silently, so its teardown never reads
+   *  as the session closing. */
+  private abandonRoom(room: Room): void {
+    this.room = null;
+    if (this.joinedRoom === room) this.joinedRoom = null;
+    room.removeAllListeners();
+    void room.disconnect().catch((err) => {
+      log.warn('[livekit-transport] abandoned room disconnect failed', err);
+    });
   }
 
   /** Send the ``bind-input`` voice-binding frame; failures are logged,
@@ -266,7 +460,7 @@ export class LiveKitTransport implements RealtimeTransport {
         if (nextEl) this.removeExtraAudio(next, nextEl);
         this.attachRemoteAudio(next);
       } else {
-        this.primaryAudioTrack = null;
+        this.setPrimaryAudioTrack(null);
       }
     });
     room.on(RoomEvent.DataReceived, (payload, participant, _kind, _topic) => {
@@ -281,10 +475,24 @@ export class LiveKitTransport implements RealtimeTransport {
       }
       this.handleDataReceived(payload);
     });
+    room.on(
+      RoomEvent.ParticipantAttributesChanged,
+      (_changed: Record<string, string>, participant: Participant) => {
+        this.maybeEmitReadyAttribute(participant);
+      },
+    );
     room.on(RoomEvent.Disconnected, (reason) => {
       if (this.isClosingByUs) return;
       const name =
         reason !== undefined ? DisconnectReason[reason] ?? reason : 'disconnected';
+      // A room that never joined has nothing to close: livekit reports a
+      // failed connect() this way too, and that failure is the join's own
+      // to raise — a prepared join falls back on it.
+      if (this.connecting && this.joinedRoom !== room) return;
+      // Latched, not only emitted: the close listeners run asynchronously,
+      // and a connect still awaiting its start POST must not accept the
+      // dead room it was building on.
+      if (this.connecting) this.connectLost = `livekit:${name}`;
       this.emitClose({ reason: `livekit:${name}` });
     });
     room.on(RoomEvent.Reconnecting, () => {
@@ -294,6 +502,14 @@ export class LiveKitTransport implements RealtimeTransport {
       // Re-assert the voice binding — the server pin is sticky but a
       // room recovery may have rebuilt participant state.
       if (this.voiceBound) void this.sendBindInput();
+      // Re-read the sign: a recovery rebuilds participants with their
+      // attributes already populated, so an agent that became ready during
+      // the outage fires no attribute change and would otherwise be missed.
+      // Deduped by ``readyAttributeSeen``, so a session already ready
+      // re-emits nothing.
+      for (const participant of room.remoteParticipants?.values() ?? []) {
+        this.maybeEmitReadyAttribute(participant);
+      }
       for (const cb of this.reconnectedListeners) cb();
     });
   }
@@ -416,10 +632,11 @@ export class LiveKitTransport implements RealtimeTransport {
     const room = this.room;
     if (!room) throw new Error('Cannot add audio stream — no active session.');
     if (this.audioStream) {
-      throw new AudioPublishAlreadyActiveError(
-        'An audio stream is already running — a session carries one voice. ' +
+      throw new SessionStateError({
+        code: 'audio_publish_already_active',
+        message: 'An audio stream is already running — a session carries one voice. ' +
           'Call stopAudioStream before starting another.',
-      );
+    });
     }
     const [mediaTrack] = stream.getAudioTracks();
     if (!mediaTrack) {
@@ -516,14 +733,14 @@ export class LiveKitTransport implements RealtimeTransport {
     }
   }
 
-  async disconnect(opts?: { sendEndFrame?: boolean }): Promise<void> {
+  async disconnect(options?: { sendEndFrame?: boolean }): Promise<void> {
     if (!this.room && !this.audioElement) return;
     this.isClosingByUs = true;
     this.voiceBound = false;
     // The end frame is a graceful-shutdown courtesy to the worker; when the
     // server already ended the session (room deleted), the transport is
     // disconnected and there is nothing left to end.
-    if (opts?.sendEndFrame !== false && this.room?.state === ConnectionState.Connected) {
+    if (options?.sendEndFrame !== false && this.room?.state === ConnectionState.Connected) {
       try {
         await this.send({ type: 'end' });
       } catch (err) {
@@ -541,7 +758,7 @@ export class LiveKitTransport implements RealtimeTransport {
     }
     if (this.primaryAudioTrack) {
       try { this.primaryAudioTrack.detach(); } catch { /* ignore */ }
-      this.primaryAudioTrack = null;
+      this.setPrimaryAudioTrack(null);
     }
     for (const [track, el] of this.extraAudioElements) {
       this.removeExtraAudio(track, el);
@@ -580,6 +797,25 @@ export class LiveKitTransport implements RealtimeTransport {
     return this.audioElement;
   }
 
+  getOutputStream(): MediaStream | null {
+    return this.outputStream;
+  }
+
+  onOutputStreamChanged(cb: () => void): Unsubscribe {
+    this.outputStreamListeners.add(cb);
+    return () => this.outputStreamListeners.delete(cb) as unknown as void;
+  }
+
+  /** Single writer for ``primaryAudioTrack``, so the cached stream and the
+   *  change notification can never drift from it. */
+  private setPrimaryAudioTrack(track: RemoteTrack | null): void {
+    if (this.primaryAudioTrack === track) return;
+    this.primaryAudioTrack = track;
+    const media = track?.mediaStreamTrack ?? null;
+    this.outputStream = media ? new MediaStream([media]) : null;
+    for (const cb of this.outputStreamListeners) cb();
+  }
+
   attachAudioElement(el: HTMLAudioElement | null): void {
     if (this.hostAudioElement === el) return;
     const previous = this.audioElement;
@@ -615,7 +851,7 @@ export class LiveKitTransport implements RealtimeTransport {
   /** Attach a remote audio track to the host element (LiveKit manages the
    *  element's srcObject + autoplay/start-audio state). */
   private attachRemoteAudio(track: RemoteTrack): void {
-    this.primaryAudioTrack = track;
+    this.setPrimaryAudioTrack(track);
     if (!this.audioElement) return;
     try {
       track.attach(this.audioElement);
@@ -778,6 +1014,34 @@ export class LiveKitTransport implements RealtimeTransport {
     return participant !== undefined && participant.kind === ParticipantKind.AGENT;
   }
 
+  /** Emit the agent's readiness attribute as an inbound ``ready`` frame,
+   *  once. The attribute carries the external frame verbatim, so downstream
+   *  handling is identical to a data-channel delivery (the engine drops
+   *  whichever of the two arrives second). */
+  private maybeEmitReadyAttribute(participant: Participant): void {
+    if (this.readyAttributeSeen) return;
+    if (!this.isAgentParticipant(participant.identity)) return;
+    const value = participant.attributes?.[READY_ATTRIBUTE];
+    if (value === undefined || value === '') return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(value);
+    } catch (err) {
+      log.warn('[livekit-transport] undecodable ready attribute', err);
+      return;
+    }
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      (parsed as { type?: unknown }).type !== 'ready'
+    ) {
+      log.warn('[livekit-transport] ready attribute is not a ready frame', parsed);
+      return;
+    }
+    this.readyAttributeSeen = true;
+    this.emitMessage(parsed as RealtimeInboundMessage);
+  }
+
   private emitMessage(message: RealtimeInboundMessage): void {
     for (const cb of this.messageListeners) cb(message);
   }
@@ -800,13 +1064,17 @@ export class LiveKitTransport implements RealtimeTransport {
   }
 
   private async _startSession(
-    options: RealtimeConnectOptions,
+    options: PreparedConnectOptions,
   ): Promise<SessionResponse> {
     const extraHeaders = options.getAuthHeaders ? await options.getAuthHeaders() : {};
     const headers: Record<string, string> = {
       ...extraHeaders,
       'Content-Type': 'application/json',
     };
+    if (options.prepared) {
+      headers['x-cosmo-prepared-room-name'] = options.prepared.roomName;
+      headers['x-cosmo-prepared-room-grant'] = options.prepared.roomGrant;
+    }
     // Bearer-authenticated external endpoint — no cookies. Default
     // ``same-origin`` credentials keep cross-origin CORS simple for
     // third-party pages (``include`` would demand
@@ -819,10 +1087,11 @@ export class LiveKitTransport implements RealtimeTransport {
         body: JSON.stringify(options.config),
       });
     } catch (err) {
-      throw new SessionStartTransportError(
-        describeFetchFailure(options.sessionStartUrl, err),
-        { cause: err },
-      );
+      throw new SessionStartError({
+        code: 'transport',
+        message: describeFetchFailure(options.sessionStartUrl, err),
+        cause: err,
+      });
     }
     if (!response.ok) {
       const detail = await parseSessionStartErrorDetail(response);

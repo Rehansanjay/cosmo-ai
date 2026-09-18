@@ -21,37 +21,41 @@ It is a peer rather than a bundled dependency so an app that already uses
 media stacks — each with its own workers — contending for the same
 microphone.
 
-`react` and `react-dom` (`^19`) are required peer dependencies. npm 7+
-installs them automatically; with yarn or pnpm run
-`yarn add react react-dom` alongside the SDK.
+If the install prints an `EBADENGINE` warning naming `machina` (a dependency
+of `livekit-client`), nothing failed — npm is noting that Node
+versions before 22.22.0 sit below that package's declared engine floor. The
+install completes and the SDK runs either way; updating to a current Node 22
+LTS or Node 24 clears the warning.
+
+`react` and `react-dom` (`^19`) are optional peer dependencies, needed only
+if you import `cosmo-ai/react`. A headless Node app carries neither.
 
 > **Beta.** `cosmo-ai` is pre-1.0: minor releases may contain breaking
 > changes, noted in the
-> [changelog](https://platform.askcosmo.ai/docs/meta/changelog). Pin a
-> minor (`"cosmo-ai": "~0.6.0"`) if
-> you need stability. We will cut 1.0 once the session, tool, and React
-> APIs have gone several releases without breaking changes.
+> [changelog](https://platform.askcosmo.ai/docs/meta/changelog).
 
-## Teach your agent
+## Teach your agent first
 
-One [Agent Skill](https://agentskills.io) covers the whole Cosmo SDK
-family (TypeScript, Python, Swift): the current SDK API, the credential
-and login rules, and the deploy/share playbook. It teaches coding agents
-(Claude Code, Cursor, Codex CLI, Gemini CLI, …) — install it once per
-machine or project:
+If a coding agent is writing this code, install the Agent Skill before the
+quickstart:
 
 ```bash
 npx skills add socratic-ai/cosmo-ai
 ```
 
-Prefer it to track your installed package version automatically? Add
-[`skills-npm`](https://github.com/antfu/skills-npm) as a dev dependency and
-run `npx skills-npm setup` once — every `npm install` then links the skill
-out of `node_modules`.
+One [Agent Skill](https://agentskills.io) covers the whole Cosmo SDK family
+(TypeScript, Python, Swift): the current SDK API, the credential and login
+rules, and the deploy/share playbook. It works with Claude Code, Cursor,
+Codex CLI, Gemini CLI, and anything else that reads the skills format.
+
+The skill also ships inside the package at `skills/cosmo/`. To track your
+installed package version automatically, add [`skills-npm`](https://github.com/antfu/skills-npm)
+as a dev dependency and run `npx skills-npm setup` once; every `npm install`
+then links the skill out of `node_modules`.
 
 Agents can also read the docs directly:
-https://platform.askcosmo.ai/docs (`/llms.txt`, `/llms-full.txt`, and an
-MCP endpoint at `/docs/api/mcp`).
+https://platform.askcosmo.ai/docs (`/docs/llms.txt`, `/docs/llms-full.txt`, and
+an MCP endpoint at `/docs/api/mcp`).
 
 ## Quickstart
 
@@ -93,15 +97,21 @@ const agent = client.agent({
 
 const session = await agent.start();
 
+// The session folds the transcript for you: one item per turn, growing
+// while the speaker talks. Render the whole list on every update.
+session.on('transcript_updated', ({ items }) => {
+  console.clear();
+  for (const item of items) {
+    console.log(`[${item.role}] ${item.text}${item.isFinal ? '' : ' …'}`);
+  }
+});
+
 for await (const event of session) {
   switch (event.type) {
     case 'ready':
-      console.log(`ready — session ${event.session_id}`);
+      console.log(`ready — session ${event.sessionId}`);
       break;
-    case 'transcript':
-      console.log(`[${event.role}] ${event.text}`);
-      break;
-    case 'session-ended':
+    case 'session_ended':
       console.log(`ended: ${event.reason}`);
       break;
   }
@@ -109,7 +119,7 @@ for await (const event of session) {
 ```
 
 End a run with `await session.end()` — the stream always finishes with a
-final `session-ended` item.
+final `session_ended` item.
 
 ### Agents are immutable
 
@@ -121,7 +131,7 @@ const terse = client.agent({
   instructions: 'Answer in one sentence.',
   voice: 'Puck',
   greeting: 'Hi, how can I help?',
-  audio: { noiseCancellation: true },
+  audio: { noiseCancellation: 'voice_focus' },
 });
 
 const session = await terse.start();
@@ -131,25 +141,56 @@ const session = await terse.start();
 agent says to open a call and how its audio is handled, configured
 once, not per run.
 
-`audio.noiseCancellation` is off by default: the agent hears the raw
-microphone signal. Set it to `true` when the microphone will hear more than
-one voice — a café, an open office, a TV in the background. The isolated
-signal is what the agent hears *and* what turn-taking reads, so turning it
-on can shift endpointing; measure it on your own audio before leaving it on.
-The default is the server's — leave `audio` unset and the SDK sends no audio
-block at all.
+Background voices showing up in the transcript, or the agent answering
+someone who isn't the user? Set `audio: { noiseCancellation: 'voice_focus' }`
+— it is off by default, so the agent hears the raw microphone signal. It
+removes background *voices* from the inbound audio server-side, keeping only
+the speaker it judges primary, so on a microphone several people share use
+`'denoise'` instead: that strips noise and keeps every voice. echo cancellation
+(keeping the agent's own voice out of the microphone) is a different job and
+always on, and the browser's own noise suppression and auto-gain control
+stay off because they duck speech during double-talk and break barge-in — so
+for background voices this flag is the lever. The isolated signal is what
+the agent hears *and* what turn-taking reads, so it costs some barge-in
+responsiveness: enable it for noisy environments — a café, an open office, a
+TV in the background — and leave it off for quiet-room or headset use,
+measuring on your own audio before shipping either way. Full voice isolation
+applies to managed WebRTC sessions; a phone leg (`session.dial(...)` or an
+inbound call) gets a lighter noise suppressor that removes background noise
+but does not single out competing voices. The default is the server's —
+leave `audio` unset and the SDK sends no audio block at all, which is also
+the only shape the local OSS `cosmo-server` accepts: it rejects any `audio`
+block at session start (`option_unsupported`).
+
+There is no language setting — not on the agent, `voice`, `audio`, or a
+model block. The native-audio models these sessions run on pick their
+working language from the audio itself, and no provider setting pins it, so
+the control is `instructions`. Managed sessions compose default
+language-stability guidance into every system prompt (a single ambiguous or
+foreign-sounding utterance is never a switch), and it defers to your own
+language rules — a pinned agent keeps its pin. To pin hard, write it in:
+"The conversation is in English only. Do not respond in any other language,
+even if the user switches or asks you to. If the user speaks another
+language, reply in English and ask them to continue in English." That is
+steering, not a guarantee — drift shows first as wrong-language transcript
+lines, and in the worst case the replies follow. The replies are the
+reliable signal: on the OpenAI-family and Grok providers, user transcripts
+come from a separate speech-to-text model that instructions never reach, so
+a wrong-language user line under correct-language replies is a
+transcription artifact, not drift. The local OSS `cosmo-server` composes
+nothing; the model receives your instructions verbatim.
 
 ### Tools
 
-`tools` on the agent takes client-executed specs (`kind: 'client'`) and
-typed server-tool opt-ins, executed server-side: `{ kind: 'web_search' }`,
-`{ kind: 'examine_image' }`, `{ kind: 'detect_objects' }`, `{ kind: 'point_at_object' }`,
-`{ kind: 'end_call' }` (the agent hangs up itself) — each zero-config; the server
+`tools` on the agent takes client tools you declare (`clientTool(...)`, or the
+`tool`-style builders below) and server-tool opt-ins, executed server-side:
+`webSearchTool()`,
+`examineImageTool()`, `detectObjectsTool()`, `pointAtObjectTool()`,
+`endCallTool()` (the agent hangs up itself) — each zero-config; the server
 owns the model-facing declaration.
-Attach a `handler` to a client spec and the SDK executes it when the agent
-calls the tool — decoding the arguments, running your async function, and
-reporting the returned object (or thrown error) back to the model. A spec
-without a handler is still declared but not locally executable. Specs the
+Every client tool carries the `handler` that runs it: when the agent calls
+the tool, the SDK decodes the arguments, runs your async function, and
+reports the returned object (or thrown error) back to the model. Specs the
 server refuses are echoed on the `ready` event's `rejectedTools`; the
 session still starts without them.
 
@@ -160,11 +201,11 @@ entry `cosmo-ai/tool/zod` (`zod` is an optional peer dependency, `^4` —
 author schemas via the `zod/v4` subpath).
 
 ```ts
-import { tool } from 'cosmo-ai/tool';
+import { clientTool } from 'cosmo-ai/tool';
 import { zodInput } from 'cosmo-ai/tool/zod';
 import { z } from 'zod/v4';
 
-const getWeather = tool({
+const getWeather = clientTool({
   name: 'get_weather',
   description: 'Current weather for a city',
   input: zodInput(
@@ -177,13 +218,13 @@ const getWeather = tool({
 });
 
 const agent = client.agent({
-  tools: [getWeather, { kind: 'web_search' }],
+  tools: [getWeather, webSearchTool()],
 });
 ```
 
 The emitted schema is checked against the backend's restricted JSON-Schema
 dialect when `zodInput()` / `tool()` runs, so a schema the server would
-reject throws `ToolSchemaError` at startup instead of surfacing as a
+reject throws `ToolDefinitionError` at startup instead of surfacing as a
 `ready.rejectedTools` entry at connect (`zodInput(schema, { name: 'get_weather' })`
 labels that error with the tool it is for). Constructs the dialect cannot
 express (`pattern`/`format`/regex, `oneOf`, strict objects, records,
@@ -196,41 +237,38 @@ own — defaults fill, transforms run: the emitted schema describes the
 
 Raw JSON Schema stays available as the advanced escape hatch — hand-written
 dialect `parameters`, args typed `Record<string, unknown>`, no validation
-(the dialect check still runs at construction). The plain spec-object form
-below is equivalent. For a validating vendor the builder has no converter
-for, `tool({ input: someStandardSchema, unsafeParameters: {...} })` accepts
-any Standard Schema V1 validator — the field name is the warning: nothing
-keeps the validator and the model-facing schema in agreement.
+(the dialect check still runs at construction). A validator the builder has
+no converter for goes here too: pass its schema as `parameters` and call the
+validator inside the handler. Either way the tool is built by calling
+`clientTool` — `AgentTool` is opaque, so a hand-written object literal does
+not type-check in `tools`.
 
 ```ts
 const agent = client.agent({
   tools: [
-    {
-      kind: 'client',
+    clientTool({
       name: 'get_local_time',
       description: 'Returns the local wall-clock time.',
       parameters: { type: 'object', properties: {}, required: [] },
       handler: async () => ({ time: new Date().toLocaleTimeString() }),
-    },
-    { kind: 'web_search' },
+    }),
+    webSearchTool(),
   ],
 });
 ```
 
 A tool whose work outlives a conversational beat (an export, a long fetch)
-is declared with `background: true` — on the builder
-(`tool({ background: true, input, handler: (args, job) => … })`) or on the
-raw spec: the handler acks the call immediately — the agent speaks the note
-and the conversation continues — and delivers its result later through the
-job handle. The same shape exists in the Python (`BackgroundClientTool`)
-and Swift SDKs.
+is declared with its own constructor —
+`backgroundClientTool({ input, handler: (args, job) => … })`, taking a typed
+`input` or raw `parameters` like `clientTool`: the handler acks the call
+immediately — the agent speaks the note and the conversation continues — and
+delivers its result later through the job handle. The same shape exists in
+the Python (`background_client_tool`) and Swift SDKs.
 
 ```ts
 const agent = client.agent({
   tools: [
-    {
-      kind: 'client',
-      background: true,
+    backgroundClientTool({
       name: 'export_report',
       description: 'Exports the report and returns a download URL.',
       parameters: { type: 'object', properties: {}, required: [] },
@@ -239,7 +277,7 @@ const agent = client.agent({
         const url = await heavyExport(args);
         await job.complete({ result: { url }, summary: 'The report is ready.' });
       },
-    },
+    }),
   ],
 });
 ```
@@ -283,11 +321,11 @@ Agent Skills `SKILL.md` documents with `parseSkillMd` (load the text from
 wherever it lives: bundled assets, OPFS, a CMS fetch). The agent folds the
 skill menu into its instructions and declares a `cosmo_sdk_load_skill` tool
 that returns a skill's body on demand. Duplicate names throw when the agent
-is built; a malformed document raises `SkillParseError` at parse.
+is built; a malformed document raises `SkillError` at parse, with `code` naming the failure.
 
 ```ts
 const agent = client.agent({
-  skills: [parseSkillMd(billingMd, { defaultName: 'billing' })],
+  skills: [parseSkillMd(billingMd, 'billing')],
 });
 ```
 
@@ -296,9 +334,10 @@ const agent = client.agent({
 A session is observable two ways — pick per consumer:
 
 - **Async iteration** — `for await (const event of session)` yields the
-  wire-level event stream. Two guarantees: **unknown ≠ fatal** (a frame with
-  an unrecognized `type` surfaces as `{ type: 'unknown' }` and the stream
-  continues) and **`session-ended` is always the final item** (synthesized
+  session's own event types, the same values the callbacks deliver, each
+  named by `type`. Two guarantees: **unknown ≠ fatal** (a frame with an
+  unrecognized `type` surfaces as `{ type: 'unknown' }` and the stream
+  continues) and **`session_ended` is always the final item** (synthesized
   on `session.end()` / transport close; after it, iteration finishes).
   Single consumer per session.
 - **Callbacks** — `session.on('transcript', ...)` with the same typed,
@@ -306,24 +345,32 @@ A session is observable two ways — pick per consumer:
   `lifecycle`, `error`, …). This is what the React hooks build on; any
   number of subscribers.
 
-The two surfaces use different vocabularies on purpose: iteration yields
-wire-level frames and mirrors the wire protocol's kebab-case names
-(`{ type: 'session-ended' }`), while callbacks are the SDK's normalized
-UI layer with snake_case names (`session_ended`). Two guarantees the
-callback layer makes:
+The two surfaces share one vocabulary: an event carried by both is named
+the same way on each — `event.type === 'session_ended'` on the stream,
+`session.on('session_ended', …)` on the callbacks — and carries the same
+payload type. The stream carries more: the `bot_*` and `user_*_speaking`
+markers and `tool_invocation` have no callback. Two guarantees the callback
+layer makes:
 
 - **`session_ended` fires exactly once per session, on any exit path** —
   server end, client `end()`, or transport failure — carrying the
   server's reason slug or the disconnect reason (e.g. `client_ended`).
   A "call over" UI keyed here (or to `lifecycle`) sees every ending.
-- **Late subscribers miss nothing.** The current `lifecycle` state (and
-  an already-fired `ready`) are replayed on subscribe, so attaching
-  handlers after `await agent.start()` resolves just works.
+- **Late subscribers miss nothing.** The current `lifecycle` state, an
+  already-fired `ready`, and the current `transcript_updated` value are
+  replayed on subscribe, so attaching handlers after
+  `await agent.start()` resolves just works.
 
 `session.state` exposes the formal connection lifecycle
 (`idle → connecting → connected ↔ reconnecting → disconnected`) with a typed
 `disconnectReason` (`client_ended`, `server_ended`, `handshake_failed`,
 `transport_error`, …) once disconnected.
+
+`session.transcript` is the coalesced conversation so far — one
+`TranscriptItem` per turn (`id`, `role`, `text`, `isFinal`), folded by the
+session from its own transcript stream. `transcript_updated` fires with the
+full updated list on every change, and the value survives `end()`, so the
+whole conversation stays readable after the run.
 
 ## On a server
 
@@ -386,6 +433,20 @@ one surface fails as a `401` on the other.
 `http://` is rejected for any host but `localhost` / `127.0.0.1`, so a
 misconfigured backend cannot carry your credential in plaintext.
 
+The one-process OSS server uses the same base URL plus the WebSocket carrier:
+
+```ts
+const client = new RealtimeClient({
+  apiKey: 'local-development',
+  transport: 'websocket',
+});
+```
+
+In a browser, set the `cosmo-base-url` meta tag to the loopback server. The
+socket carries PCM audio, session events and ordinary client-tool RPC. It is a
+local-development lane: no reconnection, camera, screen share, background
+client tools, dial or usage reads.
+
 The credential is the only boundary: these endpoints read `Authorization` and
 never a cookie, so no cookies ride along with the request. Mint on your
 server, never in the page — the `apiKey` that mints tokens must not ship to a
@@ -399,12 +460,17 @@ preflight rejection shows up.
 
 ## React usage
 
+The bindings live at `cosmo-ai/react` — provider, hooks and components. They
+are not on the package root: importing them there would pull `react` into the
+graph of every consumer, headless ones included.
+
 The provider is fed one live run — pass it the `RealtimeSession` from
 `agent.start()` (or from the `useRealtimeSession` hook), and `null`
 between runs:
 
 ```tsx
-import { RealtimeProvider, useTranscript, type RealtimeSession } from 'cosmo-ai';
+import { RealtimeProvider, useTranscript } from 'cosmo-ai/react';
+import type { RealtimeSession } from 'cosmo-ai';
 
 function App({ session }: { session: RealtimeSession | null }) {
   return (
@@ -448,8 +514,9 @@ the agent is saying, and adds nothing to `useTranscript()`. Push them as
 often as your UI changes.
 
 `sendText` takes one option, and it does not turn the send into a context
-note: `transcript: false` skips the optimistic `transcript` event the SDK
-otherwise emits for the sent text. The turn still happens.
+note: `transcript: false` keeps the sent text out of `session.transcript`
+(and skips the optimistic `transcript` event the SDK otherwise emits for
+it). The turn still happens.
 
 The agent replies in whatever modality the session runs in. There is no
 per-turn way to suppress speech; configure the agent with `audio.output =
@@ -464,8 +531,8 @@ agent, no charge. Use it as a startup check or a CI smoke test.
 const info = await client.verify(); // throws RealtimeVerifyError if rejected
 
 info.workspace?.slug;         // which workspace (and so which environment)
-info.scopes;                  // e.g. ['realtime:use']
-info.canStartSessions;        // false -> valid credential, missing realtime:use
+info.scopes;                  // e.g. ['realtime:start']
+info.canStartSessions;        // false -> valid credential, missing realtime:start
 info.realtimeVoiceAvailable;  // false -> no default voice stack configured here
 ```
 
@@ -503,7 +570,6 @@ choosing who is on the call are separate, explicit steps.
 const client = new RealtimeClient({ token });
 
 const session = await client.agent({ instructions: 'You are Alex.' }).start();
-await session.waitUntilReady();
 
 const { dialId } = await session.dial('+14155550199'); // bring the callee in over SIP
 ```
@@ -521,19 +587,40 @@ const { dialId } = await session.dial('+14155550199'); // bring the callee in ov
 - **Return** — `DialResult` (`{ dialId }`), a handle to the queued call. The
   call rings asynchronously; watch the session's events for the conversation.
 
+## Logging
+
+The SDK is quiet by default: `warn` and above reach the console, `info` and
+`debug` stay off until you ask for them.
+
+```ts
+import { setLogLevel, getLogLevel } from 'cosmo-ai';
+
+setLogLevel('debug');   // 'silent' | 'error' | 'warn' | 'info' | 'debug'
+```
+
+Outside the browser the starting level also comes from `COSMO_LOG_LEVEL`, so
+you can turn the SDK verbose without editing the app:
+
+```bash
+COSMO_LOG_LEVEL=debug node ./agent.js
+```
+
+An explicit `setLogLevel` call outranks the variable. At `debug` each session
+also reports its connect-latency breakdown.
+
 ## React Hooks
 
 | Hook | Description |
 |---|---|
 | `useRealtimeSession()` | Session lifecycle: a single-use client per run, `start`/`end`, one teardown on every exit path (used above the provider) |
-| `useRealtimeSessionContext()` | Access the provider's `RealtimeSession` (`null` between runs) from context |
+| `useRealtimeSessionContext()` | Access the provider's `RealtimeSession` (`null` between runs) from context — for imperative calls (`sendText`, `setMuted`, …) |
 | `useTransportState()` | LiveKit transport connection state |
 | `useAgentState()` | Cosmo agent lifecycle state |
 | `useTranscript()` | Array of transcript items (user + agent turns) |
 | `useToolCalls()` | Pending and completed tool call items |
 | `useMicLevel()` | Microphone input volume (0–1) |
 | `useOutputLevel()` | Agent audio output volume (0–1) |
-| `useRealtimeError()` | Latest `RealtimeError`, if any |
+| `useRealtimeError()` | Latest error, if any — a typed start failure, or the server's `ErrorEvent` |
 
 ## Documentation
 

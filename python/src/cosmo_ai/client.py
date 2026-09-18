@@ -17,13 +17,35 @@ Usage::
     async with agent.start() as session:
         async for event in session:
             ...
+
+A session can be prepared ahead of its start (:meth:`RealtimeAgent.prepare_session`)
+so the start joins a room reserved in the background instead of waiting for
+one to be allocated::
+
+    prepared = agent.prepare_session()
+    ...  # the rest of the app's setup
+    async with prepared.start() as session:
+        ...
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
+import time
+import warnings
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Generator, Mapping, Optional, Sequence
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Generator,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+)
 from urllib.parse import urlparse
 from uuid import UUID
 
@@ -32,19 +54,29 @@ import structlog
 from pydantic import SecretStr, ValidationError
 
 from cosmo_ai._internal.logging import get_logger
+from cosmo_ai._internal.prepared_room import PREPARED_ROOM_REFRESH_S, PreparedRoom
 from cosmo_ai.errors import (
+    DialErrorCode,
+    SessionStartErrorCode,
+    SessionStartRejection,
+    UsageErrorCode,
+    VerifyErrorCode,
+    _classify_start_rejection,
+    CredentialsError,
+    CredentialsErrorCode,
     DialError,
     MintTokenError,
+    MintTokenErrorCode,
     SessionStartError,
     UsageError,
     VerifyError,
-    VersionMismatchError,
 )
 from cosmo_ai._internal.hooks import Hook, HookEngine, resolve_hooks
 from cosmo_ai.mcp._engine import ConnectedMcp, McpInput, McpStdioServer, connect_mcp, resolve_mcp
 from cosmo_ai._internal.protocol import (
     SDK_NAME,
     SDK_VERSION,
+    _sdk_info,
     AgentTool,
     AudioConfig,
     ClientTool,
@@ -58,10 +90,16 @@ from cosmo_ai._internal.protocol import (
     SessionConfig,
     SessionParams,
     SessionResponse,
-    RealtimeModelOptions,
+    RealtimeModel,
     ServerHook,
     VoiceConfig,
     SessionUsage,
+    WsSessionStart,
+    parse_minted_token,
+)
+from cosmo_ai._internal.transport import (
+    StartedSession,
+    TransportName,
 )
 from cosmo_ai.session._engine import (
     GetUsage,
@@ -84,13 +122,19 @@ logger: structlog.stdlib.BoundLogger = get_logger(__name__)
 
 _SESSION_PATH = "/api/v1/external/realtime/session"
 _SESSION_START_PATH = f"{_SESSION_PATH}/start"
+_SESSION_WS_START_PATH = f"{_SESSION_PATH}/ws-start"
+_PREPARE_ROOM_PATH = f"{_SESSION_PATH}/prepare-room"
 _MINT_TOKEN_PATH = "/api/v1/external/auth/token"
 _VERIFY_PATH = "/api/v1/external/realtime/verify"
 _SESSIONS_PATH = "/api/v1/external/sessions"
 _SESSION_START_TIMEOUT_S = 40.0
+# Sized with the other SDKs rather than with session start, which is bounded
+# by the backend's agent dispatch (``contract/mint-vectors.json``).
+_MINT_TOKEN_TIMEOUT_S = 45.0
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _DEFAULT_BASE_URL = "https://platform.askcosmo.ai"
 _BASE_URL_ENV_VAR = "COSMO_BASE_URL"
+_TRANSPORT_ENV_VAR = "COSMO_TRANSPORT"
 
 
 def _as_tuple(
@@ -98,6 +142,20 @@ def _as_tuple(
 ) -> tuple[AgentTool, ...] | None:
     return tuple(tools) if tools is not None else None
 
+
+
+def _retry_after_seconds(response: httpx.Response) -> int | None:
+    """The server's ``Retry-After`` in whole seconds, when it sent one as a
+    delay, never below zero. An HTTP-date form is ignored: the SDK reports what
+    the server asked for, not a value derived from a clock it does not
+    share."""
+    raw = response.headers.get("retry-after")
+    if raw is None:
+        return None
+    try:
+        return max(0, int(raw.strip()))
+    except ValueError:
+        return None
 
 class RealtimeClient:
     """Async client for the Cosmo realtime external API.
@@ -139,10 +197,27 @@ class RealtimeClient:
         *,
         api_key: str | None = None,
         token: str | TokenSource | None = None,
+        transport: TransportName | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         if api_key is not None and token is not None:
-            raise ValueError("provide at most one of api_key or token")
+            raise CredentialsError(
+                code=CredentialsErrorCode.CONFLICTING_CREDENTIALS,
+                message="provide at most one of api_key or token",
+            )
+        if (
+            isinstance(token, str)
+            and token.startswith("cosmo_")
+            and not token.startswith("cosmo_pat_")
+        ):
+            # The backend would honor a key as a bearer, which is exactly how
+            # a pasted key ends up shipped to end users. Refuse it here.
+            raise CredentialsError(
+                code=CredentialsErrorCode.API_KEY_IN_TOKEN_SLOT,
+                message="this is a workspace API key (cosmo_…), not a minted "
+                "end-user token — pass api_key=..., or mint a token for this "
+                "user with mint_token() and pass that",
+            )
         resolved_base_url: str | None = None
         if api_key is None and token is None:
             resolved = resolve_credential()
@@ -165,9 +240,12 @@ class RealtimeClient:
         self._base_url = base_url.rstrip("/")
         parsed = urlparse(self._base_url)
         if parsed.scheme != "https" and parsed.hostname not in _LOCAL_HOSTS:
-            raise ValueError(
-                f"{_BASE_URL_ENV_VAR} must use https:// (http is allowed only for localhost)"
+            raise CredentialsError(
+                code=CredentialsErrorCode.INSECURE_BASE_URL,
+                message=f"{_BASE_URL_ENV_VAR} must use https:// "
+                "(http is allowed only for localhost)",
             )
+        self._transport: TransportName = _resolve_transport(transport)
         self._http_client: httpx.AsyncClient | None = http_client
         self._owns_http_client = http_client is None
 
@@ -175,8 +253,7 @@ class RealtimeClient:
         self,
         *,
         instructions: str | None = None,
-        model: str | None = None,
-        model_options: RealtimeModelOptions | None = None,
+        model: RealtimeModel | None = None,
         voice: str | VoiceConfig | None = None,
         tools: Sequence[AgentTool] | None = None,
         interruption_sensitivity: InterruptionSensitivity | None = None,
@@ -202,19 +279,51 @@ class RealtimeClient:
         single skill's own folder), or a list mixing directories and inline
         :class:`~cosmo_ai.skills.Skill` objects (a path element expands
         in place); a bad path or malformed SKILL.md raises
-        :class:`~cosmo_ai.skills.SkillParseError` here, not mid-call. A
+        :class:`~cosmo_ai.skills.SkillError` here, not mid-call. A
         directory that yields no skills warns and attaches none.
 
         Fields left ``None`` fall back to the protocol's server-side defaults
         — ``audio.noise_cancellation`` among them, which is off; pass
-        ``AudioConfig(noise_cancellation=True)`` when the microphone will
+        ``AudioConfig(noise_cancellation=NoiseCancellation.VOICE_FOCUS)`` when the microphone will
         hear more than one voice. Open a live run with :meth:`RealtimeAgent.start`.
+
+        :param instructions: System instructions replacing the server's
+            neutral default. This SDK caps them at 16384 characters and
+            rejects a longer value when the session config is built.
+        :param model: What runs on the other end — a provider family alias
+            or concrete model id as a string (``"gemini"``, ``"openai"``,
+            ``"openai_mini"``, ``"grok"``), or a provider block
+            (:class:`GeminiModel`, :class:`OpenAIModel`, …) carrying that
+            provider's knobs. The valid set is server-owned, so an
+            unrecognized value is refused when the session starts.
+        :param voice: Prebuilt voice id as a string, or :class:`VoiceConfig`
+            when a speaking style rides along.
+        :param tools: Everything the agent may call — tools you declare with
+            :func:`~cosmo_ai.tools.client_tool` or the ``@tool`` decorator,
+            plus server-tool opt-ins like :func:`~cosmo_ai.web_search_tool`.
+        :param interruption_sensitivity: How readily user audio barges in
+            over the assistant. See :class:`InterruptionSensitivity`.
+        :param greeting: Opening line the assistant speaks first, without
+            waiting for the user.
+        :param audio: The agent's audio pipeline — output emission and
+            inbound noise cancellation. See :class:`AudioConfig`.
+        :param mcp: Local MCP servers whose tools the agent may call: a
+            path to one ``.mcp.json``, or a list mixing such paths with
+            :class:`~cosmo_ai.mcp.McpStdioServer` values.
+        :param skills: A skills directory, or a list mixing directories with
+            inline :class:`~cosmo_ai.skills.Skill` objects.
+        :param hooks: In-process callbacks that observe or gate the session
+            (:class:`~cosmo_ai.hooks.Hook`), and declarative server-side
+            hooks (:class:`~cosmo_ai.hooks.ServerHook`) the server runs.
+        :raises SkillError: A skills path is unreadable or a ``SKILL.md`` is
+            malformed.
+        :raises McpError: An MCP config path is unreadable or malformed, or
+            two servers share a name.
         """
         return RealtimeAgent(
             _client=self,
             instructions=instructions,
             model=model,
-            model_options=model_options,
             voice=voice,
             tools=_as_tuple(tools),
             interruption_sensitivity=interruption_sensitivity,
@@ -277,7 +386,7 @@ class RealtimeClient:
                 timeout=_SESSION_START_TIMEOUT_S,
             )
         except httpx.HTTPError as exc:
-            raise VerifyError(code="transport_error", message=str(exc)) from exc
+            raise VerifyError(code=VerifyErrorCode.REQUEST_FAILED, message=str(exc)) from exc
         if response.status_code >= 400:
             code, message = _parse_error_detail(response)
             logger.warning(
@@ -285,11 +394,11 @@ class RealtimeClient:
                 status_code=response.status_code,
                 code=code,
             )
-            raise VerifyError(code=code, message=message)
+            raise VerifyError(code=VerifyErrorCode.REQUEST_REJECTED, message=message, server_code=code)
         try:
             return CredentialInfo.model_validate(response.json())
         except (ValidationError, ValueError) as exc:
-            raise VerifyError(code="invalid_response", message=str(exc)) from exc
+            raise VerifyError(code=VerifyErrorCode.INVALID_RESPONSE, message=str(exc)) from exc
 
     async def mint_token(
         self, external_user_id: str, *, ttl_seconds: int | None = None
@@ -310,7 +419,7 @@ class RealtimeClient:
         """
         if not self._can_mint:
             raise MintTokenError(
-                code="no_api_key",
+                code=MintTokenErrorCode.MISSING_API_KEY,
                 message="mint_token requires an api_key credential, not a minted token",
             )
         body: dict[str, object] = {"external_user_id": external_user_id}
@@ -321,10 +430,27 @@ class RealtimeClient:
                 f"{self._base_url}{_MINT_TOKEN_PATH}",
                 json=body,
                 headers=await self._auth_headers(),
-                timeout=_SESSION_START_TIMEOUT_S,
+                timeout=_MINT_TOKEN_TIMEOUT_S,
+                # Per-call, so an injected client built with
+                # ``follow_redirects=True`` cannot follow one before the
+                # check below sees it.
+                follow_redirects=False,
             )
         except httpx.HTTPError as exc:
-            raise MintTokenError(code="transport_error", message=str(exc)) from exc
+            raise MintTokenError(code=MintTokenErrorCode.REQUEST_FAILED, message=str(exc)) from exc
+        if response.is_redirect:
+            # Refused rather than followed: the workspace api key rides on
+            # this request, and a redirect could re-send it to another origin.
+            target = response.headers.get("location")
+            raise MintTokenError(
+                code=MintTokenErrorCode.REQUEST_FAILED,
+                message=(
+                    f"Mint-token endpoint redirected (HTTP {response.status_code}"
+                    + (f" → {target}" if target else "")
+                    + "); redirects are refused so the credential cannot leave "
+                    "the configured origin."
+                ),
+            )
         if response.status_code >= 400:
             code, message = _parse_error_detail(response)
             logger.warning(
@@ -332,11 +458,21 @@ class RealtimeClient:
                 status_code=response.status_code,
                 code=code,
             )
-            raise MintTokenError(code=code, message=message)
+            raise MintTokenError(code=MintTokenErrorCode.REQUEST_REJECTED, message=message, server_code=code)
         try:
-            return MintedToken.model_validate(response.json())
-        except (ValidationError, ValueError) as exc:
-            raise MintTokenError(code="invalid_response", message=str(exc)) from exc
+            payload = response.json()
+        except ValueError as exc:
+            raise MintTokenError(
+                code=MintTokenErrorCode.INVALID_RESPONSE,
+                message="Mint-token response was not JSON.",
+            ) from exc
+        minted = parse_minted_token(payload)
+        if minted is None:
+            raise MintTokenError(
+                code=MintTokenErrorCode.INVALID_RESPONSE,
+                message="Mint-token response missing jwt / expires_at.",
+            )
+        return minted
 
     def _assemble_config(
         self,
@@ -344,8 +480,7 @@ class RealtimeClient:
         name: str | None,
         inputs: Mapping[str, str] | None,
         instructions: str | None,
-        model: str | None,
-        model_options: RealtimeModelOptions | None,
+        model: RealtimeModel | None,
         voice: str | VoiceConfig | None,
         tools: Sequence[AgentTool] | None,
         interruption_sensitivity: InterruptionSensitivity | None,
@@ -383,7 +518,6 @@ class RealtimeClient:
             stored = {
                 "instructions": instructions,
                 "model": model,
-                "model_options": model_options,
                 "interruption_sensitivity": interruption_sensitivity,
                 "audio": audio,
                 "greeting": greeting,
@@ -403,6 +537,7 @@ class RealtimeClient:
             if tools is not None:
                 catalog_values["tools"] = list(tools)
             return SessionConfig(
+                sdk=_sdk_info(),
                 agent=CatalogAgentConfig(**catalog_values),
                 session=SessionParams(**session_values),
             )
@@ -412,8 +547,6 @@ class RealtimeClient:
             agent_values["instructions"] = instructions
         if model is not None:
             agent_values["model"] = model
-        if model_options is not None:
-            agent_values["model_options"] = model_options
         if voice is not None:
             agent_values["voice"] = voice
         if tools is not None:
@@ -427,23 +560,127 @@ class RealtimeClient:
         if greeting is not None:
             agent_values["greeting"] = greeting
         return SessionConfig(
+            sdk=_sdk_info(),
             agent=InlineAgentConfig(**agent_values),
             session=SessionParams(**session_values),
         )
 
-    async def _post_session_start(
+    async def _start_session(
+        self, config: SessionConfig, prepared: PreparedRoom | None = None
+    ) -> StartedSession:
+        """Start a session on this client's lane."""
+        if self._transport == "websocket":
+            return await self._post_ws_session_start(config)
+        return await self._post_session_start(config, prepared)
+
+    async def _prepare_room(self) -> PreparedRoom | None:
+        """POST ``session/prepare-room``. Best-effort by design: any failure
+        logs and returns ``None``, leaving the start on the ordinary path."""
+        try:
+            response = await self._http().post(
+                f"{self._base_url}{_PREPARE_ROOM_PATH}",
+                json={},
+                headers=await self._auth_headers(),
+                timeout=_SESSION_START_TIMEOUT_S,
+            )
+            if response.status_code >= 400:
+                code, _ = _parse_error_detail(response)
+                logger.debug(
+                    "realtime.prepare_room_rejected",
+                    status_code=response.status_code,
+                    code=code,
+                )
+                return None
+            body = response.json()
+            prepared = PreparedRoom(
+                livekit_url=body["livekit_url"],
+                token=body["token"],
+                room_name=body["room_name"],
+                room_grant=body["room_grant"],
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("realtime.prepare_room_failed", error=str(exc))
+            return None
+        logger.debug("realtime.room_prepared", room_name=prepared.room_name)
+        return prepared
+
+    async def _post_ws_session_start(
         self, config: SessionConfig
+    ) -> WsSessionStart:
+        """Start on a self-hosted server's websocket transport.
+
+        Its own route because it answers a socket rather than a room and a
+        join token — Cosmo's managed deployment does not serve it, and the
+        published start contract stays what the managed deployment answers.
+        """
+        body = config.model_dump(mode="json", exclude_none=True, exclude={"id"})
+        headers = await self._auth_headers()
+        try:
+            response = await self._http().post(
+                f"{self._base_url}{_SESSION_WS_START_PATH}",
+                json=body,
+                headers=headers,
+                timeout=_SESSION_START_TIMEOUT_S,
+            )
+        except httpx.HTTPError as exc:
+            raise SessionStartError(code=SessionStartErrorCode.TRANSPORT, message=str(exc)) from exc
+        if response.status_code == 404:
+            raise SessionStartError(
+                code=SessionStartErrorCode.CONFIG,
+                message=(
+                    f"{self._base_url} does not serve the websocket transport; "
+                    "start cosmo-server with COSMO_TRANSPORT=websocket, or drop "
+                    "transport=\"websocket\" to use the WebRTC room transport"
+                ),
+                status=404,
+            )
+        if response.status_code >= 400:
+            code, message = _parse_error_detail(response)
+            logger.warning(
+                "realtime.session_start_rejected",
+                status_code=response.status_code,
+                code=code,
+            )
+            if response.status_code == 401 and self._token_source is not None:
+                # Same reason as the room path, and likelier here: a
+                # self-hosted server generates a signing key at startup, so a
+                # restart invalidates every token minted before it.
+                self._token_source._invalidate()
+            raise SessionStartError(
+                code=_classify_start_rejection(code, response.status_code),
+                message=message,
+                status=response.status_code,
+                server_code=code,
+                retry_after_seconds=_retry_after_seconds(response),
+                detail=_rejection_detail(response),
+            )
+        try:
+            started = WsSessionStart.model_validate(response.json())
+        except (ValidationError, ValueError) as exc:
+            raise SessionStartError(
+                code=SessionStartErrorCode.INVALID_RESPONSE, message=str(exc)
+            ) from exc
+        return started
+
+    async def _post_session_start(
+        self, config: SessionConfig, prepared: PreparedRoom | None = None
     ) -> SessionResponse:
-        body = config.model_dump(mode="json", exclude_none=True)
+        body = config.model_dump(mode="json", exclude_none=True, exclude={"id"})
+        headers = await self._auth_headers()
+        if prepared is not None:
+            headers["x-cosmo-prepared-room-name"] = prepared.room_name
+            headers["x-cosmo-prepared-room-grant"] = prepared.room_grant
         try:
             response = await self._http().post(
                 f"{self._base_url}{_SESSION_START_PATH}",
                 json=body,
-                headers=await self._auth_headers(),
+                headers=headers,
                 timeout=_SESSION_START_TIMEOUT_S,
             )
         except httpx.HTTPError as exc:
-            raise SessionStartError(code="transport_error", message=str(exc)) from exc
+            raise SessionStartError(code=SessionStartErrorCode.TRANSPORT, message=str(exc)) from exc
         if response.status_code >= 400:
             code, message = _parse_error_detail(response)
             logger.warning(
@@ -456,13 +693,20 @@ class RealtimeClient:
                 # (revoked, or clocks disagree): drop it so the next start
                 # fetches fresh.
                 self._token_source._invalidate()
-            if code == "version_mismatch":
-                raise VersionMismatchError(code=code, message=message)
-            raise SessionStartError(code=code, message=message)
+            raise SessionStartError(
+                code=_classify_start_rejection(code, response.status_code),
+                message=message,
+                status=response.status_code,
+                server_code=code,
+                retry_after_seconds=_retry_after_seconds(response),
+                detail=_rejection_detail(response),
+            )
         try:
             return SessionResponse.model_validate(response.json())
         except (ValidationError, ValueError) as exc:
-            raise SessionStartError(code="invalid_response", message=str(exc)) from exc
+            raise SessionStartError(
+                code=SessionStartErrorCode.INVALID_RESPONSE, message=str(exc)
+            ) from exc
 
     async def _post_dial(
         self,
@@ -482,7 +726,7 @@ class RealtimeClient:
                 timeout=_SESSION_START_TIMEOUT_S,
             )
         except httpx.HTTPError as exc:
-            raise DialError(code="transport_error", message=str(exc)) from exc
+            raise DialError(code=DialErrorCode.REQUEST_FAILED, message=str(exc)) from exc
         if response.status_code >= 400:
             code, message = _parse_error_detail(response)
             logger.warning(
@@ -490,11 +734,11 @@ class RealtimeClient:
                 status_code=response.status_code,
                 code=code,
             )
-            raise DialError(code=code, message=message)
+            raise DialError(code=DialErrorCode.REQUEST_REJECTED, message=message, server_code=code)
         try:
             result = DialResult.model_validate(response.json())
         except (ValidationError, ValueError) as exc:
-            raise DialError(code="invalid_response", message=str(exc)) from exc
+            raise DialError(code=DialErrorCode.INVALID_RESPONSE, message=str(exc)) from exc
         logger.info(
             "realtime.dial_succeeded",
             session_id=session_id,
@@ -522,7 +766,7 @@ class RealtimeClient:
                 timeout=_SESSION_START_TIMEOUT_S,
             )
         except httpx.HTTPError as exc:
-            raise UsageError(code="transport_error", message=str(exc)) from exc
+            raise UsageError(code=UsageErrorCode.REQUEST_FAILED, message=str(exc)) from exc
         if response.status_code >= 400:
             code, message = _parse_error_detail(response)
             logger.warning(
@@ -531,11 +775,11 @@ class RealtimeClient:
                 status_code=response.status_code,
                 code=code,
             )
-            raise UsageError(code=code, message=message)
+            raise UsageError(code=UsageErrorCode.REQUEST_REJECTED, message=message, server_code=code)
         try:
             return SessionUsage.model_validate(response.json())
         except (ValidationError, ValueError) as exc:
-            raise UsageError(code="invalid_response", message=str(exc)) from exc
+            raise UsageError(code=UsageErrorCode.INVALID_RESPONSE, message=str(exc)) from exc
 
     async def _auth_headers(self) -> dict[str, str]:
         """Per-request auth + SDK identity, so a caller-supplied
@@ -555,6 +799,17 @@ class RealtimeClient:
         return self._http_client
 
     async def aclose(self) -> None:
+        """Release the HTTP resources this client owns. Idempotent, and the
+        same thing ``async with`` does on exit.
+
+        This ends nothing on the server. Sessions outlive the client that
+        started them, so a live one is ended through the session itself —
+        :meth:`RealtimeSession.end` to tear it down server-side, or
+        :meth:`RealtimeSession.close` to drop the local half and leave it
+        running.
+
+        An ``http_client`` you passed in is left open: you own its lifecycle.
+        """
         # Only close a client we created; a caller-supplied one is theirs.
         if self._owns_http_client and self._http_client is not None:
             await self._http_client.aclose()
@@ -567,6 +822,14 @@ class RealtimeClient:
         await self.aclose()
 
 
+class _PostSessionStart(Protocol):
+    """The client's session-start call; ``prepared`` rides as headers."""
+
+    def __call__(
+        self, config: SessionConfig, prepared: PreparedRoom | None = None
+    ) -> Awaitable[StartedSession]: ...
+
+
 class SessionHandle:
     """Return value of :meth:`RealtimeAgent.start`: an awaitable that is also an async
     context manager, either form yielding the started :class:`RealtimeSession`.
@@ -576,9 +839,7 @@ class SessionHandle:
 
     def __init__(
         self,
-        post_session_start: Callable[
-            [SessionConfig], Awaitable[SessionResponse]
-        ],
+        post_session_start: _PostSessionStart,
         post_dial: PostDial,
         get_usage: GetUsage,
         build_config: Callable[
@@ -589,8 +850,12 @@ class SessionHandle:
         mcp: tuple[McpStdioServer, ...] | None,
         on_state_change: OnStateChange | None,
         hooks: HookEngine | None = None,
+        transport: TransportName = "webrtc",
+        take_prepared: Callable[[], Awaitable[PreparedRoom | None]] | None = None,
     ) -> None:
         self._post_session_start = post_session_start
+        self._transport = transport
+        self._take_prepared = take_prepared
         self._post_dial = post_dial
         self._get_usage = get_usage
         self._build_config = build_config
@@ -624,8 +889,30 @@ class SessionHandle:
                 get_usage=self._get_usage,
                 on_close=connected.aclose if connected is not None else None,
                 hooks=self._hooks,
+                transport=self._transport,
             )
-            return await session._start(self._post_session_start)
+            started_at = time.perf_counter()
+            prepared = (
+                await self._take_prepared() if self._take_prepared is not None else None
+            )
+            if prepared is None:
+                return await session._start(
+                    self._post_session_start, started_at=started_at
+                )
+            # Bind the room ref here so the engine keeps its one-argument
+            # start contract; the headers ride only the bound call, and the
+            # unbound one stays available for the rejected-start retry.
+            post, prepared_ref = self._post_session_start, prepared
+
+            async def _start_with_prepared(config: SessionConfig) -> StartedSession:
+                return await post(config, prepared_ref)
+
+            return await session._start(
+                self._post_session_start,
+                prepared_ref,
+                _start_with_prepared,
+                started_at=started_at,
+            )
         except BaseException:
             if connected is not None:
                 await connected.aclose()
@@ -655,18 +942,37 @@ class RealtimeAgent:
 
     _client: "RealtimeClient" = field(repr=False, compare=False)
     name: str | None = None
+    """Catalog handle this agent runs, for one built by
+    :meth:`RealtimeClient.catalog_agent`. ``None`` for an inline agent."""
     inputs: Mapping[str, str] | None = None
+    """Values for a catalog agent's declared input fields. ``None`` for an
+    inline agent, which has no stored prompt to fill in."""
     instructions: str | None = None
-    model: str | None = None
-    model_options: RealtimeModelOptions | None = None
+    """System instructions as given. ``None`` means the server's default
+    runs — this never reads back the server's own text."""
+    model: RealtimeModel | None = None
+    """What was requested, verbatim: the alias or id string, or the provider
+    block. ``None`` leaves the choice to the server, and this does not tell
+    you what it chose — read :attr:`SessionUsage.model` after the fact."""
     voice: str | VoiceConfig | None = None
+    """The voice as given, string or :class:`VoiceConfig`."""
     tools: tuple[AgentTool, ...] | None = None
+    """Every tool this agent may call, in declaration order."""
     interruption_sensitivity: InterruptionSensitivity | None = None
+    """Barge-in setting as given."""
     greeting: str | None = None
+    """Opening line, if one was set."""
     audio: AudioConfig | None = None
+    """Audio pipeline settings as given."""
     mcp: tuple[McpStdioServer, ...] | None = None
+    """MCP servers after resolution — config-file paths are expanded here, so
+    this is the flat list that will actually be launched."""
     skills: tuple[Skill, ...] | None = None
+    """Skills after resolution — directories are expanded, so this is the
+    flat list with each skill's frontmatter already parsed."""
     hooks: tuple[Hook | ServerHook, ...] | None = None
+    """Hooks as declared, both kinds in one tuple: :class:`Hook` runs
+    in-process here, :class:`ServerHook` is sent for the server to run."""
 
     def start(
         self,
@@ -703,10 +1009,65 @@ class RealtimeAgent:
 
             session = await agent.start()
 
-        Raises :class:`VersionMismatchError` when the server refuses the
+        Raises :class:`SessionStartError` with ``VERSION_MISMATCH`` when the server refuses the
         protocol version and :class:`SessionStartError` for any other
         rejection.
         """
+        return self._session_handle(
+            resume_session_id=resume_session_id,
+            store_recording=store_recording,
+            store_audio=store_audio,
+            store_transcript=store_transcript,
+            store_video=store_video,
+            on_state_change=on_state_change,
+        )
+
+    def prepare_session(
+        self,
+        *,
+        resume_session_id: UUID | str | None = None,
+        store_recording: bool | None = None,
+        store_audio: bool | None = None,
+        store_transcript: bool | None = None,
+        store_video: bool | None = None,
+        on_state_change: OnStateChange | None = None,
+    ) -> "PreparedSession":
+        """Prepare one session ahead of its start, so it starts faster.
+
+        Reserves a room in the background immediately; the returned
+        :class:`PreparedSession` joins it while the session request is still
+        in flight when you call :meth:`PreparedSession.start`, instead of
+        waiting for a room to be allocated. Prepare as early as the app knows
+        a session is coming — while the rest of its setup runs — and start
+        when the user is ready. The arguments are the same per-run options
+        :meth:`start` takes; they are fixed here, and the start takes none.
+
+        Purely an accelerator: a reservation that failed, lapsed, or is
+        declined by the server leaves the start on the ordinary path, with the
+        same result as :meth:`start`. Needs a running event loop and the
+        ``webrtc`` transport (the ``websocket`` lane has no rooms to prepare).
+        """
+        return PreparedSession(
+            self,
+            resume_session_id=resume_session_id,
+            store_recording=store_recording,
+            store_audio=store_audio,
+            store_transcript=store_transcript,
+            store_video=store_video,
+            on_state_change=on_state_change,
+        )
+
+    def _session_handle(
+        self,
+        *,
+        resume_session_id: UUID | str | None,
+        store_recording: bool | None,
+        store_audio: bool | None,
+        store_transcript: bool | None,
+        store_video: bool | None,
+        on_state_change: OnStateChange | None,
+        take_prepared: Callable[[], Awaitable[PreparedRoom | None]] | None = None,
+    ) -> "SessionHandle":
         client = self._client
         client_hooks = server_hooks = None
         if self.hooks is not None:
@@ -729,7 +1090,6 @@ class RealtimeAgent:
                 inputs=self.inputs,
                 instructions=instructions,
                 model=self.model,
-                model_options=self.model_options,
                 voice=self.voice,
                 tools=all_tools or None,
                 interruption_sensitivity=self.interruption_sensitivity,
@@ -744,7 +1104,7 @@ class RealtimeAgent:
             )
 
         return SessionHandle(
-            client._post_session_start,
+            client._start_session,
             client._post_dial,
             client.get_session_usage,
             build_config,
@@ -752,7 +1112,162 @@ class RealtimeAgent:
             self.mcp,
             on_state_change,
             hooks=HookEngine(client_hooks) if client_hooks is not None else None,
+            transport=client._transport,
+            take_prepared=take_prepared,
         )
+
+
+class PreparedSession:
+    """One session prepared ahead of its start: a room reserved in the
+    background that :meth:`start` joins while the session request is still
+    in flight. Build one with :meth:`RealtimeAgent.prepare_session`, which
+    documents the arguments.
+
+    The reservation is refreshed in the background until the handle is
+    started or closed, so one held for hours stays warm. :meth:`start` is
+    single-use — prepare another session for another start — and a handle
+    that will never be started should be :meth:`close`\\ d so the refresh
+    stops.
+    """
+
+    def __init__(
+        self,
+        agent: RealtimeAgent,
+        *,
+        resume_session_id: UUID | str | None = None,
+        store_recording: bool | None = None,
+        store_audio: bool | None = None,
+        store_transcript: bool | None = None,
+        store_video: bool | None = None,
+        on_state_change: OnStateChange | None = None,
+    ) -> None:
+        client = agent._client
+        if client._transport == "websocket":
+            raise ValueError(
+                "prepare_session needs the webrtc transport; the websocket lane "
+                "has no rooms to prepare"
+            )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            raise RuntimeError(
+                "prepare_session must be called from a running event loop"
+            ) from None
+        self._agent = agent
+        self._reserve = client._prepare_room
+        self._run_options: dict[str, Any] = {
+            "resume_session_id": resume_session_id,
+            "store_recording": store_recording,
+            "store_audio": store_audio,
+            "store_transcript": store_transcript,
+            "store_video": store_video,
+            "on_state_change": on_state_change,
+        }
+        self._room: PreparedRoom | None = None
+        self._started = False
+        self._closed = False
+        self._taken = False
+        self._inflight: asyncio.Future[PreparedRoom | None] = asyncio.ensure_future(
+            self._reserve()
+        )
+        self._refresh = loop.create_task(self._keep_reserved())
+
+    async def _keep_reserved(self) -> None:
+        """Land the reservation, then renew it before the room lapses; one the
+        server declines ends the refresh and the start runs ordinarily."""
+        while True:
+            # Shielded: a take cancels this loop but still wants the room the
+            # in-flight reservation is about to produce.
+            room = await asyncio.shield(self._inflight)
+            if room is None:
+                return
+            self._room = room
+            await asyncio.sleep(PREPARED_ROOM_REFRESH_S)
+            self._inflight = asyncio.ensure_future(self._reserve())
+
+    def start(self) -> SessionHandle:
+        """Start the prepared session: an awaitable that is also an async
+        context manager, exactly as :meth:`RealtimeAgent.start` returns::
+
+            async with prepared.start() as session:
+                ...
+
+        Raises :class:`SessionStartError`
+        as :meth:`RealtimeAgent.start` does, and ``RuntimeError`` on a second
+        call — the handle is single-use, and so is the handle it returns.
+        """
+        if self._started or self._closed:
+            raise RuntimeError(
+                "PreparedSession.start is single-use; prepare another session"
+            )
+        self._started = True
+        # Stopped here, not at the take: the take runs after the session's
+        # own setup, and a setup that fails must not leave a refresh behind.
+        self._refresh.cancel()
+        return self._agent._session_handle(take_prepared=self._take, **self._run_options)
+
+    async def _take(self) -> PreparedRoom | None:
+        """Hand the reserved room to the start, waiting for a reservation
+        still in flight. Stale rooms are dropped; a second take raises."""
+        if self._taken:
+            raise RuntimeError(
+                "PreparedSession.start is single-use; prepare another session"
+            )
+        self._taken = True
+        room = (await self._inflight) or self._room
+        self._room = None
+        if room is not None and room.is_stale():
+            logger.debug("realtime.prepared_room_stale", room_name=room.room_name)
+            return None
+        return room
+
+    async def close(self) -> None:
+        """Drop the reservation and stop refreshing it. A no-op once started:
+        the start owns the reservation from then on."""
+        if self._started:
+            return
+        self._closed = True
+        self._refresh.cancel()
+        with contextlib.suppress(BaseException):
+            await self._refresh
+        self._inflight.cancel()
+        with contextlib.suppress(BaseException):
+            await self._inflight
+        self._room = None
+
+
+_TRANSPORT_NAMES: tuple[str, ...] = ("webrtc", "websocket", "livekit")
+
+
+def _resolve_transport(
+    transport: "TransportName | None",
+) -> "TransportName":
+    """The lane this client runs on: the argument, then ``COSMO_TRANSPORT``,
+    then the room transport Cosmo serves.
+
+    An unrecognized name is refused rather than defaulted. Everything that is
+    not exactly ``"websocket"`` runs the room lane, so a typo would otherwise
+    post to the wrong endpoint and read as a server problem."""
+    if transport is None:
+        # Unset is the room lane. An empty environment variable is unset too;
+        # an empty argument is a caller who meant something and got it wrong.
+        named = (os.environ.get(_TRANSPORT_ENV_VAR) or "").strip().lower()
+        if not named:
+            return "webrtc"
+        source = _TRANSPORT_ENV_VAR
+    else:
+        named = transport
+        source = "transport"
+    if named not in _TRANSPORT_NAMES:
+        raise ValueError(f"{source} must be webrtc or websocket, got {named!r}")
+    if named == "livekit":
+        warnings.warn(
+            "transport='livekit' is deprecated; use transport='webrtc'",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return "webrtc"
+    return "websocket" if named == "websocket" else "webrtc"
 
 
 def _parse_error_detail(response: httpx.Response) -> tuple[str, str]:
@@ -796,6 +1311,25 @@ def _parse_error_detail(response: httpx.Response) -> tuple[str, str]:
         return "invalid_session_config", _format_validation_errors(detail)
 
     return fallback_code, response.text[:500]
+
+
+def _rejection_detail(response: httpx.Response) -> SessionStartRejection | None:
+    """The server's structured rejection body, or ``None`` when it sent none.
+
+    Reads the same two shapes as ``_parse_error_detail`` — the external
+    ``{"error": {...}}`` envelope and the internal ``{"detail": {...}}`` — and
+    keeps every field, including ones this SDK does not name.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    for body in (payload.get("error"), payload.get("detail")):
+        if isinstance(body, dict) and body.get("code"):
+            return SessionStartRejection._from_body(body)
+    return None
 
 
 _MAX_RENDERED_VALIDATION_ERRORS = 5

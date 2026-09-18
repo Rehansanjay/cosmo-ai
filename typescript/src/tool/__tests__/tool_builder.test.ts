@@ -1,17 +1,39 @@
-/** The ``tool()`` builder: construction-time checks, the three input
+/** The ``clientTool()`` builder: construction-time checks, the two input
  *  forms, the normalized ``INVALID_INPUT`` error contract, lowering to the
  *  hand-written spec shape, and the dispatch-layer integration (envelope +
  *  hook-rewrite attribution). Python mirror: ``tests/test_tool_decorator.py``. */
 
 import { describe, expect, it, vi } from 'vitest';
+import { agentToolPayload, buildAgentSessionConfig } from '../../core/agent';
 import * as z from 'zod/v4';
 
 import type { RpcInvocation } from '../../transport/types';
-import type { RealtimeTool } from '../../core/agent';
+import type { AgentTool, BackgroundClientTool, ClientTool } from '../../core/agent';
+
 import { registerClientToolHandlers } from '../../core/client_tools';
 import { HookEngine, preToolUse } from '../../core/hooks';
-import { ToolInputValidationError, ToolSchemaError, tool } from '../index';
+import {
+  RealtimeError,
+  ToolInputValidationError,
+  ToolDefinitionError,
+  type ToolDefinitionErrorCode,
+  backgroundClientTool,
+  clientTool,
+} from '../index';
 import { zodInput } from '../zod';
+
+/** ``clientTool()`` returns the opaque public type, so the builder tests
+ *  narrow through the internal payload to read the declared shape they
+ *  assert on. */
+const declared = (t: AgentTool): ClientTool | BackgroundClientTool =>
+  agentToolPayload(t) as ClientTool | BackgroundClientTool;
+
+/** The two handler shapes differ in arity, so invoking one needs the branch. */
+const clientHandler = (t: AgentTool): ClientTool['handler'] =>
+  (agentToolPayload(t) as ClientTool).handler;
+const backgroundHandler = (t: AgentTool): BackgroundClientTool['handler'] =>
+  (agentToolPayload(t) as BackgroundClientTool).handler;
+
 
 const SESSION = 'sess-1';
 
@@ -39,9 +61,9 @@ function makeRegistrar() {
   };
 }
 
-function registerOne(spec: RealtimeTool, opts: { hooks?: HookEngine } = {}) {
+function registerOne(spec: AgentTool, opts: { hooks?: HookEngine } = {}) {
   const registrar = makeRegistrar();
-  registerClientToolHandlers(registrar, [spec], {
+  registerClientToolHandlers(registrar, [agentToolPayload(spec)], {
     hooks: opts.hooks ?? null,
     sessionId: SESSION,
   });
@@ -57,88 +79,104 @@ const weatherInput = () =>
   );
 
 describe('construction-time checks', () => {
+  /** A message regex passes on a plain `Error` too, so every case below also
+   *  asserts the type and the code — that is what pins the declaration paths
+   *  to the error family. */
+  function expectDefinitionError(fn: () => unknown, code: ToolDefinitionErrorCode): void {
+    let thrown: unknown;
+    try {
+      fn();
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(ToolDefinitionError);
+    expect(thrown).toBeInstanceOf(RealtimeError);
+    expect((thrown as ToolDefinitionError).code).toBe(code);
+  }
+
   it('rejects a name outside the tool-name grammar', () => {
-    expect(() =>
-      tool({ name: 'Bad-Name', description: 'x', parameters: { type: 'object' } }),
-    ).toThrow(/must match/);
+    const build = () =>
+      clientTool({ name: 'Bad-Name', description: 'x', parameters: { type: 'object' }, handler: async () => ({}) });
+    expect(build).toThrow(/must match/);
+    expectDefinitionError(build, 'invalid_tool_name');
   });
 
   it('requires a description', () => {
-    expect(() =>
-      tool({ name: 'get_weather', description: '', parameters: { type: 'object' } }),
-    ).toThrow(/has no description/);
+    const build = () =>
+      clientTool({ name: 'get_weather', description: '', parameters: { type: 'object' }, handler: async () => ({}) });
+    expect(build).toThrow(/has no description/);
+    expectDefinitionError(build, 'missing_description');
   });
 
   it('reports actual and max length for an overlong description', () => {
-    expect(() =>
-      tool({
+    const build = () =>
+      clientTool({
         name: 'get_weather',
         description: 'x'.repeat(2049),
         parameters: { type: 'object' },
-      }),
-    ).toThrow(/2049 characters; the protocol limit is 2048/);
+        handler: async () => ({}),
+      });
+    expect(build).toThrow(/2049 characters; the protocol limit is 2048/);
+    expectDefinitionError(build, 'description_too_long');
+  });
+
+  it('routes a reserved SDK-prefixed name through ToolDefinitionError', () => {
+    // The guard lives in buildAgentSessionConfig, so it fires at start rather
+    // than at construction — it threw a plain Error, outside the family.
+    const squatter = clientTool({
+      name: 'get_weather',
+      description: 'x',
+      parameters: { type: 'object' },
+      handler: async () => ({}),
+    });
+    const build = () =>
+      buildAgentSessionConfig(
+        { tools: [{ ...squatter, name: 'cosmo_sdk_draw_box' }] } as never,
+        {},
+      );
+    expect(build).toThrow(ToolDefinitionError);
+    expectDefinitionError(build, 'invalid_tool_name');
   });
 
   it('rejects a description with a control character', () => {
     expect(() =>
-      tool({
+      clientTool({
         name: 'get_weather',
         description: 'badtext',
         parameters: { type: 'object' },
+        handler: async () => ({}),
       }),
     ).toThrow(/control character/);
   });
 
   it('dialect-checks raw parameters', () => {
     expect(() =>
-      tool({
+      clientTool({
         name: 'get_weather',
         description: 'Weather',
         parameters: {
           type: 'object',
           properties: { sku: { type: 'string', pattern: '^[A-Z]+$' } },
         },
+        handler: async () => ({}),
       }),
-    ).toThrow(ToolSchemaError);
-  });
-
-  it('dialect-checks unsafeParameters', () => {
-    expect(() =>
-      tool({
-        name: 'get_weather',
-        description: 'Weather',
-        input: z.object({ city: z.string() }),
-        unsafeParameters: { type: 'string' },
-        handler: async () => null,
-      }),
-    ).toThrow(ToolSchemaError);
-  });
-
-  it('rejects a bare Standard Schema passed as input', () => {
-    const opts = {
-      name: 'get_weather',
-      description: 'Weather',
-      input: z.object({ city: z.string() }),
-      handler: async () => null,
-    };
-    // @ts-expect-error a bare Standard Schema needs the unsafeParameters form
-    expect(() => tool(opts)).toThrow(/unsafeParameters/);
+    ).toThrow(ToolDefinitionError);
   });
 });
 
 describe('lowering', () => {
   it('emits the hand-written spec shape', () => {
-    const spec = tool({
+    const spec = clientTool({
       name: 'get_weather',
       description: 'Current weather for a city',
       input: weatherInput(),
       handler: async () => null,
     });
-    expect(spec.kind).toBe('client');
-    expect(spec.background).toBeUndefined();
-    expect(spec.name).toBe('get_weather');
-    expect(spec.description).toBe('Current weather for a city');
-    expect(spec.parameters).toEqual({
+    expect(declared(spec).kind).toBe('client');
+    expect(declared(spec).background).toBeUndefined();
+    expect(declared(spec).name).toBe('get_weather');
+    expect(declared(spec).description).toBe('Current weather for a city');
+    expect(declared(spec).parameters).toEqual({
       type: 'object',
       properties: {
         city: { type: 'string' },
@@ -146,21 +184,20 @@ describe('lowering', () => {
       },
       required: ['city'],
     });
-    expect(typeof spec.handler).toBe('function');
+    expect(typeof declared(spec).handler).toBe('function');
   });
 
-  it('background form lowers to a BackgroundClientToolSpec', () => {
-    const spec = tool({
+  it('background form lowers to a BackgroundClientTool', () => {
+    const spec = backgroundClientTool({
       name: 'export_report',
       description: 'Export a report',
       input: weatherInput(),
-      background: true,
       handler: async (_args, job) => {
         await job.ack('started');
       },
     });
-    expect(spec.kind).toBe('client');
-    expect(spec.background).toBe(true);
+    expect(declared(spec).kind).toBe('client');
+    expect(declared(spec).background).toBe(true);
   });
 
   it('raw form passes parameters through verbatim', () => {
@@ -168,20 +205,24 @@ describe('lowering', () => {
       type: 'object',
       properties: { city: { type: 'string' } },
     };
-    const spec = tool({
+    const spec = clientTool({
       name: 'get_weather',
       description: 'Weather',
       parameters,
+      handler: async () => ({}),
     });
-    expect(spec.parameters).toBe(parameters);
-    expect(spec.handler).toBeUndefined();
+    expect(declared(spec).parameters).toBe(parameters);
+    // A client tool carries the handler that runs it. The raw form still
+    // wraps the authored one — validation is a passthrough here — so what
+    // lowers is a function, not the absence of one.
+    expect(typeof declared(spec).handler).toBe('function');
   });
 });
 
 describe('typed validation', () => {
   it('passes validated, default-filled args to the handler', async () => {
     const seen: unknown[] = [];
-    const spec = tool({
+    const spec = clientTool({
       name: 'get_weather',
       description: 'Weather',
       input: weatherInput(),
@@ -190,7 +231,7 @@ describe('typed validation', () => {
         return { ok: true };
       },
     });
-    const result = await spec.handler?.({ city: 'Oslo' });
+    const result = await clientHandler(spec)?.({ city: 'Oslo' });
     expect(result).toEqual({ ok: true });
     expect(seen).toEqual([{ city: 'Oslo', unit: 'c' }]);
   });
@@ -200,7 +241,7 @@ describe('typed validation', () => {
       z.object({ city: z.string().transform((value) => value.length) }),
     );
     const seen: unknown[] = [];
-    const spec = tool({
+    const spec = clientTool({
       name: 'get_weather',
       description: 'Weather',
       input,
@@ -214,12 +255,41 @@ describe('typed validation', () => {
       properties: { city: { type: 'string' } },
       required: ['city'],
     });
-    await spec.handler?.({ city: 'Oslo' });
+    await clientHandler(spec)?.({ city: 'Oslo' });
     expect(seen).toEqual([4]);
   });
 
+  it('does not start authored code when cancellation lands during async validation', async () => {
+    let finishValidation!: () => void;
+    let validationStarted!: () => void;
+    const started = new Promise<void>((resolve) => { validationStarted = resolve; });
+    const input = zodInput(z.object({
+      city: z.string().refine(async () => {
+        validationStarted();
+        await new Promise<void>((resolve) => { finishValidation = resolve; });
+        return true;
+      }),
+    }));
+    const authored = vi.fn(async () => null);
+    const spec = clientTool({
+      name: 'get_weather',
+      description: 'Weather',
+      input,
+      handler: authored,
+    });
+    const controller = new AbortController();
+    const running = clientHandler(spec)?.({ city: 'Oslo' }, controller.signal);
+    await started;
+
+    controller.abort();
+    finishValidation();
+
+    await expect(running).rejects.toBe(controller.signal.reason);
+    expect(authored).not.toHaveBeenCalled();
+  });
+
   it('throws the normalized INVALID_INPUT shape without submitted values', async () => {
-    const spec = tool({
+    const spec = clientTool({
       name: 'get_weather',
       description: 'Weather',
       input: weatherInput(),
@@ -228,7 +298,7 @@ describe('typed validation', () => {
     const secret = 'hunter2-credential';
     let thrown: unknown = null;
     try {
-      await spec.handler?.({ unit: secret });
+      await clientHandler(spec)?.({ unit: secret });
     } catch (err) {
       thrown = err;
     }
@@ -256,7 +326,7 @@ describe('typed validation', () => {
         g: z.string(),
       }),
     );
-    const spec = tool({
+    const spec = clientTool({
       name: 'many_fields',
       description: 'Many fields',
       input,
@@ -264,7 +334,7 @@ describe('typed validation', () => {
     });
     let thrown: unknown = null;
     try {
-      await spec.handler?.({});
+      await clientHandler(spec)?.({});
     } catch (err) {
       thrown = err;
     }
@@ -279,7 +349,7 @@ describe('typed validation', () => {
         items: z.array(z.object({ sku: z.string() })),
       }),
     );
-    const spec = tool({
+    const spec = clientTool({
       name: 'submit_order',
       description: 'Submit an order',
       input,
@@ -287,7 +357,7 @@ describe('typed validation', () => {
     });
     let thrown: unknown = null;
     try {
-      await spec.handler?.({ items: [{ sku: 'ok' }, {}] });
+      await clientHandler(spec)?.({ items: [{ sku: 'ok' }, {}] });
     } catch (err) {
       thrown = err;
     }
@@ -295,64 +365,34 @@ describe('typed validation', () => {
   });
 
   it('fails closed on a non-object handler return', async () => {
-    const spec = tool({
+    const spec = clientTool({
       name: 'get_weather',
       description: 'Weather',
       input: weatherInput(),
       handler: async () => 'nope' as unknown as null,
     });
-    await expect(spec.handler?.({ city: 'Oslo' })).rejects.toThrow(
+    await expect(clientHandler(spec)?.({ city: 'Oslo' })).rejects.toThrow(
       /result must be an object/,
     );
   });
 
   it('background typed handler validates before user code', async () => {
-    const spec = tool({
+    const spec = backgroundClientTool({
       name: 'export_report',
       description: 'Export a report',
       input: weatherInput(),
-      background: true,
       handler: async () => {
         throw new Error('user code must not run');
       },
     });
     const job = { ack: async () => undefined } as never;
-    await expect(spec.handler?.({}, job)).rejects.toThrow(/INVALID_INPUT/);
-  });
-});
-
-describe('unsafe Standard Schema form', () => {
-  it('validates through the schema but reports paths only', async () => {
-    const spec = tool({
-      name: 'get_weather',
-      description: 'Weather',
-      input: z.object({ city: z.string() }),
-      unsafeParameters: {
-        type: 'object',
-        properties: { city: { type: 'string' } },
-      },
-      handler: async (args) => ({ length: args.city.length }),
-    });
-    expect(await spec.handler?.({ city: 'Oslo' })).toEqual({ length: 4 });
-
-    let thrown: unknown = null;
-    try {
-      await spec.handler?.({ city: 42 });
-    } catch (err) {
-      thrown = err;
-    }
-    expect(thrown).toBeInstanceOf(ToolInputValidationError);
-    expect((thrown as ToolInputValidationError).message).toBe(
-      'INVALID_INPUT: get_weather rejected parameters:\n' +
-        '- city: invalid\n' +
-        'Fix the input and retry.',
-    );
+    await expect(backgroundHandler(spec)?.({}, job)).rejects.toThrow(/INVALID_INPUT/);
   });
 });
 
 describe('dispatch integration', () => {
   it('a malformed model call becomes the {ok: false} envelope', async () => {
-    const spec = tool({
+    const spec = clientTool({
       name: 'get_weather',
       description: 'Weather',
       input: weatherInput(),
@@ -369,7 +409,7 @@ describe('dispatch integration', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const errorLog = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     try {
-      const spec = tool({
+      const spec = clientTool({
         name: 'get_weather',
         description: 'Weather',
         input: weatherInput(),
@@ -397,7 +437,7 @@ describe('dispatch integration', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const errorLog = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     try {
-      const spec = tool({
+      const spec = clientTool({
         name: 'get_weather',
         description: 'Weather',
         input: weatherInput(),
@@ -425,7 +465,7 @@ describe('dispatch integration', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const errorLog = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     try {
-      const spec = tool({
+      const spec = clientTool({
         name: 'get_weather',
         description: 'Weather',
         input: weatherInput(),

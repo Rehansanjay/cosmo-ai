@@ -47,7 +47,9 @@ const BAR_CONFIG: Record<
   speaking: { animation: 'cosmo-rtbv-active', duration: '0.6s' },
 };
 
+/** Props for ``<BarVisualizer />``. */
 export type BarVisualizerProps = {
+  /** Class applied to the container element, for your own styling. */
   className?: string;
 };
 

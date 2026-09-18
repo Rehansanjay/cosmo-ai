@@ -1,5 +1,5 @@
 /**
- * ``zodInput`` — the Zod converter entry point for ``tool({ input })``.
+ * ``zodInput`` — the Zod converter entry point for ``clientTool({ input })``.
  *
  * Statically imports the Zod v4 API (the ``zod/v4`` subpath, which must
  * resolve to zod ^4.2 — see ``ZodV4Guard``); ``zod`` is an optional peer
@@ -10,7 +10,7 @@
  *
  * Conversion runs the strict builder pipeline at the ``zodInput()`` call:
  * ``z.toJSONSchema`` → ref inlining → normalize (safe drops silent, lossy
- * constructs throw ``ToolSchemaError``) → restricted-dialect check.
+ * constructs throw ``ToolDefinitionError``) → restricted-dialect check.
  *
  * Validation issues are sanitized from Zod's structured fields only
  * (``path`` / ``code`` / expected values) — ``issue.message`` can embed the
@@ -19,7 +19,7 @@
 
 import * as z from 'zod/v4';
 
-import type { ToolInputIssue } from './errors';
+import { issuePath, type ToolInputIssue } from './errors';
 import { mintToolInput, type ToolInput } from './input';
 import { buildToolParameters } from './schema';
 
@@ -101,8 +101,10 @@ function issueConstraint(issue: ZodIssueLike): string {
 
 function sanitizeIssues(issues: readonly ZodIssueLike[]): ToolInputIssue[] {
   return issues.map((issue) => ({
-    path: issue.path.map((segment) =>
-      typeof segment === 'number' ? segment : String(segment),
+    path: issuePath(
+      issue.path.map((segment) =>
+        typeof segment === 'number' ? segment : String(segment),
+      ),
     ),
     code: issue.code ?? 'unknown',
     constraint: issueConstraint(issue),
@@ -118,19 +120,22 @@ function sanitizeIssues(issues: readonly ZodIssueLike[]): ToolInputIssue[] {
 type ZodVersionMismatch = {
   readonly ['cosmo-ai requires zod@^4.2; the resolved "zod/v4" is older (zod@4.0/4.1, or the zod@3.25 compat shim)']: never;
 };
+/** ``never`` when the resolved Zod is new enough, and otherwise the
+ *  explanatory type above — which is what makes ``zodInput`` reject an old
+ *  Zod with a readable message. */
 type ZodV4Guard = 'toJSONSchema' extends keyof z.ZodType ? never : ZodVersionMismatch;
 
 /** Convert a Zod object schema into a {@link ToolInput}: the dialect JSON
  *  Schema plus a validator whose issues are sanitized from structured
- *  fields only. Throws ``ToolSchemaError`` at the call when the schema
- *  cannot be expressed in the restricted dialect; ``opts.name`` labels
+ *  fields only. Throws ``ToolDefinitionError`` at the call when the schema
+ *  cannot be expressed in the restricted dialect; ``options.name`` labels
  *  that error with the tool the schema is for. */
 export function zodInput<S extends z.ZodType>(
   schema: [ZodV4Guard] extends [never] ? S : ZodV4Guard,
-  opts?: { name?: string },
+  options?: { name?: string },
 ): ToolInput<z.output<S>> {
   const raw = z.toJSONSchema(schema, { io: 'input' }) as Record<string, unknown>;
-  const parameters = buildToolParameters(raw, opts?.name ?? 'zodInput');
+  const parameters = buildToolParameters(raw, options?.name ?? 'zodInput');
   return mintToolInput<z.output<S>>({
     parameters,
     validate: async (args) => {

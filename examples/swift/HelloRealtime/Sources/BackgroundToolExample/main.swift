@@ -29,7 +29,7 @@ struct StatusArgs: Decodable, Sendable {
     let service: String
 }
 
-let checkStatus = try AgentTool.define(
+let checkStatus = try AgentTool.clientTool(
     name: "check_status",
     description: "Current status of a named service. Answers immediately.",
     input: .object(
@@ -50,7 +50,7 @@ struct ExportArgs: Decodable, Sendable {
 // `defineBackground` gives the handler a second argument, a `ClientToolJob`.
 // The job is the handle for one invocation: `ack` releases the reply, and
 // `complete` / `fail` delivers the outcome once the work is done.
-let exportReport = try AgentTool.defineBackground(
+let exportReport = try AgentTool.backgroundClientTool(
     name: "export_report",
     description: """
         Export the quarterly report. Takes a while, so it returns immediately \
@@ -89,8 +89,7 @@ actor ReadyFlag {
 }
 let readyFlag = ReadyFlag()
 
-let options = try RealtimeClient.Options()
-let client = RealtimeClient(options)
+let client = try RealtimeClient()
 let agent = try client.agent(
     instructions: """
         You are a terse reporting assistant. When the user asks for an export, \
@@ -100,7 +99,7 @@ let agent = try client.agent(
     tools: [checkStatus, exportReport]
 )
 
-print("Connecting to \(options.baseURL.absoluteString)…")
+print("Connecting…")
 let session = try await agent.start(micMuted: true)
 
 let pump = Task {

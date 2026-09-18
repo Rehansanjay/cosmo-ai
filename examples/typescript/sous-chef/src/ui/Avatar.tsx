@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { useAgentState, useOutputLevel, useToolCalls } from 'cosmo-ai';
+import { useAgentState, useOutputLevel, useToolCalls } from 'cosmo-ai/react';
 
 import { cookStore, useCookState } from '../state/cook';
 

@@ -11,24 +11,33 @@ protocol state machine, client-tool dispatch — is vendor-free.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import structlog
 
 from cosmo_ai._internal.logging import get_logger
+from cosmo_ai._internal.prepared_room import PreparedRoom
 from cosmo_ai._internal.transport import (
     AgentAudioSink,
+    MicSource,
     RpcHandler,
     RpcInvocation,
     RpcMethodError,
+    StartedSession,
     TransportCallbacks,
     TransportClose,
 )
-from cosmo_ai.audio import AGENT_AUDIO_SAMPLE_RATE, AgentAudioFrame
-from cosmo_ai.errors import NotConnectedError, VideoPublishAlreadyActiveError
+from cosmo_ai.audio import (
+    AGENT_AUDIO_SAMPLE_RATE,
+    AgentAudioFrame,
+    MicrophoneCapture,
+)
+from cosmo_ai.audio._pcm import PcmAudioSource
+from cosmo_ai.errors import SessionStateError, SessionStateErrorCode
 from cosmo_ai._internal.protocol import SessionResponse
 
 logger: structlog.stdlib.BoundLogger = get_logger(__name__)
@@ -62,13 +71,28 @@ class _VideoPublishState:
     stopped: bool = False
 
 
+#: Participant attribute on the agent carrying the external ``ready`` frame
+#: verbatim — room state every joiner reads, however late, where the
+#: one-shot data-channel broadcast can be missed.
+READY_ATTRIBUTE = "cosmo.ready"
+
+
 class LiveKitTransport:
     """Production transport: a LiveKit room for audio and the data channel."""
 
     def __init__(self) -> None:
         self._room: Any = None  # rtc.Room | None
+        #: Set when the room went down while ``connect`` was still in flight.
+        #: Read by the session as pre-ready failure evidence.
+        self._connect_lost: TransportClose | None = None
+        self._ready_attribute_seen = False
         self._callbacks: TransportCallbacks | None = None
         self._video_publish: _VideoPublishState | None = None
+        # The WebRTC source this transport built for a PcmAudioSource, with
+        # the publication it belongs to. Keyed, because unpublish_track also
+        # serves screen share and video streams and must not close audio.
+        self._owned_source: PcmAudioSource | None = None
+        self._owned_source_sid: str | None = None
         self._agent_audio_sink: AgentAudioSink | None = None
         self._agent_audio_track: Any = None  # rtc.RemoteAudioTrack | None
         self._agent_audio_task: asyncio.Task[None] | None = None
@@ -79,12 +103,34 @@ class LiveKitTransport:
 
     async def connect(
         self,
-        response: SessionResponse,
+        started: StartedSession,
         callbacks: TransportCallbacks,
+    ) -> None:
+        if not isinstance(started, SessionResponse):
+            raise SessionStateError(
+                code=SessionStateErrorCode.NOT_CONNECTED,
+                message="this session start carries no room to join; it was answered "
+                "by a server running its websocket transport",
+            )
+        await self._join(started.livekit_url, started.token, callbacks)
+
+    async def connect_prepared(
+        self, prepared: PreparedRoom, callbacks: TransportCallbacks
+    ) -> None:
+        """Join a room minted before the session start, on its held token.
+
+        The start that names this room is still in flight; nothing here reads
+        the start response, which is what lets the two run concurrently.
+        """
+        await self._join(prepared.livekit_url, prepared.token, callbacks)
+
+    async def _join(
+        self, livekit_url: str, token: str, callbacks: TransportCallbacks
     ) -> None:
         rtc = _import_livekit_rtc("RealtimeSession")
         _quiet_expected_livekit_streams()
         self._callbacks = callbacks
+        self._connect_lost = None
         # Frames may be pushed from a capture thread, which has no loop of its
         # own; the publish they trigger has to run on this one.
         self._loop = asyncio.get_running_loop()
@@ -94,8 +140,12 @@ class LiveKitTransport:
         room.on("reconnecting", self._on_reconnecting)
         room.on("reconnected", self._on_reconnected)
         room.on("track_subscribed", self._on_track_subscribed)
+        room.on(
+            "participant_attributes_changed",
+            self._on_participant_attributes_changed,
+        )
         try:
-            await room.connect(response.livekit_url, response.token)
+            await room.connect(livekit_url, token)
         except BaseException:
             # BaseException: a cancelled connect must not leak a half-open room.
             try:
@@ -114,6 +164,11 @@ class LiveKitTransport:
         pending, self._pending_rpc = self._pending_rpc, {}
         for name, handler in pending.items():
             self._bind_rpc_method(name, handler)
+        # The agent may already be up: its readiness attribute arrives with
+        # the join-time participant state, where its one-shot ready frame
+        # would already have been missed.
+        for participant in room.remote_participants.values():
+            self._maybe_emit_ready_attribute(participant)
 
     def is_connected(self) -> bool:
         return self._room is not None and self._room.isconnected()
@@ -127,6 +182,13 @@ class LiveKitTransport:
         self._stop_agent_audio_reader()
         self._agent_audio_track = None
         self._halt_publish(state)
+        # Every teardown path lands here, and an ordinary session end never
+        # unpublishes first — without this the SDK-built source keeps its
+        # native handle for the life of the process.
+        owned, self._owned_source = self._owned_source, None
+        self._owned_source_sid = None
+        if owned is not None:
+            await owned.aclose()
         if room is not None:
             try:
                 await room.disconnect()
@@ -148,8 +210,9 @@ class LiveKitTransport:
             if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT
         ]
         if not agent_identities:
-            raise NotConnectedError(
-                f"no agent participant to receive bytes on {topic!r}"
+            raise SessionStateError(
+                code=SessionStateErrorCode.NOT_CONNECTED,
+                message=f"no agent participant to receive bytes on {topic!r}",
             )
         writer = await room.local_participant.stream_bytes(
             name=topic,
@@ -189,29 +252,56 @@ class LiveKitTransport:
 
         room.local_participant.register_rpc_method(name, rpc_method)
 
+    def _participant_is_agent(self, participant: Any) -> bool:
+        """True when ``participant``'s ``kind`` is ``agent``.
+
+        Reads the kind off the participant the event carried, so the answer
+        does not depend on a room. ``disconnect`` releases the room first,
+        and a frame dispatched after that used to be logged as a stranger's
+        for want of a roster to resolve the sender against."""
+        rtc = _import_livekit_rtc("participant kind")
+        return bool(participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT)
+
     def _caller_is_agent(self, caller_identity: str) -> bool:
         """True when ``caller_identity`` belongs to a remote participant whose
         ``kind`` is ``agent``. The local participant and any human remote are
         not agents."""
-        rtc = _import_livekit_rtc("client tools")
         room = self._room
         if room is None:
             return False
         participant = room.remote_participants.get(caller_identity)
         if participant is None:
             return False
-        return bool(participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT)
+        return self._participant_is_agent(participant)
 
     # ── Audio ──────────────────────────────────────────────────────
+
+    def create_mic_source(self, capture: Optional[MicrophoneCapture]) -> MicSource:
+        from cosmo_ai.audio._mic import MicAudioSource
+
+        return MicAudioSource(capture)
 
     async def publish_audio_source(
         self, source: Any, *, track_name: str = "mic"
     ) -> Any:
         room = self._require_room()
         rtc = _import_livekit_rtc("publish_audio_source")
+        if isinstance(source, PcmAudioSource):
+            # A portable source publishes here through the WebRTC source it
+            # builds on demand, so one caller-owned source works on both
+            # lanes without the caller choosing. That inner source is ours,
+            # so it is held for closing when the track is unpublished.
+            owned = source
+            source = source.livekit_source()
+        else:
+            owned = None
         track = rtc.LocalAudioTrack.create_audio_track(track_name, source)
         options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
-        return await room.local_participant.publish_track(track, options)
+        publication = await room.local_participant.publish_track(track, options)
+        if owned is not None:
+            self._owned_source = owned
+            self._owned_source_sid = getattr(publication, "sid", None)
+        return publication
 
     async def unpublish_track(self, publication: Any) -> None:
         room = self._room
@@ -221,6 +311,15 @@ class LiveKitTransport:
             await room.local_participant.unpublish_track(publication.sid)
         except Exception:
             logger.exception("realtime.unpublish_track_failed", stack_info=True)
+        if (
+            self._owned_source is not None
+            and self._owned_source_sid == getattr(publication, "sid", None)
+        ):
+            # Ours to close, and only when this is the publication it backs:
+            # a native handle and a queue otherwise held until collection.
+            owned, self._owned_source = self._owned_source, None
+            self._owned_source_sid = None
+            await owned.aclose()
 
     def set_agent_audio_sink(self, sink: AgentAudioSink | None) -> None:
         self._agent_audio_sink = sink
@@ -320,8 +419,9 @@ class LiveKitTransport:
             # video stream is someone else's publish — refuse rather than
             # silently tearing it down.
             if active.kind != "screen_share":
-                raise VideoPublishAlreadyActiveError(
-                    "a video stream is publishing; remove it before sharing a screen"
+                raise SessionStateError(
+                    code=SessionStateErrorCode.VIDEO_PUBLISH_ALREADY_ACTIVE,
+                    message="a video stream is publishing; remove it before sharing a screen",
                 )
             await self.stop_screen_share()
         self._video_publish = self._create_publish_state(
@@ -336,8 +436,9 @@ class LiveKitTransport:
 
     async def add_video_stream(self, *, width: int, height: int) -> str:
         if self._video_publish is not None:
-            raise VideoPublishAlreadyActiveError(
-                "a video publish is already active; one video track at a time"
+            raise SessionStateError(
+                code=SessionStateErrorCode.VIDEO_PUBLISH_ALREADY_ACTIVE,
+                message="a video publish is already active; one video track at a time",
             )
         state = self._create_publish_state(
             kind="video_stream", name="camera", width=width, height=height
@@ -458,7 +559,7 @@ class LiveKitTransport:
         # (a SIP leg, another client). ``participant`` is None for server-API
         # data, which no peer can forge — let it through.
         participant = getattr(data_packet, "participant", None)
-        if participant is not None and not self._caller_is_agent(participant.identity):
+        if participant is not None and not self._participant_is_agent(participant):
             logger.warning(
                 "realtime.frame_from_non_agent_dropped",
                 sender_identity=participant.identity,
@@ -468,7 +569,46 @@ class LiveKitTransport:
         if callbacks is not None:
             callbacks.on_frame(payload)
 
+    def _on_participant_attributes_changed(self, *args: object) -> None:
+        # livekit-rtc emits ``(changed_attributes, participant)``.
+        participant = args[1] if len(args) > 1 else None
+        self._maybe_emit_ready_attribute(participant)
+
+    def _maybe_emit_ready_attribute(self, participant: Any) -> None:
+        """Emit the agent's readiness attribute as an inbound ``ready``
+        frame, once. The attribute carries the external frame verbatim, so
+        downstream handling is identical to a data-channel delivery (the
+        engine drops whichever of the two arrives second)."""
+        if self._ready_attribute_seen or participant is None:
+            return
+        if not self._participant_is_agent(participant):
+            return
+        value = (getattr(participant, "attributes", None) or {}).get(READY_ATTRIBUTE)
+        if not value:
+            return
+        try:
+            frame = json.loads(value)
+        except json.JSONDecodeError:
+            logger.warning("realtime.ready_attribute_not_json")
+            return
+        if not isinstance(frame, dict) or frame.get("type") != "ready":
+            logger.warning("realtime.ready_attribute_not_a_ready_frame")
+            return
+        self._ready_attribute_seen = True
+        callbacks = self._callbacks
+        if callbacks is not None:
+            callbacks.on_frame(value.encode("utf-8"))
+
     def _on_disconnected(self, *args: object) -> None:
+        # A room that never joined has nothing to close: livekit reports a
+        # failed connect as a disconnect too, and that failure is the
+        # caller's to handle (a prepared join falls back on it). The reason
+        # is latched even so — a room deleted while ``connect`` is still
+        # negotiating is the evidence a failed boot leaves behind, and the
+        # join's own error says nothing about why.
+        if self._room is None:
+            self._connect_lost = _classify_disconnect(args[0] if args else None)
+            return
         callbacks = self._callbacks
         if callbacks is not None:
             callbacks.on_closed(_classify_disconnect(args[0] if args else None))
@@ -479,13 +619,21 @@ class LiveKitTransport:
             callbacks.on_reconnecting()
 
     def _on_reconnected(self, *args: object) -> None:
+        # Re-read the sign: a recovery rebuilds participants with their
+        # attributes already populated, so an agent that became ready during
+        # the outage fires no attribute change and would otherwise be missed.
+        # Deduped, so a session already ready re-emits nothing.
+        room = self._room
+        if room is not None:
+            for participant in room.remote_participants.values():
+                self._maybe_emit_ready_attribute(participant)
         callbacks = self._callbacks
         if callbacks is not None:
             callbacks.on_reconnected()
 
     def _require_room(self) -> Any:
         if self._room is None:
-            raise NotConnectedError("Session is not connected.")
+            raise SessionStateError(code=SessionStateErrorCode.NOT_CONNECTED, message="Session is not connected.")
         return self._room
 
 

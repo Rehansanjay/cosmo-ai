@@ -2,17 +2,20 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  RealtimeClient,
+  TokenSource,
+  type RealtimeClientOptions,
+  type RealtimeSession,
+} from 'cosmo-ai';
+import {
   RealtimeProvider,
   RealtimeAudio,
   MicToggle,
   useRealtimeSessionContext,
   useTranscript,
   useTransportState,
-  RealtimeClient,
-  type RealtimeClientOptions,
-  type RealtimeSession,
-} from 'cosmo-ai';
-import { tool } from 'cosmo-ai/tool';
+} from 'cosmo-ai/react';
+import { clientTool } from 'cosmo-ai/tool';
 import { zodInput } from 'cosmo-ai/tool/zod';
 import { z } from 'zod/v4';
 
@@ -32,7 +35,9 @@ function setCosmoBaseUrl(baseUrl: string): void {
   }
   tag.setAttribute('content', baseUrl);
 }
-const API_KEY_DEFAULT = import.meta.env.VITE_COSMO_API_KEY ?? '';
+// No key in page code: the /token route (vite.config's tokenRoute plugin in
+// dev; a real route when deployed) mints short-lived tokens. The settings
+// panel's key field stays as an override for a deployment without one.
 
 type SceneEvent = {
   rep_id: number;
@@ -305,7 +310,7 @@ function makePlayVideoTool(videoRef: React.RefObject<HTMLVideoElement | null>) {
     return { playing: `${start.toFixed(1)}s-${end.toFixed(1)}s`, done };
   }
 
-  return tool({
+  return clientTool({
     name: 'play_video',
     description:
       'Plays one or more clips of the squat set so the user can see the moment being discussed; segments play in order, so pass two to compare reps. ' +
@@ -645,7 +650,7 @@ export function App() {
   const [coaching, setCoaching] = useState<Coaching | null>(null);
   const [coachingError, setCoachingError] = useState<string | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
-  const [apiKey, setApiKey] = useState(API_KEY_DEFAULT);
+  const [apiKey, setApiKey] = useState('');
   const [baseUrl, setBaseUrl] = useState(BASE_URL_DEFAULT);
   const [startError, setStartError] = useState<string | null>(null);
   const [session, setSession] = useState<RealtimeSession | null>(null);
@@ -674,12 +679,14 @@ export function App() {
   }, []);
 
   const handleStart = useCallback(async () => {
-    if (!scene || !apiKey) return;
+    if (!scene) return;
     setConnecting(true);
     setStartError(null);
     setCosmoBaseUrl(baseUrl);
-    const opts: RealtimeClientOptions = { apiKey };
-    const client = new RealtimeClient(opts);
+    const options: RealtimeClientOptions = apiKey.trim()
+      ? { apiKey }
+      : { token: TokenSource.endpoint('/token') };
+    const client = new RealtimeClient(options);
     try {
       const started = await client
         .agent({
@@ -724,15 +731,15 @@ export function App() {
             </p>
           )}
 
-          <button className="btn btn-primary" onClick={handleStart} disabled={connecting || !apiKey}>
-            {connecting ? 'Connecting…' : apiKey ? 'Talk to your coach' : 'Add a key below to start'}
+          <button className="btn btn-primary" onClick={handleStart} disabled={connecting}>
+            {connecting ? 'Connecting…' : 'Talk to your coach'}
           </button>
           {startError && <div className="err">{startError}</div>}
 
-          <details className="settings" open={!apiKey}>
+          <details className="settings">
             <summary>Connection</summary>
             <div className="field">
-              <label htmlFor="k">API key</label>
+              <label htmlFor="k">API key (optional — the /token route is used when empty)</label>
               <input
                 id="k"
                 type="password"
@@ -748,7 +755,7 @@ export function App() {
           </details>
         </>
       ) : (
-        <RealtimeProvider session={session} maxTranscriptLength={50}>
+        <RealtimeProvider session={session}>
           <SessionView
             videoRef={videoRef}
             videoUrl={videoUrl}

@@ -8,6 +8,7 @@ from typing import Callable
 import httpx
 import pytest
 
+from cosmo_ai import VerifyErrorCode
 from cosmo_ai import CredentialInfo, CredentialKind, RealtimeClient, VerifyError
 
 Handler = Callable[[httpx.Request], httpx.Response]
@@ -120,7 +121,8 @@ def test_verify_raises_on_rejected_credential() -> None:
 
     with pytest.raises(VerifyError) as exc:
         asyncio.run(scenario())
-    assert exc.value.code == "auth_failed"
+    assert exc.value.code is VerifyErrorCode.REQUEST_REJECTED
+    assert exc.value.server_code == "auth_failed"
 
 
 def test_verify_raises_on_transport_error() -> None:
@@ -132,7 +134,7 @@ def test_verify_raises_on_transport_error() -> None:
 
     with pytest.raises(VerifyError) as exc:
         asyncio.run(scenario())
-    assert exc.value.code == "transport_error"
+    assert exc.value.code is VerifyErrorCode.REQUEST_FAILED
 
 
 def test_verify_raises_on_malformed_success_body() -> None:
@@ -144,4 +146,4 @@ def test_verify_raises_on_malformed_success_body() -> None:
 
     with pytest.raises(VerifyError) as exc:
         asyncio.run(scenario())
-    assert exc.value.code == "invalid_response"
+    assert exc.value.code is VerifyErrorCode.INVALID_RESPONSE

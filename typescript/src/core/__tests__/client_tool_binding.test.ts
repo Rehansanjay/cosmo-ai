@@ -6,6 +6,7 @@
 
 import { describe, expect, it } from 'vitest';
 
+import { mintAgentTool, webSearchTool } from '../agent';
 import { RealtimeClient } from '../realtime_client';
 import { type Hook,
   preToolUse } from '../hooks';
@@ -19,25 +20,24 @@ function makeClient(fake: FakeTransport): RealtimeClient {
     await originalConnect(opts);
     opts.onSessionStarted?.('sess-fake');
   };
-  return new RealtimeClient({ transportFactory: () => fake });
+  return new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
 }
 
 describe('client-tool binding through agent.start()', () => {
-  it('registers one RPC method per handler-carrying client tool', async () => {
+  it('registers one RPC method per declared client tool', async () => {
     const fake = makeFakeTransport();
     const client = makeClient(fake);
     await client
       .agent({
         tools: [
-          {
+          mintAgentTool({
             kind: 'client',
             name: 'runnable',
             description: 'd',
             parameters: {},
             handler: async () => ({ done: true }),
-          },
-          { kind: 'client', name: 'declared_only', description: 'd', parameters: {} },
-          { kind: 'web_search' },
+          }),
+          webSearchTool(),
         ],
       })
       .start();
@@ -45,17 +45,6 @@ describe('client-tool binding through agent.start()', () => {
 
     const reply = JSON.parse(await fake.invokeRpc('runnable', '{}')) as unknown;
     expect(reply).toEqual({ ok: true, result: { done: true }, error: null });
-  });
-
-  it('registers nothing when no declared tool carries a handler', async () => {
-    const fake = makeFakeTransport();
-    const client = makeClient(fake);
-    await client
-      .agent({
-        tools: [{ kind: 'client', name: 'declared_only', description: 'd', parameters: {} }],
-      })
-      .start();
-    expect(fake.rpcMethods.size).toBe(0);
   });
 
   it('routes a background job result through the transport as tool_job_result', async () => {
@@ -72,7 +61,7 @@ describe('client-tool binding through agent.start()', () => {
     await client
       .agent({
         tools: [
-          {
+          mintAgentTool({
             kind: 'client',
             background: true,
             name: 'export_report',
@@ -84,7 +73,7 @@ describe('client-tool binding through agent.start()', () => {
               await job.complete({ result: { url: 'https://x' }, summary: 'ready' });
               finished();
             },
-          },
+          }),
         ],
       })
       .start();
@@ -126,7 +115,7 @@ describe('client-tool binding through agent.start()', () => {
     const session = await client
       .agent({
         tools: [
-          {
+          mintAgentTool({
             kind: 'client',
             background: true,
             name: 'export_report',
@@ -138,7 +127,7 @@ describe('client-tool binding through agent.start()', () => {
               await job.complete({ summary: 'too late' });
               finished();
             },
-          },
+          }),
         ],
       })
       .start();
@@ -156,13 +145,13 @@ describe('client-tool binding through agent.start()', () => {
     const session = await client
       .agent({
         tools: [
-          {
+          mintAgentTool({
             kind: 'client',
             name: 'runnable',
             description: 'd',
             parameters: {},
             handler: async () => ({ done: true }),
-          },
+          }),
         ],
       })
       .start();
@@ -184,13 +173,13 @@ describe('client-tool binding through agent.start()', () => {
       .agent({
         hooks,
         tools: [
-          {
+          mintAgentTool({
             kind: 'client',
             name: 'runnable',
             description: 'd',
             parameters: {},
             handler: async () => ({ done: true }),
-          },
+          }),
         ],
       })
       .start();
@@ -216,17 +205,17 @@ describe('client-tool binding through agent.start()', () => {
       windowReply = await fake.invokeRpc('runnable', '{}');
       await originalConnect(opts);
     };
-    const client = new RealtimeClient({ transportFactory: () => fake });
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
     await client
       .agent({
         tools: [
-          {
+          mintAgentTool({
             kind: 'client',
             name: 'runnable',
             description: 'd',
             parameters: {},
             handler: async () => ({ done: true }),
-          },
+          }),
         ],
       })
       .start();
@@ -244,13 +233,13 @@ describe('client-tool binding through agent.start()', () => {
     await client
       .agent({
         tools: [
-          {
+          mintAgentTool({
             kind: 'client',
             name: 'runnable',
             description: 'd',
             parameters: {},
             handler: async () => ({ done: true }),
-          },
+          }),
         ],
       })
       .start();

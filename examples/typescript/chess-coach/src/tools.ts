@@ -1,4 +1,4 @@
-import { tool } from 'cosmo-ai/tool';
+import { clientTool } from 'cosmo-ai/tool';
 import { zodInput } from 'cosmo-ai/tool/zod';
 import { z } from 'zod/v4';
 
@@ -15,7 +15,7 @@ export type ToolContext = {
 };
 
 export function makeBoardPositionTool(ctx: ToolContext) {
-  return tool({
+  return clientTool({
     name: 'get_chess_board_position',
     description:
       'Read the chess board on the shared screen and return its FEN placement. ' +

@@ -15,9 +15,12 @@ from typing import Any
 
 import pytest
 
+from cosmo_ai import SessionStartError, SessionStartErrorCode
+from cosmo_ai.hooks import PreToolUseContext, pre_tool_use
+
+from cosmo_ai._internal.protocol import ClientTool
 from cosmo_ai._internal.schema import check_schema_dialect
 from cosmo_ai.tools import (
-    ClientTool,
     ScreenCapture,
     ScreenCaptureRequest,
     ScreenClickOutcome,
@@ -26,10 +29,10 @@ from cosmo_ai.tools import (
     ScreenHighlightBoxRequest,
     ScreenHighlightOutcome,
     ScreenHighlightTarget,
-    screen_click_element,
-    screen_highlight_box,
-    screen_highlight_element,
-    screen_locate,
+    screen_click_element_tool,
+    screen_highlight_box_tool,
+    screen_highlight_element_tool,
+    screen_locate_tool,
 )
 from cosmo_ai.tools._screen_capture import (
     SCREEN_CAPTURE_RPC_METHOD,
@@ -75,7 +78,7 @@ def _locate(capture_id: str, capture: ScreenCapture) -> None:
 
     async def scenario() -> None:
         _sent, send_bytes = await _collect_bytes()
-        handler = screen_capture_handler(screen_locate(lambda: capture), send_bytes)
+        handler = screen_capture_handler(screen_locate_tool(lambda _: capture), send_bytes)
         ack = await handler({"capture_id": capture_id})
         assert ack == {"captured": True}
 
@@ -94,7 +97,7 @@ def test_capture_caches_the_snapshot_and_publishes_it_for_the_locator() -> None:
     async def scenario() -> None:
         cache = ScreenCaptureCache()
         sent, send_bytes = await _collect_bytes()
-        spec = screen_locate(lambda: _capture(elements=_two_elements()))
+        spec = screen_locate_tool(lambda _: _capture(elements=_two_elements()))
         handler = screen_capture_handler(spec, send_bytes, cache=cache)
 
         ack = await handler({"capture_id": "cap1"})
@@ -108,7 +111,7 @@ def test_capture_caches_the_snapshot_and_publishes_it_for_the_locator() -> None:
         assert payload["capture_id"] == "cap1"
         assert payload["mime_type"] == "image/jpeg"
         assert base64.b64decode(payload["image_b64"]) == b"\xff\xd8"
-        assert payload["ax_elements"] == [
+        assert payload["elements"] == [
             {"idx": 0, "role": "AXButton", "frame": [0.0, 0.0, 20.0, 20.0], "title": "b0"},
             {"idx": 1, "role": "AXButton", "frame": [10.0, 0.0, 20.0, 20.0], "title": "b1"},
         ]
@@ -135,7 +138,7 @@ def test_descriptors_are_clamped_instead_of_shipping_a_document() -> None:
         )
     )
 
-    assert payload["ax_elements"][0]["value"] == "v" * 256
+    assert payload["elements"][0]["value"] == "v" * 256
 
 
 def test_a_named_element_ships_no_value_the_screenshot_already_shows_it() -> None:
@@ -156,7 +159,7 @@ def test_a_named_element_ships_no_value_the_screenshot_already_shows_it() -> Non
         )
     )
 
-    assert payload["ax_elements"][0] == {
+    assert payload["elements"][0] == {
         "idx": 0,
         "role": "AXTextField",
         "frame": [0.0, 0.0, 20.0, 20.0],
@@ -164,17 +167,7 @@ def test_a_named_element_ships_no_value_the_screenshot_already_shows_it() -> Non
     }
 
 
-@pytest.mark.parametrize(
-    ("args", "wants_elements", "element_count"),
-    [
-        ({"want_elements": False}, False, 0),
-        ({"want_elements": True}, True, 2),
-        ({}, True, 2),
-    ],
-)
-def test_want_elements_reaches_the_handler_and_shapes_the_payload(
-    args: dict[str, Any], wants_elements: bool, element_count: int
-) -> None:
+def test_the_capture_handler_receives_the_request_envelope() -> None:
     async def scenario() -> None:
         sent, send_bytes = await _collect_bytes()
         asked: list[ScreenCaptureRequest] = []
@@ -184,32 +177,14 @@ def test_want_elements_reaches_the_handler_and_shapes_the_payload(
             return _capture(elements=_two_elements())
 
         handler = screen_capture_handler(
-            screen_locate(capture), send_bytes, cache=ScreenCaptureCache()
+            screen_locate_tool(capture), send_bytes, cache=ScreenCaptureCache()
         )
 
-        await handler({"capture_id": "cap1", **args})
+        await handler({"capture_id": "cap1"})
 
-        assert asked == [ScreenCaptureRequest(wants_elements=wants_elements)]
+        assert asked == [ScreenCaptureRequest()]
         payload = json.loads(sent[0][0])
-        assert len(payload["ax_elements"]) == element_count
-        assert base64.b64decode(payload["image_b64"]) == b"\xff\xd8"
-
-    asyncio.run(scenario())
-
-
-def test_a_no_argument_capture_handler_still_works() -> None:
-    async def scenario() -> None:
-        sent, send_bytes = await _collect_bytes()
-        handler = screen_capture_handler(
-            screen_locate(lambda: _capture(elements=_two_elements())),
-            send_bytes,
-            cache=ScreenCaptureCache(),
-        )
-
-        ack = await handler({"capture_id": "cap1", "want_elements": False})
-
-        assert ack == {"captured": True}
-        assert json.loads(sent[0][0])["ax_elements"] == []
+        assert len(payload["elements"]) == 2
 
     asyncio.run(scenario())
 
@@ -219,10 +194,10 @@ def test_a_failed_capture_answers_no_capture_carrying_the_handlers_reason() -> N
         cache = ScreenCaptureCache()
         sent, send_bytes = await _collect_bytes()
 
-        def boom() -> ScreenCapture:
+        def boom(_request: ScreenCaptureRequest) -> ScreenCapture:
             raise RuntimeError("the user stopped sharing their screen")
 
-        handler = screen_capture_handler(screen_locate(boom), send_bytes, cache=cache)
+        handler = screen_capture_handler(screen_locate_tool(boom), send_bytes, cache=cache)
 
         ack = await handler({"capture_id": "cap-fails"})
 
@@ -236,19 +211,66 @@ def test_a_failed_capture_answers_no_capture_carrying_the_handlers_reason() -> N
     asyncio.run(scenario())
 
 
-def test_a_call_with_no_capture_id_answers_no_capture_without_capturing() -> None:
+def test_descriptor_clamps_count_unicode_scalars() -> None:
+    """The clamp unit is Unicode scalars in every SDK: an astral scalar is one
+    unit (never split), and a combining mark is its own unit."""
+
+    async def scenario() -> None:
+        sent, send_bytes = await _collect_bytes()
+        emoji_value = "\U0001f600" * 300  # 300 scalars
+        accent_title = "e\u0301" * 400  # 800 scalars, 400 grapheme clusters
+        capture = ScreenCapture(
+            image_jpeg=b"\xff\xd8",
+            elements=(
+                ScreenElement(
+                    index=0,
+                    role="AXButton",
+                    frame=(0.0, 0.0, 20.0, 20.0),
+                    value=emoji_value,
+                ),
+                ScreenElement(
+                    index=1,
+                    role="AXButton",
+                    frame=(0.0, 0.0, 20.0, 20.0),
+                    title=accent_title,
+                ),
+            ),
+        )
+        handler = screen_capture_handler(
+            screen_locate_tool(lambda _: capture), send_bytes, cache=ScreenCaptureCache()
+        )
+        await handler({"capture_id": "cap-u"})
+        payload = json.loads(sent[0][0].decode("utf-8"))
+        clamped_value = payload["elements"][0]["value"]
+        clamped_title = payload["elements"][1]["title"]
+
+        assert len(clamped_value) == 256  # scalars, whole emoji preserved
+        assert clamped_value == "\U0001f600" * 256
+        assert len(clamped_title) == 512  # scalars: 256 e+mark pairs
+        assert clamped_title == "e\u0301" * 256
+
+    asyncio.run(scenario())
+
+
+def test_a_call_with_no_capture_id_is_a_protocol_error_without_capturing() -> None:
+    """The server mints an id for every capture — a missing one is a
+    protocol violation, never a decline."""
+
     async def scenario() -> None:
         cache = ScreenCaptureCache()
         sent, send_bytes = await _collect_bytes()
         captured: list[bool] = []
 
-        def capture() -> ScreenCapture:
+        def capture(_request: ScreenCaptureRequest) -> ScreenCapture:
             captured.append(True)
             return _capture()
 
-        handler = screen_capture_handler(screen_locate(capture), send_bytes, cache=cache)
+        handler = screen_capture_handler(screen_locate_tool(capture), send_bytes, cache=cache)
 
-        assert await handler({}) == {"captured": False}
+        with pytest.raises(ValueError, match="missing required 'capture_id'"):
+            await handler({})
+        with pytest.raises(ValueError, match="missing required 'capture_id'"):
+            await handler({"capture_id": ""})
         assert captured == []
         assert sent == []
 
@@ -260,11 +282,11 @@ def test_an_async_capture_handler_is_awaited() -> None:
         cache = ScreenCaptureCache()
         sent, send_bytes = await _collect_bytes()
 
-        async def capture() -> ScreenCapture:
+        async def capture(_request: ScreenCaptureRequest) -> ScreenCapture:
             await asyncio.sleep(0)
             return _capture(elements=_two_elements())
 
-        handler = screen_capture_handler(screen_locate(capture), send_bytes, cache=cache)
+        handler = screen_capture_handler(screen_locate_tool(capture), send_bytes, cache=cache)
 
         assert await handler({"capture_id": "cap-async"}) == {"captured": True}
         assert cache.get("cap-async") is not None
@@ -280,7 +302,7 @@ def test_a_publish_failure_propagates_as_the_calls_error() -> None:
             raise RuntimeError("byte stream refused")
 
         handler = screen_capture_handler(
-            screen_locate(lambda: _capture()), send_boom, cache=cache
+            screen_locate_tool(lambda _: _capture()), send_boom, cache=cache
         )
 
         with pytest.raises(RuntimeError, match="byte stream refused"):
@@ -301,7 +323,7 @@ def test_click_hands_the_caller_the_element_the_handle_addresses() -> None:
         return ScreenClickOutcome(clicked=True)
 
     result = _invoke(
-        screen_click_element(on_click),
+        screen_click_element_tool(on_click),
         {"found_element": "click-ok#1", "button": "right", "double": True},
     )
 
@@ -321,7 +343,7 @@ def test_click_defaults_to_a_single_left_click() -> None:
         seen.append(target)
         return ScreenClickOutcome(clicked=True)
 
-    _invoke(screen_click_element(on_click), {"found_element": "click-defaults#0"})
+    _invoke(screen_click_element_tool(on_click), {"found_element": "click-defaults#0"})
 
     assert seen[0].action.button == "left"
     assert seen[0].action.double is False
@@ -335,7 +357,7 @@ def test_click_declines_an_unresolvable_handle_instead_of_clicking_something_els
         return ScreenClickOutcome(clicked=True)
 
     result = _invoke(
-        screen_click_element(on_click),
+        screen_click_element_tool(on_click),
         {"found_element": "never-captured#0"},
     )
 
@@ -353,7 +375,7 @@ def test_click_declines_an_index_past_the_end_of_its_capture() -> None:
         return ScreenClickOutcome(clicked=True)
 
     result = _invoke(
-        screen_click_element(on_click), {"found_element": "click-short#5"}
+        screen_click_element_tool(on_click), {"found_element": "click-short#5"}
     )
 
     assert result["clicked"] is False
@@ -367,7 +389,7 @@ def test_click_carries_a_refusal_reason() -> None:
         return ScreenClickOutcome(clicked=False, reason="the window moved — locate it again")
 
     result = _invoke(
-        screen_click_element(on_click), {"found_element": "click-refused#0"}
+        screen_click_element_tool(on_click), {"found_element": "click-refused#0"}
     )
 
     assert result == {"clicked": False, "reason": "the window moved — locate it again"}
@@ -383,7 +405,7 @@ def test_click_never_hands_malformed_arguments_to_the_caller() -> None:
     # A structured token is not a handle: decode rejects it before the handler.
     with pytest.raises(ValueError, match=SCREEN_CLICK_TOOL_NAME):
         _invoke(
-            screen_click_element(on_click),
+            screen_click_element_tool(on_click),
             {"found_element": {"capture_id": "click-ok", "element_idx": 0}},
         )
     assert called == []
@@ -401,7 +423,7 @@ def test_highlight_hands_the_caller_the_element_plus_the_tooltip() -> None:
         return ScreenHighlightOutcome(shown=True, exact=True)
 
     result = _invoke(
-        screen_highlight_element(on_highlight),
+        screen_highlight_element_tool(on_highlight),
         {
             "found_element": "mark-ok#0",
             "label": "Save",
@@ -425,7 +447,7 @@ def test_highlight_declines_an_unresolvable_handle() -> None:
         return ScreenHighlightOutcome(shown=True, exact=True)
 
     result = _invoke(
-        screen_highlight_element(on_highlight),
+        screen_highlight_element_tool(on_highlight),
         {"found_element": "never-captured#0", "label": "Save"},
     )
 
@@ -443,7 +465,7 @@ def test_highlight_carries_the_callers_refusal_reason() -> None:
         )
 
     result = _invoke(
-        screen_highlight_element(on_highlight),
+        screen_highlight_element_tool(on_highlight),
         {"found_element": "mark-refused#0", "label": "Save"},
     )
 
@@ -461,7 +483,7 @@ def test_box_draws_from_the_box_alone_no_capture_no_lookup() -> None:
         return ScreenHighlightOutcome(shown=True, exact=True)
 
     result = _invoke(
-        screen_highlight_box(on_highlight),
+        screen_highlight_box_tool(on_highlight),
         {
             "x": 0.25,
             "y": 0.5,
@@ -486,7 +508,7 @@ def test_box_draws_from_the_box_alone_no_capture_no_lookup() -> None:
 
 def test_box_reports_a_highlight_that_only_landed_on_the_estimate() -> None:
     result = _invoke(
-        screen_highlight_box(
+        screen_highlight_box_tool(
             lambda request: ScreenHighlightOutcome(shown=True, exact=False)
         ),
         {"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4, "label": "Save"},
@@ -497,7 +519,7 @@ def test_box_reports_a_highlight_that_only_landed_on_the_estimate() -> None:
 
 def test_box_carries_a_refusal_reason_instead_of_an_exactness() -> None:
     result = _invoke(
-        screen_highlight_box(
+        screen_highlight_box_tool(
             lambda request: ScreenHighlightOutcome(
                 shown=False, reason="nothing is shared right now"
             )
@@ -517,7 +539,7 @@ def test_box_never_hands_malformed_arguments_to_the_caller() -> None:
 
     with pytest.raises(ValueError, match=SCREEN_HIGHLIGHT_BOX_TOOL_NAME):
         _invoke(
-            screen_highlight_box(on_highlight),
+            screen_highlight_box_tool(on_highlight),
             {"x": 0.1, "y": 0.2, "width": 0.3, "label": "Save"},
         )
     assert called == []
@@ -540,7 +562,8 @@ def test_cache_expires_entries_past_the_ttl() -> None:
     cache.put("cap-1", _capture())
     clock[0] += 29.0
     assert cache.get("cap-1") is not None
-    clock[0] += 2.0
+    # The boundary is exclusive: exactly at the TTL is expired, in every SDK.
+    clock[0] += 1.0
     assert cache.get("cap-1") is None
 
 
@@ -580,8 +603,8 @@ def test_the_renderer_schemas_stay_within_the_restricted_dialect(
 def test_the_locate_opt_in_reaches_the_wire_as_a_bare_kind() -> None:
     body = start_body(
         tools=[
-            screen_locate(lambda: _capture()),
-            screen_click_element(lambda target: ScreenClickOutcome(clicked=True)),
+            screen_locate_tool(lambda _: _capture()),
+            screen_click_element_tool(lambda target: ScreenClickOutcome(clicked=True)),
         ]
     )
     declared = {spec["kind"]: spec for spec in body["agent"]["tools"]}
@@ -594,7 +617,7 @@ def test_the_locate_opt_in_reaches_the_wire_as_a_bare_kind() -> None:
 
 def test_the_capture_rpc_is_registered_without_being_advertised() -> None:
     async def scenario() -> None:
-        harness = await start_fake_session(tools=[screen_locate(lambda: _capture())])
+        harness = await start_fake_session(tools=[screen_locate_tool(lambda _: _capture())])
         # Registered as an RPC method the locator drives, but never declared as
         # a tool the model can call.
         assert SCREEN_CAPTURE_RPC_METHOD in harness.transport.rpc_methods
@@ -604,10 +627,57 @@ def test_the_capture_rpc_is_registered_without_being_advertised() -> None:
     asyncio.run(scenario())
 
 
+def test_screen_locate_on_the_websocket_transport_refuses_at_start() -> None:
+    """The capture payload travels as a byte stream the single-socket carrier
+    does not have — start refuses before the capture handler could ever run."""
+
+    async def scenario() -> None:
+        with pytest.raises(SessionStartError) as err:
+            await start_fake_session(
+                tools=[screen_locate_tool(lambda _: _capture())],
+                client_transport="websocket",
+            )
+        assert err.value.code is SessionStartErrorCode.CONFIG
+        assert err.value.server_code == "screen_locate_unsupported"
+        assert err.value.message == (
+            "screen_locate is not supported on the websocket transport"
+        )
+
+    asyncio.run(scenario())
+
+
+def test_hooks_do_not_fire_on_the_capture_rpc() -> None:
+    """The capture RPC is wire plumbing, not a tool call, so hooks skip it —
+    the contract every SDK mirrors."""
+
+    async def scenario() -> None:
+        calls: list[str] = []
+
+        @pre_tool_use
+        def spy(ctx: PreToolUseContext) -> None:
+            calls.append(ctx.tool_name)
+
+        harness = await start_fake_session(
+            tools=[screen_locate_tool(lambda _: _capture())],
+            hooks=[spy],
+        )
+        method = harness.transport.rpc_methods[SCREEN_CAPTURE_RPC_METHOD]
+        reply = await method(
+            FakeRpcInvocation(
+                caller_identity="agent-1", payload=json.dumps({"capture_id": "cap-h"})
+            )
+        )
+
+        assert json.loads(reply)["result"] == {"captured": True}
+        assert calls == []
+
+    asyncio.run(scenario())
+
+
 def test_no_screen_locate_registers_no_capture_rpc() -> None:
     async def scenario() -> None:
         harness = await start_fake_session(
-            tools=[screen_click_element(lambda target: ScreenClickOutcome(clicked=True))]
+            tools=[screen_click_element_tool(lambda target: ScreenClickOutcome(clicked=True))]
         )
         assert SCREEN_CAPTURE_RPC_METHOD not in harness.transport.rpc_methods
 
@@ -617,7 +687,7 @@ def test_no_screen_locate_registers_no_capture_rpc() -> None:
 def test_the_capture_rpc_round_trips_over_the_transport() -> None:
     async def scenario() -> None:
         harness = await start_fake_session(
-            tools=[screen_locate(lambda: _capture(elements=_two_elements()))]
+            tools=[screen_locate_tool(lambda _: _capture(elements=_two_elements()))]
         )
         method = harness.transport.rpc_methods[SCREEN_CAPTURE_RPC_METHOD]
         reply = await method(
@@ -645,12 +715,12 @@ def test_the_capture_rpc_round_trips_over_the_transport() -> None:
 def test_the_sdks_own_screen_tools_are_admitted_by_construction() -> None:
     body = start_body(
         tools=[
-            screen_locate(lambda: _capture()),
-            screen_click_element(lambda target: ScreenClickOutcome(clicked=True)),
-            screen_highlight_element(
+            screen_locate_tool(lambda _: _capture()),
+            screen_click_element_tool(lambda target: ScreenClickOutcome(clicked=True)),
+            screen_highlight_element_tool(
                 lambda target: ScreenHighlightOutcome(shown=True, exact=True)
             ),
-            screen_highlight_box(
+            screen_highlight_box_tool(
                 lambda request: ScreenHighlightOutcome(shown=True, exact=True)
             ),
         ]

@@ -22,6 +22,9 @@ class VideoStreamHandle:
 
     @property
     def stream_id(self) -> str:
+        """The id the transport matches this stream's frames against. Assigned
+        at creation and stable for the handle's life; useful for logging when
+        several streams are live at once."""
         return self._stream_id
 
     def push(self, frame: Any) -> None:

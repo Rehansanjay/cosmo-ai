@@ -13,28 +13,34 @@
  * ``RealtimeSession`` (which owns exactly one engine).
  */
 
+import {
+  AudioUnavailableError,
+  type AudioUnavailableErrorCode,
+  SessionStateError,
+} from './errors';
 import { log } from './logger';
+import * as decode from './wire_decode';
 import type {
-  ErrorCode as WireErrorCode,
+  ClientConnectTimings,
   SessionConfig,
-} from '../wire/types.gen';
+  DelegationChannel,
+} from '../protocol';
 import type { SessionConnectTimings } from './state';
 
 import type {
-  BackgroundClientToolSpec,
-  ClientToolSpec,
+  BackgroundClientTool,
+  ClientTool,
 } from './agent';
 import { ClientToolJobSink } from './client_tool_jobs';
 import { makeRpcHandler, registerClientToolHandlers } from './client_tools';
-import {
-  SCREEN_CAPTURE_RPC_METHOD,
-  screenCaptureRpc,
-  type ScreenLocateTool,
-} from '../tool/screen';
+import { SCREEN_CAPTURE_RPC_METHOD, screenCaptureRpc } from '../tool/screen_capture_rpc';
+import type { ScreenLocateTool } from './agent';
 import type { HookEngine } from './hooks';
 
 import type { RealtimeInboundMessage } from '../transport/envelope';
+import type { PreparedConnectOptions, PreparedRoomRef } from '../transport/prepared_room';
 import type {
+  RealtimeCloseInfo,
   RealtimeTransport,
   VideoStreamHandle,
   VideoStreamKind,
@@ -42,7 +48,11 @@ import type {
 } from '../transport/types';
 import { postDial, validateE164, type DialResult } from '../transport/dial';
 import { getUsage, type SessionUsage } from './usage';
-import { SessionStartError } from '../transport/session_start_error';
+import {
+  SessionStartError,
+  unsupportedTransportCapability,
+  sessionStartRejectionFrom,
+} from '../transport/session_start_error';
 import { computeVisionInputStatus } from './vision_input_status';
 
 import {
@@ -51,24 +61,22 @@ import {
   type RealtimeEventMap,
   type RealtimeEventName,
   type TranscriptDeltaEvent,
+  type TranscriptItem,
   type Unsubscribe,
 } from './events';
+import { TranscriptStore } from './transcript_state';
 import {
   INITIAL_LIFECYCLE_STATE,
   INITIAL_SNAPSHOT,
   type AgentState,
   type DisconnectReason,
   type MediaState,
+  type MicState,
   type RealtimeSnapshot,
-  type SessionLifecycleState,
+  type SessionState,
   type TransportState,
 } from './state';
-import {
-  NotReadyError,
-  type ErrorEvent,
-  type ErrorCode,
-  type ScreenShareState,
-} from './types';
+import { type ErrorEvent, type ScreenShareState } from './types';
 
 /** What an engine needs from its ``RealtimeClient``: transport construction,
  *  URL composition against the client's (possibly late-resolved) base URL,
@@ -84,10 +92,41 @@ export type SessionEngineContext = {
   onStartUnauthorized: () => void;
 };
 
-function isMicPermissionDenied(err: unknown): boolean {
-  if (!err || typeof err !== 'object') return false;
-  const name = (err as { name?: unknown }).name;
-  return name === 'NotAllowedError' || name === 'SecurityError';
+/** The three ways acquiring a microphone fails, named as the ``MicState``
+ *  each one leaves behind. */
+type MicFailure = Extract<MicState, 'denied' | 'not-found' | 'in-use'>;
+
+/** The slug each failure carries on ``AudioUnavailableError`` — the same set
+ *  Python and Swift publish for the same situations. It lives on the error
+ *  rather than in ``ErrorCode``, which is the server's wire enum. */
+const MIC_FAILURE_CODES: Record<MicFailure, AudioUnavailableErrorCode> = {
+  denied: 'mic_denied',
+  'not-found': 'mic_not_found',
+  'in-use': 'mic_in_use',
+};
+
+/** Which microphone failure an error describes, or ``null`` when it is not
+ *  one. Classified by ``DOMException.name``: the transport rethrows the
+ *  browser's own error unwrapped, and reading the name keeps ``MicState``
+ *  free of any vendor type. The aliases are the pre-standard names still
+ *  emitted by some browsers. */
+function micFailureKind(err: unknown): MicFailure | null {
+  if (!err || typeof err !== 'object') return null;
+  switch ((err as { name?: unknown }).name) {
+    case 'NotAllowedError':
+    case 'PermissionDeniedError':
+    case 'SecurityError':
+      return 'denied';
+    case 'NotFoundError':
+    case 'DevicesNotFoundError':
+    case 'OverconstrainedError':
+      return 'not-found';
+    case 'NotReadableError':
+    case 'TrackStartError':
+      return 'in-use';
+    default:
+      return null;
+  }
 }
 
 function isScreenPermissionDenied(err: unknown): boolean {
@@ -113,35 +152,48 @@ function normalizeCloseReason(reason: string | undefined): string {
   return reason;
 }
 
-function errorCodeFor(err: unknown, micDenied: boolean): ErrorCode {
-  if (micDenied) return 'mic_denied';
-  if (err && typeof err === 'object') {
-    const name = (err as { name?: unknown }).name;
-    // ``LiveKitConnectTimeoutError`` is a vendor-internal type the
-    // current transport raises; mapping is one-way (error name → SDK
-    // error code) so the public ``ErrorCode`` stays vendor-
-    // agnostic.
-    if (name === 'LiveKitConnectTimeoutError') return 'transport_connect_timeout';
-  }
-  return 'session_start_failed';
-}
-
-function mapServerErrorCode(code: WireErrorCode): ErrorCode {
-  if (code === 'upstream_disconnect') return 'transport_disconnect';
-  if (code === 'auth_failed' || code === 'workspace_forbidden') return 'auth_error';
-  return 'server_error';
-}
-
-function generateTurnId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
-  return `turn-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
-}
+/** What the error axis carries: the typed error a failed ``start()``
+ *  rejected with, or the server's error event. */
+type BubbledError = SessionStartError | AudioUnavailableError | ErrorEvent;
 
 /** Grace between a ``session-ended`` frame and a forced teardown when
  *  the expected transport close never follows. */
 const SERVER_END_GRACE_MS = 5_000;
+
+/** Bound on the wait between the transport joining and the server's
+ *  ``ready`` handshake. Deliberately longer than the server's own 30s boot
+ *  deadline (which fails a stuck boot as an ``error`` frame + room close),
+ *  so a failed boot reaches ``start()`` as that informative close rather
+ *  than this blind timeout; only genuine infra loss lands here. A session
+ *  that has not readied by then is torn down and ``start()`` rejects with
+ *  ``SessionStartError`` and code ``'ready_timeout'``. */
+const READY_TIMEOUT_MS = 40_000;
+
+/** A close before ``ready`` — a failed boot. Synthetic status ``0``; the
+ *  server's boot-failure ``error`` frame supplies ``serverCode`` and ``detail``
+ *  when one preceded the close, else ``handshake_disconnect`` + the close
+ *  reason. */
+/** A close before ready. No `status`: no HTTP exchange failed. `serverCode`
+ *  only when the server's pre-close `error` frame supplied one — a close with
+ *  no frame has no server verdict to report, and Python and Swift report none
+ *  either. */
+function handshakeFailed(code: string | undefined, message: string): SessionStartError {
+  return new SessionStartError({
+    code: 'handshake_failed',
+    message,
+    serverCode: code,
+    detail: code === undefined ? null : sessionStartRejectionFrom({ code, message }),
+  });
+}
+
+/** The refusal every video entry point answers on a transport without video
+ *  (the websocket transport). */
+function videoUnsupported(): SessionStartError {
+  return unsupportedTransportCapability(
+    'video_unsupported',
+    'This transport carries no video; use the WebRTC transport for camera or screen input.',
+  );
+}
 
 /** Map a wire transcript role onto the public union.
  *
@@ -157,6 +209,10 @@ function normalizeTranscriptRole(role: string): 'user' | 'assistant' | null {
   return null;
 }
 
+/** Machinery behind one ``RealtimeSession``: its transport, state machine,
+ *  event emitter and media. One engine per run, created by the client at
+ *  start. Not part of the public surface — everything here is reached
+ *  through ``RealtimeSession``. @internal */
 export class SessionEngine {
   /** Raw emitter — ``on()`` adds the subscribe-time replay on top. The
    *  client's event bridge taps this directly so a bridge attach never
@@ -190,31 +246,44 @@ export class SessionEngine {
   // outbound-phone sessions.
   private earlySessionId: string | null = null;
   private connectTimings: SessionConnectTimings | null = null;
+  /** ``performance.now()`` origin the marks that land after the connect
+   *  measure from. Stamped before ``connect()`` so a transport that reports
+   *  no origin still yields usable marks, then replaced by the transport's
+   *  own origin, which shares a clock with ``wsMs``. */
+  private connectStartedAt: number | null = null;
+  private readyAt: number | null = null;
+  /** The ``connect-timings`` report goes out once — the worker accepts one
+   *  per session, and the engine is single-use. */
+  private connectTimingsReported = false;
   private analyserContext: AudioContext | null = null;
   private inputAnalyser: AnalyserNode | null = null;
   private outputAnalyser: AnalyserNode | null = null;
   private inputAnalyserSource: MediaStreamAudioSourceNode | null = null;
-  private outputAnalyserSource: MediaElementAudioSourceNode | null = null;
-  /** Element the current output tap was built from. ``createMediaElementSource``
-   *  throws if called twice for the same element, so a repeat rebuild for an
-   *  unchanged element must be a no-op. */
-  private outputAnalyserElement: HTMLAudioElement | null = null;
+  private outputAnalyserSource: MediaStreamAudioSourceNode | null = null;
+  /** Stream the current output tap was built from, so a refresh for an
+   *  unchanged stream is a no-op. */
+  private outputAnalyserStream: MediaStream | null = null;
   private readonly inputAnalyserListeners = new Set<(a: AnalyserNode | null) => void>();
   private readonly outputAnalyserListeners = new Set<(a: AnalyserNode | null) => void>();
 
   private snapshot: RealtimeSnapshot = { ...INITIAL_SNAPSHOT };
-  private lifecycle: SessionLifecycleState = INITIAL_LIFECYCLE_STATE;
+  private lifecycle: SessionState = INITIAL_LIFECYCLE_STATE;
+  /** Coalesced conversation state, folded from the transcript and
+   *  turn-complete streams. Survives teardown so ``transcript`` stays
+   *  readable after the session ends. */
+  private readonly transcriptStore = new TranscriptStore();
   /** Last ``ready`` payload of the current session, replayed to late
    *  subscribers — ``ready`` can fire before ``agent.start()`` resolves. */
   private lastReadyEvent: RealtimeEventMap['ready'] | null = null;
+  /** Pre-ready ``error`` frame, stashed as enrichment: a failed boot closes
+   *  the room, and this upgrades that close's rejection with the server's
+   *  own code and message. */
+  private pendingHandshakeError: { code: string; message: string } | null = null;
   /** ``session_ended`` fires exactly once per session, on any exit path. */
   private sessionEndedEmitted = false;
   private readonly wireMessageListeners = new Set<
     (message: RealtimeInboundMessage) => void
   >();
-  private currentTurnId: string = generateTurnId();
-  private transcriptSeq = 0;
-  private lastTranscriptRole: 'user' | 'assistant' | null = null;
   // Reason slug from a ``session-ended`` frame. Marks the transport close
   // that follows as an expected server end, not a failure.
   private serverEndReason: string | null = null;
@@ -222,6 +291,7 @@ export class SessionEngine {
 
   private screenShareHandle: VideoStreamHandle | null = null;
   private screenShareTrack: MediaStreamTrack | null = null;
+  private screenShareStream: MediaStream | null = null;
   private screenShareEndedListener: (() => void) | null = null;
 
   /** Every published video track this engine is currently publishing,
@@ -273,12 +343,16 @@ export class SessionEngine {
     return this.connectTimings;
   }
 
-  getLifecycleState(): SessionLifecycleState {
+  getLifecycleState(): SessionState {
     return this.lifecycle;
   }
 
   getLastReady(): RealtimeEventMap['ready'] | null {
     return this.lastReadyEvent;
+  }
+
+  getTranscript(): readonly TranscriptItem[] {
+    return this.transcriptStore.current;
   }
 
   on<E extends RealtimeEventName>(
@@ -293,6 +367,10 @@ export class SessionEngine {
       (handler as (payload: RealtimeEventMap['lifecycle']) => void)(this.lifecycle);
     } else if (event === 'ready' && this.lastReadyEvent !== null) {
       (handler as (payload: RealtimeEventMap['ready']) => void)(this.lastReadyEvent);
+    } else if (event === 'transcript_updated') {
+      (handler as (payload: RealtimeEventMap['transcript_updated']) => void)({
+        items: this.transcriptStore.current,
+      });
     }
     return unsubscribe;
   }
@@ -327,12 +405,15 @@ export class SessionEngine {
   /** Open this engine's one session. Takes the prebuilt external
    *  ``session-config`` body; single-use — a second call is a programmer
    *  error, not a state to recover from. */
-  async start(opts: {
+  async start(options: {
     config: SessionConfig;
     publishMicrophone: boolean;
-    clientTools?: readonly (ClientToolSpec | BackgroundClientToolSpec)[];
+    clientTools?: readonly (ClientTool | BackgroundClientTool)[];
     screenLocate?: ScreenLocateTool;
     hooks?: HookEngine;
+    prepared?: PreparedRoomRef;
+    /** When the caller began waiting, if before this call. */
+    connectStartedAt?: number;
   }): Promise<void> {
     if (this.started) {
       throw new Error('SessionEngine.start is single-use — create a new engine.');
@@ -344,12 +425,12 @@ export class SessionEngine {
     // Freeze before the first dispatch (concurrent registration must never
     // race a running session), then let SessionStart hooks fold additional
     // context into the instructions ahead of the session-config POST.
-    const hooks = opts.hooks ?? null;
+    const hooks = options.hooks ?? null;
     this.activeHooks = hooks;
     this.sessionEndFired = false;
     let config: SessionConfig;
     try {
-      config = await this.applySessionStartHooks(opts.config, hooks);
+      config = await this.applySessionStartHooks(options.config, hooks);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'session-start hook fold failed';
       await this.fireSessionEnd('handshake_failed', message);
@@ -359,14 +440,25 @@ export class SessionEngine {
         disconnectReason: 'handshake_failed',
         detail: message,
       });
-      throw new SessionStartError(0, 'session-start hook fold failed', {
-        code: 'session_start_hook_failed',
+      const failure = new SessionStartError({
+        code: 'handshake_failed',
         message,
+        status: 0,
+        serverCode: 'session_start_hook_failed',
+        detail: sessionStartRejectionFrom({
+          code: 'session_start_hook_failed',
+          message,
+        }),
       });
+      this.reportError(failure);
+      throw failure;
     }
     if (this.cancelReason !== null) {
       this.setLifecycle({ kind: 'disconnected', disconnectReason: this.cancelReason });
-      throw new NotReadyError('Session was ended before start completed.');
+      throw new SessionStateError({
+        code: 'not_connected',
+        message: 'Session was ended before start completed.',
+      });
     }
 
     this.setTransportState('requesting-permission');
@@ -378,10 +470,19 @@ export class SessionEngine {
         local.attachAudioElement(this.hostAudioElement);
       }
       local.onMessage((m) => {
+        // ``ready`` arrives on two channels — the agent's participant
+        // attribute (room state, read by late joiners) and the data-channel
+        // frame. First delivery wins; the echo reaches neither surface.
+        if (m.type === 'ready' && this.lastReadyEvent !== null) return;
         this.handleServerMessage(m);
         this.emitWireMessage(m);
       });
       local.onClose((event) => void this.handleUnsolicitedClose(event));
+      // The remote track is subscribed after the connect resolves, and can
+      // be replaced mid-session when a speaker leaves, so the output
+      // analyser is rebuilt on the transport's signal rather than guessed at
+      // from the connect.
+      local.onOutputStreamChanged?.(() => this.refreshOutputAnalyser());
       local.onReconnecting(() => {
         // Layer-1 transient reconnect: LiveKit is recovering the room
         // itself. Surface for UI but take no action; LiveKit will fire
@@ -390,7 +491,11 @@ export class SessionEngine {
         this.setLifecycle({ kind: 'reconnecting' });
       });
       local.onReconnected(() => {
-        this.setTransportState('ready');
+        // Restore the pre-reconnect truth — a transport recovery is not a
+        // handshake, so it must never forge readiness. A genuinely ready
+        // session re-latches anyway: rejoining re-delivers the agent's
+        // readiness attribute.
+        this.setTransportState(this.readyAt !== null ? 'ready' : 'connecting');
         this.setLifecycle({ kind: 'connected' });
         // The server-side mic gate is session-server state that may reset with
         // the transport; re-assert the last state this client set. Best-effort.
@@ -417,12 +522,13 @@ export class SessionEngine {
       // failing "method not found". The session id resolves lazily — it is
       // minted by the session-start POST inside ``connect`` and set before
       // any agent can exist to invoke a tool.
-      this.bindClientTools(local, opts.clientTools ?? [], opts.hooks);
-      this.bindScreenCapture(local, opts.screenLocate);
-      await local.connect({
+      this.bindClientTools(local, options.clientTools ?? [], options.hooks);
+      this.bindScreenCapture(local, options.screenLocate);
+      this.connectStartedAt = options.connectStartedAt ?? performance.now();
+      const connectOptions: PreparedConnectOptions = {
         config,
         sessionStartUrl: this.context.startUrl(),
-        publishMicrophone: opts.publishMicrophone,
+        publishMicrophone: options.publishMicrophone,
         getAuthHeaders: () => this.context.resolveAuthHeaders(),
         // Publish the server-minted ``session_id`` the instant the
         // session-start POST returns, well ahead of the ``ready``
@@ -435,16 +541,39 @@ export class SessionEngine {
           this.earlySessionId = sessionId;
           this.emitter.emit('session_started', { sessionId });
         },
-        onConnectTimings: (timings) => {
+        onConnectTimings: (timings, startedAt) => {
           this.connectTimings = timings;
+          if (startedAt !== undefined) this.connectStartedAt = startedAt;
+          log.debug(
+            `cosmo connect timings ws_ms=${timings.wsMs} room_ms=${timings.roomMs}` +
+              ` mic_ms=${timings.micMs} total_ms=${timings.totalConnectMs}` +
+              ` server_ms=${timings.serverTimings?.total_ms ?? '-'}`,
+          );
+          this.foldConnectMarks();
         },
-      });
+        onOutputBlocked: (blocked) => this.setOutputBlocked(blocked),
+        prepared: options.prepared,
+        startedAt: this.connectStartedAt,
+      };
+      await local.connect(connectOptions);
       if (this.cancelReason !== null) {
-        throw new NotReadyError('Session was ended before start completed.');
+        throw new SessionStateError({
+        code: 'not_connected',
+        message: 'Session was ended before start completed.',
+      });
       }
       this.attachAnalysers(local);
-      this.setMediaState({ ...this.snapshot.mediaState, mic: 'granted' });
+      if (this.snapshot.mediaState.mic !== 'muted') {
+        this.setMediaState({ ...this.snapshot.mediaState, mic: 'granted' });
+      }
       this.setLifecycle({ kind: 'connected' });
+      await this.awaitReadyForStart();
+      if (this.cancelReason !== null) {
+        throw new SessionStateError({
+        code: 'not_connected',
+        message: 'Session was ended before start completed.',
+      });
+      }
     } catch (err) {
       if (this.cancelReason !== null) {
         // ``disconnect()``/``close()`` raced the start and already published
@@ -455,26 +584,118 @@ export class SessionEngine {
       if (err instanceof SessionStartError && err.status === 401) {
         this.context.onStartUnauthorized();
       }
-      const message = err instanceof Error ? err.message : 'Voice session connection failed.';
-      await this.fireSessionEnd(
-        err instanceof SessionStartError ? 'handshake_failed' : 'transport_error',
-        message,
-      );
-      await this.teardown();
-      const denied = isMicPermissionDenied(err);
-      if (denied) {
-        this.setMediaState({ ...this.snapshot.mediaState, mic: 'denied' });
+      // A close before ``ready`` settles the ready waiters with the window's
+      // typed failure, so that rejection IS this error. Recomputing it would
+      // mint a second instance whose message quotes the lifecycle detail the
+      // first one just wrote. Only ``handshakeFailed`` mints this code — a
+      // server rejection never classifies to it.
+      const settled =
+        err instanceof SessionStartError && err.code === 'handshake_failed' ? err : null;
+      if (this.lifecycle.kind === 'disconnected') {
+        // Another path — an unsolicited transport close, a server-side end —
+        // already published the terminal state and tore down while the start
+        // was still pending (most often during the ready wait). Don't
+        // re-publish it or clobber its error with a generic one; do raise
+        // the typed handshake failure over whatever the racing phase threw.
+        throw settled ?? this.handshakeFailure() ?? err;
       }
-      const code: ErrorCode = errorCodeFor(err, denied);
-      const sessionError: ErrorEvent = { code, message };
-      this.setError(sessionError);
+      // The room can die before the join resolves — a boot that failed fast,
+      // deleting the room while ``connect`` is still negotiating. The join
+      // then fails on its own timeout, but the session-ending evidence (the
+      // server's pre-ready error frame, or a close seen mid-connect) is what
+      // the caller needs: raise the window's typed close exit, not the raw
+      // transport error.
+      const handshakeFailure = settled ?? this.handshakeFailure();
+      if (handshakeFailure !== null) {
+        await this.fireSessionEnd('handshake_failed', handshakeFailure.message);
+        await this.teardown();
+        this.reportError(handshakeFailure);
+        this.setTransportState('failed');
+        this.setLifecycle({
+          kind: 'disconnected',
+          disconnectReason: 'handshake_failed',
+          detail: handshakeFailure.message,
+        });
+        throw handshakeFailure;
+      }
+      const message = err instanceof Error ? err.message : 'Voice session connection failed.';
+      const disconnectReason: DisconnectReason =
+        err instanceof SessionStartError ? 'handshake_failed' : 'transport_error';
+      await this.fireSessionEnd(disconnectReason, message);
+      await this.teardown();
+      const micFailure = micFailureKind(err);
+      if (micFailure !== null) {
+        this.setMediaState({ ...this.snapshot.mediaState, mic: micFailure });
+      }
+      // The browser's or transport's own error names the failure for a
+      // developer reading a stack trace; the typed one names it the way the
+      // other SDKs do, and is both what ``start()`` rejects with and what
+      // the error axis latches — one object, not two vocabularies.
+      const typed: BubbledError =
+        micFailure !== null
+          ? new AudioUnavailableError(message, MIC_FAILURE_CODES[micFailure])
+          : err instanceof SessionStartError
+            ? err
+            : new SessionStartError({ code: 'join_failed', message, cause: err });
+      this.reportError(typed);
+      this.setTransportState('failed');
       this.setLifecycle({
         kind: 'disconnected',
-        disconnectReason:
-          err instanceof SessionStartError ? 'handshake_failed' : 'transport_error',
+        disconnectReason,
         detail: message,
       });
-      throw err;
+      throw typed;
+    }
+  }
+
+  /** The window's close exit as a typed error, when the evidence for one
+   *  exists: the server's stashed pre-ready ``error`` frame (enrichment), or
+   *  a session that reached its terminal state before ``ready``. ``null``
+   *  when neither — an ordinary transport failure with nothing to enrich. */
+  private handshakeFailure(): SessionStartError | null {
+    if (this.snapshot.transportState === 'ready') return null;
+    const stashed = this.pendingHandshakeError;
+    if (stashed !== null) {
+      return handshakeFailed(stashed.code, stashed.message);
+    }
+    if (this.lifecycle.kind !== 'disconnected') return null;
+    const detail = this.lifecycle.detail;
+    return handshakeFailed(
+      undefined,
+      detail
+        ? `The session ended before ready: ${detail}`
+        : 'The session ended before ready.',
+    );
+  }
+
+  /** Hold ``start()`` until the server's ``ready`` handshake lands, so a
+   *  resolved start is a usable session. Bounded: a session that never
+   *  readies is a start failure, not a live-looking object whose every
+   *  method throws. */
+  private async awaitReadyForStart(): Promise<void> {
+    if (this.snapshot.transportState === 'ready') return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      await Promise.race([
+        this.waitUntilReady(),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(
+                // No status and no serverCode: nothing was refused. The
+                // server never answered, so attributing a verdict to it —
+                // which Python and Swift do not — would be a fabrication.
+                new SessionStartError({
+                  code: 'ready_timeout',
+                  message: `The server's ready handshake did not arrive within ${READY_TIMEOUT_MS / 1000}s.`,
+                }),
+              ),
+            READY_TIMEOUT_MS,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer !== null) clearTimeout(timer);
     }
   }
 
@@ -520,17 +741,17 @@ export class SessionEngine {
    *  the transport parks the registrations and binds them ahead of the join):
    *  freeze the hook registry (concurrent tool dispatch must never race
    *  registration), stand up the session's job sink for background tools,
-   *  and register one guarded RPC method per handler-carrying tool. */
+   *  and register one guarded RPC method per declared tool. */
   private bindClientTools(
     transport: RealtimeTransport,
-    clientTools: readonly (ClientToolSpec | BackgroundClientToolSpec)[],
+    clientTools: readonly (ClientTool | BackgroundClientTool)[],
     hooks: HookEngine | undefined,
   ): void {
-    if (!clientTools.some((tool) => tool.handler !== undefined)) return;
+    if (clientTools.length === 0) return;
     const registerRpcMethod = transport.registerRpcMethod?.bind(transport);
     if (registerRpcMethod === undefined) {
       log.warn(
-        '[realtime] client tools declared with handlers but the transport does not support RPC registration',
+        '[realtime] client tools declared but the transport does not support RPC registration',
       );
       return;
     }
@@ -560,10 +781,14 @@ export class SessionEngine {
     const registerRpcMethod = transport.registerRpcMethod?.bind(transport);
     const sendBytes = transport.sendBytes?.bind(transport);
     if (registerRpcMethod === undefined || sendBytes === undefined) {
-      log.warn(
-        '[realtime] screen_locate declared but the transport does not support RPC registration + byte streams',
-      );
-      return;
+      // The locator's capture payload travels as a byte stream, a channel
+      // the single-socket carrier does not have — refusing here means the
+      // capture handler never runs.
+      throw new SessionStartError({
+        code: 'config',
+        message: 'screen_locate is not supported on the websocket transport',
+        serverCode: 'screen_locate_unsupported',
+      });
     }
     this.unbindScreenCapture = registerRpcMethod(
       SCREEN_CAPTURE_RPC_METHOD,
@@ -615,21 +840,25 @@ export class SessionEngine {
     options?: { transcript?: boolean },
   ): Promise<void> {
     if (!this.connection || this.snapshot.transportState !== 'ready') {
-      throw new NotReadyError(
-        `sendText requires the session to be live, currently ${this.snapshot.transportState}.`,
-      );
+      throw new SessionStateError({
+        code: 'not_connected',
+        message: `sendText requires the session to be live, currently ${this.snapshot.transportState}.`,
+    });
     }
     if (!content.trim()) return;
     // Await delivery before emitting the optimistic user transcript so
     // a failed publish doesn't leave a phantom user bubble in the UI.
     await this.connection.send({ type: 'send-text', content });
     if (options?.transcript === false) return;
-    this.emitTranscript({
+    // The echo is a complete turn of its own — never folded through the
+    // wire-final path, which would replace an in-progress speech bubble.
+    const changed = this.transcriptStore.appendClosed('user', content);
+    this.emitter.emit('transcript', {
       role: 'user',
       text: content,
       isFinal: true,
-      append: false,
     });
+    if (changed) this.emitTranscriptUpdated();
   }
 
   /** Give the agent context without asking it anything.
@@ -643,12 +872,33 @@ export class SessionEngine {
    *  record, form values. ``sendText`` is the opposite: it asks. */
   async sendContext(content: string): Promise<void> {
     if (!this.connection || this.snapshot.transportState !== 'ready') {
-      throw new NotReadyError(
-        `sendContext requires the session to be live, currently ${this.snapshot.transportState}.`,
-      );
+      throw new SessionStateError({
+        code: 'not_connected',
+        message: `sendContext requires the session to be live, currently ${this.snapshot.transportState}.`,
+    });
     }
     if (!content.trim()) return;
     await this.connection.send({ type: 'send-context', content });
+  }
+
+  async appendDelegation(
+    channel: DelegationChannel,
+    content: string,
+    options?: { delegationId?: string },
+  ): Promise<void> {
+    if (!this.connection || this.snapshot.transportState !== 'ready') {
+      throw new SessionStateError({
+        code: 'not_connected',
+        message: `append${channel[0].toUpperCase()}${channel.slice(1)} requires the session to be live, currently ${this.snapshot.transportState}.`,
+      });
+    }
+    if (!content.trim()) return;
+    await this.connection.send({
+      type: 'delegation-append',
+      channel,
+      content,
+      ...(options?.delegationId === undefined ? {} : { delegation_id: options.delegationId }),
+    });
   }
 
   /** Send a single image frame to the agent as base64 JSON. Use for
@@ -661,9 +911,10 @@ export class SessionEngine {
     streamId?: string;
   }): Promise<void> {
     if (!this.connection || this.snapshot.transportState !== 'ready') {
-      throw new NotReadyError(
-        `sendImage requires the session to be live, currently ${this.snapshot.transportState}.`,
-      );
+      throw new SessionStateError({
+        code: 'not_connected',
+        message: `sendImage requires the session to be live, currently ${this.snapshot.transportState}.`,
+    });
     }
     await this.connection.send({
       type: 'send-image',
@@ -676,9 +927,10 @@ export class SessionEngine {
   /** Send a keep-alive ping. Server replies with a ``pong`` event. */
   async sendPing(): Promise<void> {
     if (!this.connection || this.snapshot.transportState !== 'ready') {
-      throw new NotReadyError(
-        `sendPing requires the session to be live, currently ${this.snapshot.transportState}.`,
-      );
+      throw new SessionStateError({
+        code: 'not_connected',
+        message: `sendPing requires the session to be live, currently ${this.snapshot.transportState}.`,
+    });
     }
     await this.connection.send({ type: 'ping' });
   }
@@ -688,9 +940,10 @@ export class SessionEngine {
    *  from ending the session. */
   async sendActivityEnd(): Promise<void> {
     if (!this.connection || this.snapshot.transportState !== 'ready') {
-      throw new NotReadyError(
-        `sendActivityEnd requires the session to be live, currently ${this.snapshot.transportState}.`,
-      );
+      throw new SessionStateError({
+        code: 'not_connected',
+        message: `sendActivityEnd requires the session to be live, currently ${this.snapshot.transportState}.`,
+    });
     }
     await this.connection.send({ type: 'activity-end' });
   }
@@ -709,16 +962,17 @@ export class SessionEngine {
    *
    *  Throws ``DialError`` for a malformed number (validated locally,
    *  before any request) or a server rejection (phone calls disabled, over
-   *  the minute limit, ended session, …); and ``NotReadyError`` when
+   *  the minute limit, ended session, …); and ``SessionStateError`` when
    *  no session has started. */
   async dial(phoneNumber: string, callerNumber?: string): Promise<DialResult> {
     const validated = validateE164(phoneNumber);
     const validatedCaller = callerNumber === undefined ? undefined : validateE164(callerNumber);
     const sessionId = this.getSessionId();
     if (sessionId === null) {
-      throw new NotReadyError(
-        `dial requires an active session, currently ${this.snapshot.transportState}.`,
-      );
+      throw new SessionStateError({
+        code: 'not_connected',
+        message: `dial requires an active session, currently ${this.snapshot.transportState}.`,
+    });
     }
     return postDial({
       dialUrl: this.context.dialUrl(sessionId),
@@ -746,12 +1000,6 @@ export class SessionEngine {
   attachAudioElement(el: HTMLAudioElement | null): void {
     this.hostAudioElement = el;
     this.connection?.attachAudioElement(el);
-    // The host element routinely arrives AFTER the connect — a React host
-    // mounts it on a later render — and the transport swaps its fallback for
-    // it. Rebuild the side-tap against whatever is playing now; leaving it on
-    // whatever existed when the connect finished is how the output level
-    // silently reads zero for a whole call.
-    this.refreshOutputAnalyser();
   }
 
   /** Register a transport-level RPC method handler the server invokes via
@@ -766,13 +1014,14 @@ export class SessionEngine {
     handler: (payload: string) => Promise<string>,
   ): Unsubscribe {
     if (!this.connection?.registerRpcMethod) {
-      throw new NotReadyError(
-        `registerRpcMethod requires a connected transport, currently ${this.snapshot.transportState}.`,
-      );
+      throw new SessionStateError({
+        code: 'not_connected',
+        message: `registerRpcMethod requires a connected transport, currently ${this.snapshot.transportState}.`,
+    });
     }
     // Manual RPC wiring predates the typed client-tool runtime and stays
-    // payload-only (no caller guard) for compatibility; declared tools with
-    // handlers go through ``registerClientToolHandlers`` instead.
+    // payload-only (no caller guard) for compatibility; declared client
+    // tools go through ``registerClientToolHandlers`` instead.
     return this.connection.registerRpcMethod(name, (invocation) =>
       handler(invocation.payload),
     );
@@ -796,9 +1045,10 @@ export class SessionEngine {
 
   async setMicMuted(muted: boolean): Promise<void> {
     if (!this.connection || this.snapshot.transportState !== 'ready') {
-      throw new NotReadyError(
-        `setMicMuted requires the session to be live, currently ${this.snapshot.transportState}.`,
-      );
+      throw new SessionStateError({
+        code: 'not_connected',
+        message: `setMicMuted requires the session to be live, currently ${this.snapshot.transportState}.`,
+    });
     }
     const previous = this.snapshot.mediaState.mic;
     if (muted) {
@@ -809,12 +1059,10 @@ export class SessionEngine {
     try {
       await this.connection.setMicMuted(muted);
     } catch (err) {
-      // Roll back optimistic state and surface the failure — callers
-      // and ``useRealtimeError`` should see a real ``mic_toggle_failed``
-      // instead of a silently lost mute toggle.
+      // Roll back optimistic state. The caller awaited this and receives
+      // the throw; a toggle failure on a live session is request-scoped,
+      // not session health, so it does not latch on the error axis.
       this.setMediaState({ ...this.snapshot.mediaState, mic: previous });
-      const message = err instanceof Error ? err.message : 'Mic toggle failed.';
-      this.setError({ code: 'server_error', message });
       throw err;
     }
   }
@@ -829,19 +1077,36 @@ export class SessionEngine {
     return this.snapshot.mediaState.screen;
   }
 
+  /** The locally captured display stream while a share is active, for the
+   *  app to render its own "you are sharing this" preview. ``null`` when
+   *  nothing is being shared. The engine owns the stream's lifecycle — do
+   *  not stop its tracks; call ``stopScreenShare`` instead. */
+  getScreenShareStream(): MediaStream | null {
+    return this.screenShareStream;
+  }
+
   async startScreenShare(): Promise<void> {
     if (!this.connection || this.snapshot.transportState !== 'ready') {
-      throw new NotReadyError(
-        `startScreenShare requires the session to be live, currently ${this.snapshot.transportState}.`,
-      );
+      throw new SessionStateError({
+        code: 'not_connected',
+        message: `startScreenShare requires the session to be live, currently ${this.snapshot.transportState}.`,
+    });
     }
     const current = this.snapshot.mediaState.screen;
     if (current.kind === 'active' || current.kind === 'requesting') {
       log.info('[realtime] screen share already in progress', current.kind);
       return;
     }
+    if (this.connection.addVideoStream === undefined) {
+      const refusal = videoUnsupported();
+      this.setScreenShareState({
+        kind: 'error',
+        error: { code: 'screen_start_failed', message: refusal.message },
+      });
+      throw refusal;
+    }
     if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getDisplayMedia) {
-      const code: ErrorCode = 'screen_start_failed';
+      const code = 'screen_start_failed';
       const message = 'Screen capture is not supported in this environment.';
       this.setScreenShareState({ kind: 'error', error: { code, message } });
       throw new Error(message);
@@ -855,14 +1120,14 @@ export class SessionEngine {
       log.error('[realtime] screen-share permission failed', err);
       const message = err instanceof Error ? err.message : 'Screen share was not granted.';
       const denied = isScreenPermissionDenied(err);
-      const code: ErrorCode = denied ? 'screen_denied' : 'screen_start_failed';
+      const code = denied ? 'screen_denied' : 'screen_start_failed';
       this.setScreenShareState({ kind: 'error', error: { code, message } });
       throw err;
     }
     const videoTrack = displayStream.getVideoTracks()[0] ?? null;
     if (!videoTrack) {
       for (const t of displayStream.getTracks()) t.stop();
-      const code: ErrorCode = 'screen_start_failed';
+      const code = 'screen_start_failed';
       const message = 'Screen capture stream contained no video track.';
       this.setScreenShareState({ kind: 'error', error: { code, message } });
       throw new Error(message);
@@ -874,12 +1139,13 @@ export class SessionEngine {
       for (const t of displayStream.getTracks()) t.stop();
       log.error('[realtime] screen-share publish failed', err);
       const message = err instanceof Error ? err.message : 'Failed to publish screen share.';
-      const code: ErrorCode = 'screen_start_failed';
+      const code = 'screen_start_failed';
       this.setScreenShareState({ kind: 'error', error: { code, message } });
       throw err;
     }
     this.screenShareHandle = handle;
     this.screenShareTrack = videoTrack;
+    this.screenShareStream = displayStream;
     const onEnded = (): void => {
       log.info('[realtime] screen-share track ended');
       void this.stopScreenShare();
@@ -930,6 +1196,10 @@ export class SessionEngine {
     if (track) {
       try { track.stop(); } catch { /* ignore */ }
     }
+    for (const t of this.screenShareStream?.getTracks() ?? []) {
+      try { t.stop(); } catch { /* ignore */ }
+    }
+    this.screenShareStream = null;
     this.screenShareTrack = null;
     this.screenShareEndedListener = null;
     this.screenShareHandle = null;
@@ -947,12 +1217,13 @@ export class SessionEngine {
     // join and silently drop the publish. Throwing keeps the failure
     // visible.
     if (!conn || this.snapshot.transportState !== 'ready') {
-      throw new NotReadyError(
-        `addVideoStream requires the session to be live, currently ${this.snapshot.transportState}.`,
-      );
+      throw new SessionStateError({
+        code: 'not_connected',
+        message: `addVideoStream requires the session to be live, currently ${this.snapshot.transportState}.`,
+    });
     }
     if (!conn.addVideoStream) {
-      throw new Error('Active transport does not support video streams.');
+      throw videoUnsupported();
     }
     const handle = await conn.addVideoStream(stream, options);
     const track = stream.getVideoTracks()[0] ?? null;
@@ -987,9 +1258,10 @@ export class SessionEngine {
   async startAudioStream(stream: MediaStream): Promise<void> {
     const conn = this.connection;
     if (!conn || this.snapshot.transportState !== 'ready') {
-      throw new NotReadyError(
-        `startAudioStream requires the session to be live, currently ${this.snapshot.transportState}.`,
-      );
+      throw new SessionStateError({
+        code: 'not_connected',
+        message: `startAudioStream requires the session to be live, currently ${this.snapshot.transportState}.`,
+    });
     }
     if (!conn.startAudioStream) {
       throw new Error('Active transport does not support audio streams.');
@@ -1005,15 +1277,23 @@ export class SessionEngine {
 
   // ─── Internals: state mutation ─────────────────────────────────────────
 
-  setError(error: ErrorEvent | null): void {
-    const prev = this.snapshot.error;
-    if (prev === error) return;
+  /** The one intake for the error axis: latch the error object itself and
+   *  emit it. Call sites own any transport-state transition — a non-fatal
+   *  server error frame arrives on a healthy transport. */
+  private reportError(error: BubbledError): void {
+    if (this.snapshot.error === error) return;
     this.snapshot = { ...this.snapshot, error };
-    if (error !== null) this.setTransportState('failed');
     this.emitter.emit('error', error);
   }
 
-  private setLifecycle(next: SessionLifecycleState): void {
+  /** Clear the axis back to healthy, so subscribers drop a stale banner. */
+  private clearError(): void {
+    if (this.snapshot.error === null) return;
+    this.snapshot = { ...this.snapshot, error: null };
+    this.emitter.emit('error', null);
+  }
+
+  private setLifecycle(next: SessionState): void {
     if (this.lifecycle.kind === next.kind && next.kind !== 'disconnected') return;
     const previous = this.lifecycle.kind;
     this.lifecycle = next;
@@ -1024,6 +1304,15 @@ export class SessionEngine {
       detail: next.detail ?? null,
       sessionId: this.getSessionId(),
     });
+    // Close any still-open bubble before the terminal notifications, so a
+    // ``session_ended`` handler reading ``transcript`` sees finals only.
+    const transcriptChanged =
+      next.kind === 'disconnected' ? this.transcriptStore.closeOpen() : false;
+    // The fold goes out before the ending does. A subscriber told the
+    // session ended tears its subscriptions down, so an update emitted after
+    // that lands on nothing — and Python settles the transcript first for the
+    // same reason: a consumer draining to the end sees finals only.
+    if (transcriptChanged) this.emitTranscriptUpdated();
     this.emitter.emit('lifecycle', next);
     if (next.kind === 'disconnected' && !this.sessionEndedEmitted) {
       this.sessionEndedEmitted = true;
@@ -1067,11 +1356,9 @@ export class SessionEngine {
   private resetSnapshot(): void {
     const hadError = this.snapshot.error !== null;
     this.snapshot = { ...INITIAL_SNAPSHOT };
-    this.currentTurnId = generateTurnId();
-    this.transcriptSeq = 0;
-    this.lastTranscriptRole = null;
     this.serverEndReason = null;
     this.lastReadyEvent = null;
+    this.pendingHandshakeError = null;
     this.emitter.emit('transport_state', this.snapshot.transportState);
     this.emitter.emit('agent_state', this.snapshot.agentState);
     this.emitter.emit('media_state', this.snapshot.mediaState);
@@ -1087,19 +1374,61 @@ export class SessionEngine {
     role: 'user' | 'assistant';
     text: string;
     isFinal: boolean;
-    append: boolean;
   }): void {
-    const seq = this.transcriptSeq++;
     const event: TranscriptDeltaEvent = {
-      id: `${this.currentTurnId}-${seq}`,
-      turnId: this.currentTurnId,
       role: args.role,
       text: args.text,
       isFinal: args.isFinal,
-      append: args.append,
     };
-    this.lastTranscriptRole = args.role;
+    // Fold into the session-owned transcript before either notification
+    // goes out, so a handler reading ``transcript`` always sees this
+    // delta applied.
+    const changed = this.transcriptStore.applyDelta(args.role, args.text, args.isFinal);
     this.emitter.emit('transcript', event);
+    if (changed) this.emitTranscriptUpdated();
+  }
+
+  private emitTranscriptUpdated(): void {
+    this.emitter.emit('transcript_updated', { items: this.transcriptStore.current });
+  }
+
+  /** Resolve the ``ready`` mark against the connect origin, then report the
+   *  waterfall. Runs from both sides of the race: ``ready`` can arrive over
+   *  the data channel before ``connect()`` resolves, so the mark is taken raw
+   *  and folded once both exist. */
+  private foldConnectMarks(): void {
+    const timings = this.connectTimings;
+    const startedAt = this.connectStartedAt;
+    if (timings === null || startedAt === null) return;
+    this.connectTimings = {
+      ...timings,
+      readyMs: this.readyAt === null ? (timings.readyMs ?? null) : this.readyAt - startedAt,
+    };
+    this.reportConnectTimings();
+  }
+
+  /** Hand the client's half of the connect waterfall to the worker, which
+   *  can't see the start request, the room join or the mic permission.
+   *  Released at ``ready`` — readiness is room state now, so every session
+   *  that comes up observes it.
+   *  Fire-and-forget diagnostics: a failure never reaches the session. */
+  private reportConnectTimings(): void {
+    const timings = this.connectTimings;
+    if (this.connectTimingsReported || timings === null) return;
+    if (this.readyAt === null) return;
+    this.connectTimingsReported = true;
+    const readyMs = timings.readyMs ?? null;
+    const frame: ClientConnectTimings = {
+      type: 'connect-timings',
+      request_ms: Math.round(timings.wsMs),
+      room_ms: Math.round(timings.roomMs),
+      mic_ms: Math.round(timings.micMs),
+      ...(readyMs === null ? {} : { ready_ms: Math.round(readyMs) }),
+      ...(timings.serverTimings === null ? {} : { server: timings.serverTimings }),
+    };
+    this.connection?.send(frame).catch((err: unknown) => {
+      log.warn('[realtime] connect-timings send failed', err);
+    });
   }
 
   private handleServerMessage(message: RealtimeInboundMessage): void {
@@ -1109,7 +1438,11 @@ export class SessionEngine {
     switch (message.type) {
       case 'ready': {
         const ready = message;
-        this.setError(null);
+        if (this.readyAt === null) {
+          this.readyAt = performance.now();
+          this.foldConnectMarks();
+        }
+        this.clearError();
         this.setTransportState('ready');
         this.setAgentState('listening');
         const rejectedTools = ready.rejected_tools ?? [];
@@ -1118,17 +1451,7 @@ export class SessionEngine {
             `[realtime] server rejected tool spec "${rejected.name}": ${rejected.reason}`,
           );
         }
-        this.lastReadyEvent = {
-          sessionId: ready.session_id,
-          rejectedTools,
-          maxSessionSeconds: ready.max_session_seconds ?? null,
-          agent: ready.agent
-            ? {
-                name: ready.agent.name,
-                tools: ready.agent.tools ?? [],
-              }
-            : null,
-        };
+        this.lastReadyEvent = decode.readyEvent(ready);
         this.emitter.emit('ready', this.lastReadyEvent);
         this.settleReadyWaiters(null);
         return;
@@ -1139,12 +1462,10 @@ export class SessionEngine {
           log.warn(`[realtime] dropping transcript with unknown role: ${message.role}`);
           return;
         }
-        const append = this.lastTranscriptRole === role;
         this.emitTranscript({
           role,
           text: message.text,
           isFinal: message.is_final,
-          append,
         });
         return;
       }
@@ -1154,10 +1475,7 @@ export class SessionEngine {
         // not transcribed audio. Consumers that render a transcript
         // bubble should subscribe to ``transcript`` only. SDK ships
         // this verbatim so debug surfaces / TEXT-mode callers can use it.
-        this.emitter.emit('model_text', {
-          text: message.text,
-          isFinal: message.is_final ?? false,
-        });
+        this.emitter.emit('model_text', decode.modelTextEvent(message));
         return;
       }
       case 'turn-complete': {
@@ -1166,39 +1484,26 @@ export class SessionEngine {
           log.warn(`[realtime] dropping turn-complete with unknown role: ${message.role}`);
           return;
         }
+        const closedDangling = this.transcriptStore.applyTurnComplete(role);
         this.emitter.emit('turn_complete', { role });
+        if (closedDangling) this.emitTranscriptUpdated();
         this.setAgentState('listening');
-        this.currentTurnId = generateTurnId();
-        this.transcriptSeq = 0;
-        this.lastTranscriptRole = null;
         return;
       }
       case 'tool-call':
-        this.emitter.emit('tool_call', {
-          toolCallId: message.tool_call_id,
-          name: message.name,
-        });
+        this.emitter.emit('tool_call', decode.toolCallEvent(message));
         return;
       case 'tool-dispatch-started':
-        this.emitter.emit('tool_dispatch_started', {
-          toolCallId: message.tool_call_id,
-          name: message.name,
-        });
+        this.emitter.emit(
+          'tool_dispatch_started',
+          decode.toolDispatchStartedEvent(message),
+        );
         return;
       case 'tool-result':
-        this.emitter.emit('tool_result', {
-          toolCallId: message.tool_call_id,
-          ok: message.ok ?? false,
-          summary: message.summary ?? null,
-        });
+        this.emitter.emit('tool_result', decode.toolResultEvent(message));
         return;
       case 'cosmo.session-state':
-        this.emitter.emit('session_state', {
-          state: (message.state ?? {}) as Record<string, unknown>,
-          updatedKeys: message.updated_keys ?? [],
-          warnings: message.warnings ?? [],
-          stage: message.stage ?? null,
-        });
+        this.emitter.emit('session_state', decode.sessionStateWriteEvent(message));
         return;
       case 'user-started-speaking':
         this.setAgentState('listening');
@@ -1234,40 +1539,27 @@ export class SessionEngine {
       case 'tool-invocation':
         return;
       case 'cosmo.usage':
-        this.emitter.emit('usage', {
-          inputTextTokens: message.input_text_tokens ?? 0,
-          inputImageTokens: message.input_image_tokens ?? 0,
-          inputAudioTokens: message.input_audio_tokens ?? 0,
-          inputCachedTokens: message.input_cached_tokens ?? 0,
-          outputTextTokens: message.output_text_tokens ?? 0,
-          outputAudioTokens: message.output_audio_tokens ?? 0,
-          totalTokens: message.total_tokens ?? 0,
-        });
+        this.emitter.emit('usage', decode.usageEvent(message));
         return;
       case 'user-speech-timeout': {
-        const timeout: UserSpeechTimeoutEvent = {
-          sessionId: message.session_id,
-          silenceMs: message.silence_ms,
-          triggerCount: message.trigger_count,
-          maxCount: message.max_count,
-          action: message.action,
-        };
-        this.emitter.emit('user_speech_timeout', timeout);
+        this.emitter.emit('user_speech_timeout', decode.userSpeechTimeoutEvent(message));
+        return;
+      }
+      case 'delegation-created': {
+        this.emitter.emit('delegation_created', decode.delegationCreatedEvent(message));
         return;
       }
       case 'pong':
-        this.emitter.emit('pong', {});
+        this.emitter.emit('pong', decode.pongEvent(message));
         return;
       case 'reconnecting':
-        this.emitter.emit('reconnecting', {
-          secondsRemaining: message.seconds_remaining ?? null,
-        });
+        this.emitter.emit('reconnecting', decode.reconnectingEvent(message));
         return;
       case 'session-ending-soon':
-        this.emitter.emit('session_ending_soon', {
-          secondsRemaining: message.seconds_remaining,
-          reason: message.reason,
-        });
+        this.emitter.emit(
+          'session_ending_soon',
+          decode.sessionEndingSoonEvent(message),
+        );
         return;
       case 'session-ended':
         // The server ends the session on purpose (e.g. max-duration cap).
@@ -1278,13 +1570,19 @@ export class SessionEngine {
         this.armServerEndGrace();
         return;
       case 'error': {
-        const errCode = mapServerErrorCode(message.code);
-        this.setError({ code: errCode, message: message.message });
-        // A server error before ready means the session will never
-        // reach 'ready' — fail pending waitUntilReady waiters so a
-        // pending ``waitUntilReady()`` rejects instead of hanging.
+        // The wire omits ``fatal`` for a non-fatal error; the published
+        // event states it, the way every other event here reads its
+        // optional wire fields as settled values.
+        this.reportError(decode.errorEvent(message));
+        // Before ready, an error frame is enrichment for the room close a
+        // failed boot sends next — stashed so that close rejects with the
+        // server's own code and message. The frame itself settles nothing:
+        // the structural close is the authoritative failure signal.
         if (this.snapshot.transportState !== 'ready') {
-          this.settleReadyWaiters(new NotReadyError(message.message));
+          this.pendingHandshakeError = {
+            code: message.code,
+            message: message.message,
+          };
         }
         return;
       }
@@ -1300,14 +1598,18 @@ export class SessionEngine {
 
   /** Resolve when the current session reaches ``transportState === 'ready'``.
    *  Resolves immediately if already ready, rejects if the session ends
-   *  (or disconnects) before becoming ready. Use this between
-   *  ``await agent.start()`` and the first ``sendText()`` to avoid the
-   *  ``NotReadyError`` race. */
+   *  (or disconnects) before becoming ready. ``agent.start()`` already
+   *  resolves at ready, so after a resolved start this is instant; it
+   *  exists for code holding a session reference from before the start
+   *  settled (the ``onSession`` callback). */
   waitUntilReady(): Promise<void> {
     if (this.snapshot.transportState === 'ready') return Promise.resolve();
     if (this.connection === null) {
       return Promise.reject(
-        new NotReadyError('waitUntilReady called with no active connection.'),
+        new SessionStateError({
+          code: 'not_connected',
+          message: 'waitUntilReady called with no active connection.',
+        }),
       );
     }
     return new Promise<void>((resolve, reject) => {
@@ -1347,22 +1649,44 @@ export class SessionEngine {
   // Async so SessionEnd hooks complete before the terminal lifecycle publish and
   // teardown (Python awaits ``_fire_session_end`` before clearing session state);
   // transports invoke it fire-and-forget off their close callbacks.
-  private async handleUnsolicitedClose(event?: {
-    reason?: string;
-    code?: string;
-  }): Promise<void> {
+  private async handleUnsolicitedClose(event?: RealtimeCloseInfo): Promise<void> {
+    // A close before ``ready`` fails the handshake: settle the pending
+    // ready waiters (``start()``, ``waitUntilReady()``) with the typed
+    // start-taxonomy error before the teardown below drains them. A
+    // stashed pre-ready error frame supplies the detail — the close is the
+    // authoritative signal, the frame its enrichment.
+    if (this.snapshot.transportState !== 'ready') {
+      const stashed = this.pendingHandshakeError;
+      const detail = this.serverEndReason ?? normalizeCloseReason(event?.reason);
+      const failure =
+        stashed !== null
+          ? handshakeFailed(stashed.code, stashed.message)
+          : handshakeFailed(
+              undefined,
+              `The session ended before ready: ${detail}`,
+            );
+      this.settleReadyWaiters(failure);
+      // One terminal reason for one ending: a close before ``ready`` is the
+      // window's handshake failure on every surface — the rejection
+      // ``start()`` raises, the state ``onStateChange`` reports, the stream's
+      // terminal item, and the SessionEnd hook. Falling through to the
+      // server-ended / transport-error branches below would report a
+      // different reason than the caller was just handed.
+      await this.fireSessionEnd('handshake_failed', failure.message);
+      this.reportError(failure);
+      this.setTransportState('failed');
+      this.setLifecycle({
+        kind: 'disconnected',
+        disconnectReason: 'handshake_failed',
+        detail: failure.message,
+      });
+      await this.teardown();
+      return;
+    }
     // A close preceded by ``session-ended`` is the server hanging up on
     // purpose — tear down cleanly, no error banner.
     if (this.serverEndReason !== null) {
-      const reason = this.serverEndReason;
-      log.info('[voice] server ended the session', { reason, sessionId: this.getSessionId() });
-      await this.fireSessionEnd('server_ended', reason);
-      this.setLifecycle({
-        kind: 'disconnected',
-        disconnectReason: 'server_ended',
-        detail: reason,
-      });
-      await this.teardown();
+      await this.endServerSide('server ended the session', this.serverEndReason);
       return;
     }
     // A deliberate server-side close (room deleted when a transfer's call
@@ -1371,33 +1695,47 @@ export class SessionEngine {
     // teardown, no error. Mirrors the backend webhook's normal-disconnect
     // set.
     if (event?.reason && /ROOM_DELETED|ROOM_CLOSED|PARTICIPANT_REMOVED/.test(event.reason)) {
-      const detail = normalizeCloseReason(event.reason);
-      log.info('[voice] server ended the call', { reason: detail, sessionId: this.getSessionId() });
-      await this.fireSessionEnd('server_ended', detail);
-      this.setLifecycle({
-        kind: 'disconnected',
-        disconnectReason: 'server_ended',
-        detail,
-      });
-      await this.teardown();
+      await this.endServerSide('server ended the call', normalizeCloseReason(event.reason));
+      return;
+    }
+    // A transport that can tell a deliberate remote close from a failure
+    // says so itself; the close code is transport-defined and means
+    // nothing here on its own.
+    if (event?.serverEnded === true) {
+      await this.endServerSide('server closed the socket', normalizeCloseReason(event.reason));
       return;
     }
     // LiveKit handles transient transport recovery on its own (ICE
     // restart, signal reconnect) — this handler is only called when
     // LiveKit has fully given up. We don't auto-retry at the session
     // layer; callers can start a new session (``agent.start()``) from
-    // their error / transport_state handlers if they want to re-mint one.
+    // their transport_state / session_ended handlers if they want to
+    // re-mint one.
     log.error('[voice] transport closed unexpectedly', event);
-    const transportError: ErrorEvent = {
-      code: 'transport_disconnect',
-      message: normalizeCloseReason(event?.reason),
-    };
-    await this.fireSessionEnd('transport_error', transportError.message);
-    this.setError(transportError);
+    const closeReason = normalizeCloseReason(event?.reason);
+    const detail = event?.code !== undefined
+      ? `${closeReason} (close code ${event.code})`
+      : closeReason;
+    // The lifecycle axis carries this ending — ``disconnected`` with
+    // ``transport_error`` and the close detail. It is not latched on the
+    // error axis, which holds typed errors and wire error frames only.
+    await this.fireSessionEnd('transport_error', detail);
+    this.setTransportState('failed');
     this.setLifecycle({
       kind: 'disconnected',
       disconnectReason: 'transport_error',
-      detail: transportError.message,
+      detail,
+    });
+    await this.teardown();
+  }
+
+  private async endServerSide(logMessage: string, detail: string): Promise<void> {
+    log.info(`[voice] ${logMessage}`, { reason: detail, sessionId: this.getSessionId() });
+    await this.fireSessionEnd('server_ended', detail);
+    this.setLifecycle({
+      kind: 'disconnected',
+      disconnectReason: 'server_ended',
+      detail,
     });
     await this.teardown();
   }
@@ -1431,38 +1769,34 @@ export class SessionEngine {
     this.refreshOutputAnalyser();
   }
 
-  /** Point the output side-tap at the transport's current audio element.
+  /** Point the output analyser at the transport's current remote audio.
    *
-   * Runs at connect and again whenever the element changes, because the host
-   * element is often attached later than the connect and the transport may
-   * have been playing through its own fallback until then. A no-op when the
-   * element is unchanged — ``createMediaElementSource`` throws on a second
-   * call for the same element. */
+   * Runs at connect and again whenever the stream changes, because the
+   * remote track is subscribed after the connect resolves and can be
+   * replaced mid-session. A no-op when the stream has not moved. */
   private refreshOutputAnalyser(): void {
     const local = this.connection;
     if (local === null) return;
-    const element = local.getOutputAudioElement();
-    if (element === this.outputAnalyserElement) return;
+    const stream = local.getOutputStream?.() ?? null;
+    if (stream === this.outputAnalyserStream) return;
     try {
       if (this.outputAnalyserSource) {
         this.outputAnalyserSource.disconnect();
         this.outputAnalyserSource = null;
       }
-      this.outputAnalyserElement = element;
-      if (element === null) {
+      this.outputAnalyserStream = stream;
+      if (stream === null) {
         this.setOutputAnalyser(null);
       } else {
         const ctx = this.analyserContext ?? new AudioContext();
         this.analyserContext = ctx;
-        const src = ctx.createMediaElementSource(element);
+        const src = ctx.createMediaStreamSource(stream);
         const an = ctx.createAnalyser();
         an.fftSize = 256;
-        // The side-tap must ALSO re-connect to destination so the audio keeps
-        // audibly playing — createMediaElementSource diverts the element's
-        // output into the graph. Without `connect(destination)` the user
-        // would hear nothing.
+        // No ``connect(destination)``: the element plays this track itself
+        // and the source only feeds the analyser. Routing it to the speakers
+        // as well would double the agent's voice.
         src.connect(an);
-        src.connect(ctx.destination);
         this.outputAnalyserSource = src;
         this.setOutputAnalyser(an);
       }
@@ -1516,7 +1850,7 @@ export class SessionEngine {
     return Math.sqrt(sum / buf.length);
   }
 
-  private async teardown(opts?: { sendEndFrame?: boolean }): Promise<void> {
+  private async teardown(options?: { sendEndFrame?: boolean }): Promise<void> {
     const local = this.connection;
     const wasSharing = this.snapshot.mediaState.screen.kind === 'active';
     this.connection = null;
@@ -1538,7 +1872,10 @@ export class SessionEngine {
     this.earlySessionId = null;
     this.connectTimings = null;
     this.settleReadyWaiters(
-      new NotReadyError('Realtime session ended before reaching ready.'),
+      new SessionStateError({
+        code: 'not_connected',
+        message: 'Realtime session ended before reaching ready.',
+      }),
     );
     // Screen-share state resets in this synchronous prologue — the client's
     // detach runs one microtask after the terminal lifecycle, so an emission
@@ -1559,7 +1896,9 @@ export class SessionEngine {
       try { this.outputAnalyserSource.disconnect(); } catch { /* ignore */ }
       this.outputAnalyserSource = null;
     }
-    this.outputAnalyserElement = null;
+    this.outputAnalyserStream = null;
+    // Both taps are stream sources on this engine's own context, and neither
+    // owns anything a later session needs, so closing it is safe.
     if (this.analyserContext) {
       try {
         await this.analyserContext.close();
@@ -1568,6 +1907,6 @@ export class SessionEngine {
       }
       this.analyserContext = null;
     }
-    if (local) await local.disconnect(opts);
+    if (local) await local.disconnect(options);
   }
 }

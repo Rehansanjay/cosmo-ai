@@ -1,5 +1,10 @@
 import { useState } from 'react';
-import { MicToggle, RealtimeAudio, StartAudio, useTransportState } from 'cosmo-ai';
+import {
+  MicToggle,
+  RealtimeAudio,
+  StartAudio,
+  useTransportState,
+} from 'cosmo-ai/react';
 
 import { useWakeLock } from '../camera/use_wake_lock';
 import { Avatar, useChefMood } from './Avatar';

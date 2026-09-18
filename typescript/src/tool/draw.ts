@@ -2,16 +2,16 @@
  * The renderer client tools the SDK ships: ``cosmo_sdk_draw_box`` and
  * ``cosmo_sdk_draw_point``.
  *
- * A server-side locator (``{ kind: 'detect_objects' }`` /
- * ``{ kind: 'point_at_object' }``) hands the model candidate boxes or points;
+ * A server-side locator (``detectObjectsTool()`` / ``pointAtObjectTool()``)
+ * hands the model candidate boxes or points;
  * the model picks the one that matches what it is looking at and passes it
  * here for the app to draw over the user's live view::
  *
  *     const agent = client.agent({
  *       instructions: 'help the user find things on screen',
  *       tools: [
- *         { kind: 'detect_objects' },
- *         drawBox((request) => {
+ *         detectObjectsTool(),
+ *         drawBoxTool((request) => {
  *           if (!preview.visible) return notShown('the preview is not on screen');
  *           preview.showBox(request);
  *           return shown;
@@ -25,34 +25,45 @@
  * cross-SDK contract, pinned by ``sdk-client-tool-vectors.json``.
  */
 
-import type { ClientToolSpec } from '../core/agent';
+import { mintAgentTool } from '../core/agent';
+import type { AgentTool, ClientTool } from '../core/agent';
 
 import { markSdkClientTool } from './sdk_tool';
 
 /** Where to draw, normalized to the frame the model was shown: ``[0,1]``,
  *  top-left origin (y increases downward). */
 export type NormalizedBox = {
+  /** Left edge, ``0``–``1`` across the frame's width. */
   x: number;
+  /** Top edge, ``0``–``1`` down the frame's height. */
   y: number;
+  /** Width as a fraction of the frame's width. */
   width: number;
+  /** Height as a fraction of the frame's height. */
   height: number;
 };
 
 /** Where to mark, in the same normalized space. */
 export type NormalizedPoint = {
+  /** Horizontal position, ``0``–``1`` across the frame's width. */
   x: number;
+  /** Vertical position, ``0``–``1`` down the frame's height. */
   y: number;
 };
 
 /** One model request to draw a box over the user's live view. */
 export type DrawBoxRequest = {
+  /** Where to draw it, in frame-normalized coordinates. */
   box: NormalizedBox;
+  /** Short caption to show with the box. Unset draws it unlabelled. */
   label?: string;
 };
 
 /** One model request to mark a single spot over the user's live view. */
 export type DrawPointRequest = {
+  /** Where to mark, in frame-normalized coordinates. */
   point: NormalizedPoint;
+  /** Short caption to show with the mark. Unset draws it unlabelled. */
   label?: string;
 };
 
@@ -62,13 +73,25 @@ export type DrawPointRequest = {
  *  off, the preview isn't on screen. Answering "shown" regardless would leave
  *  it talking about something the user cannot see, so a refusal carries a
  *  reason the agent can say out loud. */
-export type DrawOutcome = { shown: true } | { shown: false; reason: string };
+export type DrawOutcome =
+  | { shown: true }
+  | {
+      shown: false;
+      /** Why nothing was drawn — model-facing prose the agent says out loud,
+       *  not an error code. */
+      reason: string;
+    };
 
 /** The refusal arm every renderer shares — the camera draws and the screen
  *  highlights alike, since "nothing was drawn, and here is why" carries no
  *  detail either of them needs to qualify. Named so {@link notShown} can serve
  *  both without either outcome type importing the other. */
-export type NotShown = { shown: false; reason: string };
+export type NotShown = {
+  shown: false;
+  /** Why nothing was drawn — model-facing prose the agent says out loud,
+   *  not an error code. */
+  reason: string;
+};
 
 /** The annotation is on screen. */
 export const shown: DrawOutcome = { shown: true };
@@ -80,8 +103,11 @@ export function notShown(reason: string): NotShown {
   return { shown: false, reason };
 }
 
-/** Wire name shipped in tool-call events; a rename is a wire break. */
+/** Wire name of the box-drawing tool as it appears in tool-call events; a
+ *  rename is a wire break. */
 export const DRAW_BOX_TOOL_NAME = 'cosmo_sdk_draw_box';
+/** Wire name of the point-drawing tool as it appears in tool-call events; a
+ *  rename is a wire break. */
 export const DRAW_POINT_TOOL_NAME = 'cosmo_sdk_draw_point';
 
 const DRAW_BOX_DESCRIPTION =
@@ -192,10 +218,10 @@ export function parseDrawPointRequest(
  *  locator that feeds it. Your handler owns only the drawing — and the honest
  *  answer about whether it happened. Malformed arguments surface to the model
  *  as the call's error without reaching your code. */
-export function drawBox(
+export function drawBoxTool(
   onDraw: (request: DrawBoxRequest) => DrawOutcome | Promise<DrawOutcome>,
-): ClientToolSpec {
-  return markSdkClientTool({
+): AgentTool {
+  return mintAgentTool(markSdkClientTool({
     kind: 'client',
     name: DRAW_BOX_TOOL_NAME,
     description: DRAW_BOX_DESCRIPTION,
@@ -209,15 +235,15 @@ export function drawBox(
       }
       return { ...(await onDraw(request)) };
     },
-  });
+  }));
 }
 
-/** The point renderer. Same contract as {@link drawBox}, with a
+/** The point renderer. Same contract as {@link drawBoxTool}, with a
  *  {@link DrawPointRequest}. */
-export function drawPoint(
+export function drawPointTool(
   onDraw: (request: DrawPointRequest) => DrawOutcome | Promise<DrawOutcome>,
-): ClientToolSpec {
-  return markSdkClientTool({
+): AgentTool {
+  return mintAgentTool(markSdkClientTool({
     kind: 'client',
     name: DRAW_POINT_TOOL_NAME,
     description: DRAW_POINT_DESCRIPTION,
@@ -231,5 +257,5 @@ export function drawPoint(
       }
       return { ...(await onDraw(request)) };
     },
-  });
+  }));
 }

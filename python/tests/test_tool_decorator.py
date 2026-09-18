@@ -17,16 +17,22 @@ from typing import Any, Literal
 import pytest
 import structlog.testing
 from pydantic import BaseModel, ConfigDict, Field
+from cosmo_ai._internal.protocol import BackgroundClientTool, ClientTool
 from cosmo_ai import tool
 from cosmo_ai.tools._dispatch import _invoke_handler
-from cosmo_ai.errors import ToolInputValidationError
+from cosmo_ai.errors import (
+    RealtimeError,
+    ToolDefinitionErrorCode,
+    ToolInputValidationError,
+)
 from cosmo_ai._internal.hooks import HookEngine, PreToolUseResult, pre_tool_use
 from cosmo_ai.tools import (
-    BackgroundClientTool,
-    ClientTool,
     ClientToolJob,
-    ToolSchemaError,
+    ToolDefinitionError,
+    background_client_tool,
+    client_tool,
 )
+from cosmo_ai.tools._sdk_tools import SDK_TOOL_NAME_PREFIX
 
 from .fakes import run_awaitable
 
@@ -257,11 +263,16 @@ def test_invalid_args_raise_normalized_error_without_submitted_values() -> None:
     assert "kelvin-secret-value" not in message
     assert excinfo.value.__cause__ is None
     assert excinfo.value.__suppress_context__
-    assert {issue["type"] for issue in excinfo.value.issues} == {
+    assert {issue.code for issue in excinfo.value.issues} == {
         "missing",
         "literal_error",
     }
-    assert all("input" not in issue for issue in excinfo.value.issues)
+    # The submitted value never reaches the structured issues either — every
+    # field is schema-derived, so there is nowhere for it to ride along.
+    assert all(
+        "kelvin-secret-value" not in (issue.path + issue.code + issue.constraint)
+        for issue in excinfo.value.issues
+    )
 
 
 def test_nested_paths_are_dotted_and_indexed() -> None:
@@ -446,32 +457,67 @@ def test_rejects_var_args_and_unannotated_first_param() -> None:
 
 
 def test_rejects_bad_names_and_missing_description() -> None:
-    with pytest.raises(ValueError, match="tool name"):
+    # ToolDefinitionError is a ValueError, so asserting the base would pass
+    # whether or not the declaration paths are typed. Assert the code.
+    with pytest.raises(ToolDefinitionError, match="tool name") as bad_name:
 
         @tool(description="Camel case name.")
         async def getWeather(input: WeatherInput) -> dict[str, Any]:
             return {}
 
-    with pytest.raises(ValueError, match="no description"):
+    assert bad_name.value.code is ToolDefinitionErrorCode.INVALID_TOOL_NAME
+
+    with pytest.raises(ToolDefinitionError, match="no description") as no_desc:
 
         @tool
         async def no_docstring(input: WeatherInput) -> dict[str, Any]:
             return {}
 
+    assert no_desc.value.code is ToolDefinitionErrorCode.MISSING_DESCRIPTION
+
+
+@pytest.mark.parametrize("build", [client_tool, background_client_tool])
+def test_raw_builders_enforce_the_description_limit(build: Any) -> None:
+    # The decorator checked it; the raw builders fell through to a Pydantic
+    # ValidationError, so the advertised code never appeared on this path.
+    with pytest.raises(ToolDefinitionError) as caught:
+        build(
+            name="get_weather",
+            description="x" * 2049,
+            parameters={"type": "object"},
+            handler=lambda args: {},
+        )
+    assert caught.value.code is ToolDefinitionErrorCode.DESCRIPTION_TOO_LONG
+
+
+def test_reserved_prefix_name_is_a_tool_definition_error() -> None:
+    # The reserved-prefix guard sits beside the name-pattern one; both refuse a
+    # tool name, so both belong to the same error family.
+    with pytest.raises(ToolDefinitionError, match="reserved") as reserved:
+
+        @tool(name="cosmo_sdk_draw_box", description="Shadows an SDK tool.")
+        async def shadowing(input: WeatherInput) -> dict[str, Any]:
+            return {}
+
+    assert reserved.value.code is ToolDefinitionErrorCode.INVALID_TOOL_NAME
+    assert isinstance(reserved.value, RealtimeError)
+
 
 def test_rejects_overlong_description_with_actual_and_max() -> None:
-    with pytest.raises(ValueError, match=r"2049 characters.*2048"):
+    with pytest.raises(ToolDefinitionError, match=r"2049 characters.*2048") as long_desc:
 
         @tool(description="x" * 2049)
         async def long_description(input: WeatherInput) -> dict[str, Any]:
             return {}
+
+    assert long_desc.value.code is ToolDefinitionErrorCode.DESCRIPTION_TOO_LONG
 
 
 def test_rejects_lossy_schema_constructs_at_decoration() -> None:
     class PatternInput(BaseModel):
         sku: str = Field(pattern="^[A-Z]+$")
 
-    with pytest.raises(ToolSchemaError) as excinfo:
+    with pytest.raises(ToolDefinitionError) as excinfo:
 
         @tool(description="Pattern field.")
         async def pattern_tool(input: PatternInput) -> dict[str, Any]:
@@ -483,7 +529,7 @@ def test_rejects_lossy_schema_constructs_at_decoration() -> None:
         model_config = ConfigDict(extra="forbid")
         city: str
 
-    with pytest.raises(ToolSchemaError) as excinfo:
+    with pytest.raises(ToolDefinitionError) as excinfo:
 
         @tool(description="Strict model.")
         async def strict_tool(input: StrictInput) -> dict[str, Any]:
@@ -504,7 +550,7 @@ def test_rejects_recursive_model_at_decoration() -> None:
     class Node(BaseModel):
         children: list["Node"] = Field(default_factory=list)
 
-    with pytest.raises(ToolSchemaError) as excinfo:
+    with pytest.raises(ToolDefinitionError) as excinfo:
 
         @tool(description="Recursive model.")
         async def tree_tool(input: Node) -> dict[str, Any]:
@@ -539,3 +585,113 @@ def test_a_natural_name_outside_the_prefix_is_untouched() -> None:
         return {}
 
     assert mine.name == "draw_box"
+
+
+# ── client_tool(input=…) — the typed form without a decorator ─────────────
+#
+# ``@tool`` reads the model off a decorated function's annotation. The
+# constructor takes it by value, for the cases a decorator cannot reach: a
+# closure, a bound method, a tool built in a loop. Both paths run the same
+# emission and validation, so these pin that they agree.
+
+
+class _WeatherArgs(BaseModel):
+    city: str = Field(description="City to look up")
+    unit: Literal["c", "f"] = "c"
+
+
+def test_input_form_emits_the_same_schema_as_the_decorator() -> None:
+    async def fetch(args: _WeatherArgs) -> dict[str, Any]:
+        return {"city": args.city}
+
+    built = client_tool(
+        name="get_weather", description="Look it up", input=_WeatherArgs, handler=fetch
+    )
+
+    @tool(name="get_weather", description="Look it up")
+    async def decorated(input: _WeatherArgs) -> dict[str, Any]:
+        return {"city": input.city}
+
+    assert isinstance(built, ClientTool)
+    assert built.parameters == decorated.parameters
+
+
+def test_input_form_hands_the_handler_a_validated_model() -> None:
+    seen: list[_WeatherArgs] = []
+
+    async def fetch(args: _WeatherArgs) -> dict[str, Any]:
+        seen.append(args)
+        return {"ok": True}
+
+    spec = client_tool(
+        name="get_weather", description="Look it up", input=_WeatherArgs, handler=fetch
+    )
+    assert asyncio.run(spec.handler({"city": "Oslo"})) == {"ok": True}
+    # Defaults are filled by the same validation the decorator applies.
+    assert seen == [_WeatherArgs(city="Oslo", unit="c")]
+
+
+def test_input_form_rejects_a_malformed_call_before_the_handler_runs() -> None:
+    async def fetch(args: _WeatherArgs) -> dict[str, Any]:
+        raise AssertionError("handler must not run on invalid input")
+
+    spec = client_tool(
+        name="get_weather", description="Look it up", input=_WeatherArgs, handler=fetch
+    )
+    with pytest.raises(ToolInputValidationError, match="INVALID_INPUT"):
+        asyncio.run(spec.handler({}))
+
+
+def test_background_input_form_passes_the_job_through() -> None:
+    seen: list[tuple[str, bool]] = []
+
+    async def export(args: _WeatherArgs, job: object) -> None:
+        seen.append((args.city, job is not None))
+
+    spec = background_client_tool(
+        name="export_data", description="Export it", input=_WeatherArgs, handler=export
+    )
+    assert isinstance(spec, BackgroundClientTool)
+    asyncio.run(spec.handler({"city": "Oslo"}, object()))
+    assert seen == [("Oslo", True)]
+
+
+def test_input_form_runs_the_construction_time_checks() -> None:
+    async def fetch(args: _WeatherArgs) -> dict[str, Any]:
+        return {}
+
+    with pytest.raises(ValueError, match="must match"):
+        client_tool(name="Bad-Name", description="d", input=_WeatherArgs, handler=fetch)
+    with pytest.raises(ValueError, match="no description"):
+        client_tool(name="get_weather", description="", input=_WeatherArgs, handler=fetch)
+    with pytest.raises(ValueError, match="reserved"):
+        client_tool(
+            name=SDK_TOOL_NAME_PREFIX + "x", description="d",
+            input=_WeatherArgs, handler=fetch,
+        )
+
+
+def test_exactly_one_input_form_is_passed() -> None:
+    async def fetch(args: Any) -> dict[str, Any]:
+        return {}
+
+    schema = {"type": "object", "properties": {}}
+    with pytest.raises(TypeError, match="exactly one"):
+        client_tool(name="x_tool", description="d", handler=fetch)
+    with pytest.raises(TypeError, match="exactly one"):
+        client_tool(
+            name="x_tool", description="d",
+            input=_WeatherArgs, parameters=schema, handler=fetch,
+        )
+
+
+def test_input_rejects_a_non_model_and_says_where_to_go() -> None:
+    async def fetch(args: Any) -> dict[str, Any]:
+        return {}
+
+    with pytest.raises(TypeError, match="parameters="):
+        client_tool(name="x_tool", description="d", input=dict, handler=fetch)
+    # Bare ``BaseModel`` has no fields to emit; Pydantic's own error names an
+    # internal method, so the constructor catches it the way ``@tool`` does.
+    with pytest.raises(TypeError, match="not BaseModel itself"):
+        client_tool(name="x_tool", description="d", input=BaseModel, handler=fetch)

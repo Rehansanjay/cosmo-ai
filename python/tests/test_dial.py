@@ -10,8 +10,9 @@ from typing import Callable
 import httpx
 import pytest
 
+from cosmo_ai import DialErrorCode
 from cosmo_ai import RealtimeClient, DialError, DialResult
-from cosmo_ai._internal.protocol import SessionConfig
+from cosmo_ai._internal.protocol import _sdk_info, SessionConfig
 from cosmo_ai.session import RealtimeSession
 
 Handler = Callable[[httpx.Request], httpx.Response]
@@ -70,7 +71,8 @@ def test_post_dial_maps_server_slug_to_dial_error_code() -> None:
 
     with pytest.raises(DialError) as exc:
         asyncio.run(scenario())
-    assert exc.value.code == "phone_calls_disabled"
+    assert exc.value.code is DialErrorCode.REQUEST_REJECTED
+    assert exc.value.server_code == "phone_calls_disabled"
     assert "disabled" in exc.value.message
 
 
@@ -97,7 +99,8 @@ def test_post_dial_legacy_nested_detail_still_parses() -> None:
 
     with pytest.raises(DialError) as exc:
         asyncio.run(scenario())
-    assert exc.value.code == "phone_calls_disabled"
+    assert exc.value.code is DialErrorCode.REQUEST_REJECTED
+    assert exc.value.server_code == "phone_calls_disabled"
     assert "disabled" in exc.value.message
 
 
@@ -122,7 +125,8 @@ def test_post_dial_string_detail_surfaces_error_type_as_code() -> None:
 
     with pytest.raises(DialError) as exc:
         asyncio.run(scenario())
-    assert exc.value.code == "api_error"
+    assert exc.value.code is DialErrorCode.REQUEST_REJECTED
+    assert exc.value.server_code == "api_error"
     assert "scopes" in exc.value.message
 
 
@@ -135,13 +139,13 @@ def test_post_dial_maps_malformed_success_to_invalid_response() -> None:
 
     with pytest.raises(DialError) as exc:
         asyncio.run(scenario())
-    assert exc.value.code == "invalid_response"
+    assert exc.value.code is DialErrorCode.INVALID_RESPONSE
 
 
 def _started_session(post_dial) -> RealtimeSession:
     """A session past start() without joining LiveKit — enough to exercise
     dial(), which only needs the bound post_dial and the session id."""
-    session = RealtimeSession(config=SessionConfig(), post_dial=post_dial)
+    session = RealtimeSession(config=SessionConfig(sdk=_sdk_info()), post_dial=post_dial)
     session._response = SimpleNamespace(session_id="sess-42")  # type: ignore[assignment]
     return session
 
@@ -155,7 +159,7 @@ def test_dial_rejects_bad_number_before_any_request() -> None:
 
     with pytest.raises(DialError) as exc:
         asyncio.run(scenario())
-    assert exc.value.code == "invalid_phone_number"
+    assert exc.value.code is DialErrorCode.INVALID_REQUEST
 
 
 def test_dial_delegates_session_id_and_normalised_number() -> None:
@@ -234,4 +238,4 @@ def test_post_dial_transport_failure_maps_to_transport_error() -> None:
 
     with pytest.raises(DialError) as exc:
         asyncio.run(scenario())
-    assert exc.value.code == "transport_error"
+    assert exc.value.code is DialErrorCode.REQUEST_FAILED

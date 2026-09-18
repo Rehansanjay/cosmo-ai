@@ -13,7 +13,7 @@ from typing import Any
 
 import livekit.rtc as rtc
 import pytest
-from cosmo_ai.errors import NotConnectedError
+from cosmo_ai.errors import SessionStateError
 from cosmo_ai.session._livekit import LiveKitTransport
 
 _AGENT = rtc.ParticipantKind.PARTICIPANT_KIND_AGENT
@@ -120,7 +120,7 @@ def test_send_bytes_targets_every_agent_when_more_than_one_is_present() -> None:
 def test_send_bytes_rejects_and_opens_no_stream_when_no_agent_is_present() -> None:
     async def scenario() -> None:
         transport = _connected(_FakeParticipant("human-1", _HUMAN))
-        with pytest.raises(NotConnectedError, match="no agent participant"):
+        with pytest.raises(SessionStateError, match="no agent participant"):
             await transport.send_bytes(b"\x01", "screen_capture")
         assert transport._room.local_participant.calls == []
 
@@ -130,7 +130,7 @@ def test_send_bytes_rejects_and_opens_no_stream_when_no_agent_is_present() -> No
 def test_send_bytes_rejects_when_not_connected() -> None:
     async def scenario() -> None:
         transport = LiveKitTransport()
-        with pytest.raises(NotConnectedError):
+        with pytest.raises(SessionStateError):
             await transport.send_bytes(b"\x01", "screen_capture")
 
     asyncio.run(scenario())

@@ -21,10 +21,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import json
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, AsyncIterator, Awaitable, Callable, Coroutine, Optional
 
@@ -32,15 +33,26 @@ import structlog
 from pydantic import BaseModel, ValidationError
 
 from cosmo_ai._internal.logging import get_logger
+from cosmo_ai._internal.prepared_room import PreparedJoinTransport, PreparedRoom
 from cosmo_ai.tools._jobs import ClientToolJobSink
 from cosmo_ai.tools._dispatch import register_client_tool_handlers
 from cosmo_ai.tools._screen_capture import register_screen_locate
-from cosmo_ai._internal.transport import Transport, TransportCallbacks, TransportClose
+from cosmo_ai._internal.transport import (
+    MicSource,
+    StartedSession,
+    TransportName,
+    Transport,
+    TransportCallbacks,
+    TransportClose,
+)
 from cosmo_ai.audio import AgentAudioFrame, AudioLevels, MicrophoneCapture
 from cosmo_ai.errors import (
-    AudioPublishAlreadyActiveError,
+    DialErrorCode,
+    SessionStartErrorCode,
+    UsageErrorCode,
+    SessionStateErrorCode,
     DialError,
-    NotConnectedError,
+    SessionStateError,
     SessionStartError,
     UsageError,
 )
@@ -53,6 +65,7 @@ from cosmo_ai._internal.hooks import (
     SessionStartContext,
 )
 from cosmo_ai._internal.protocol import (
+    BackgroundClientTool,
     ClientTool,
     DialResult,
     SessionUsage,
@@ -64,6 +77,7 @@ from cosmo_ai._internal.protocol import (
     BotTtsStoppedEvent,
     ClientActivityEnd,
     ClientBindInput,
+    ClientConnectTimings,
     ClientContext,
     ClientEnd,
     ClientImage,
@@ -71,6 +85,9 @@ from cosmo_ai._internal.protocol import (
     ClientPing,
     CatalogAgentConfig,
     ClientText,
+    DelegationAppend,
+    DelegationChannel,
+    DelegationCreatedEvent,
     UserSpeechTimeoutEvent,
     ErrorEvent,
     ModelTextEvent,
@@ -81,20 +98,25 @@ from cosmo_ai._internal.protocol import (
     SessionConfig,
     SessionStateWriteEvent,
     UsageEvent,
+    SessionEndingSoonEvent,
     SessionEndedEvent,
     RealtimeSessionEvent,
-    SessionResponse,
     SessionStartTimings,
     ToolCallEvent,
     ToolDispatchStartedEvent,
     ToolInvocationEvent,
     ToolResultEvent,
     TranscriptDeltaEvent,
+    TranscriptItem,
+    TranscriptRole,
+    TranscriptUpdatedEvent,
     TurnCompleteEvent,
     UserStartedSpeakingEvent,
     UserStoppedSpeakingEvent,
     UnknownEvent,
+    ScreenLocateTool,
 )
+from cosmo_ai.session._transcript import TranscriptStore
 
 logger: structlog.stdlib.BoundLogger = get_logger(__name__)
 
@@ -103,20 +125,31 @@ class SessionStateKind(str, Enum):
     """Transport-level lifecycle of the session."""
 
     IDLE = "idle"
+    """Built but not started."""
     CONNECTING = "connecting"
+    """Start is in flight; nothing can be sent yet."""
     CONNECTED = "connected"
+    """Live — sends work and events are flowing."""
     RECONNECTING = "reconnecting"
+    """The transport is re-establishing. The session survives it; sends may
+    fail until it lands."""
     DISCONNECTED = "disconnected"
+    """Terminal. ``disconnect_reason`` says why, and the event stream has
+    finished."""
 
 
 @dataclass(frozen=True)
-class RealtimeSessionState:
+class SessionState:
     """Snapshot of the session lifecycle; ``disconnect_reason`` is populated
     on ``DISCONNECTED`` transitions."""
 
     kind: SessionStateKind
+    """Where the session is in its transport lifecycle."""
     disconnect_reason: DisconnectReason | None = None
+    """Why it disconnected. Set only on ``DISCONNECTED``; ``None`` at every
+    other point."""
     detail: str | None = None
+    """Extra context on the disconnect, when there is any."""
 
 
 @dataclass(frozen=True)
@@ -125,21 +158,32 @@ class SessionConnectTimings:
     session's start plus the server's own breakdown from the start response.
 
     ``ws_ms`` is the REST session-start round trip, ``room_ms`` the LiveKit
-    join, ``total_ms`` the whole start. ``mic_ms`` is ``None`` here — this SDK
-    publishes audio through an explicit call rather than during the join, so
-    there is no mic phase to measure. Every field is ``None`` before the
-    corresponding phase completes; ``server_timings`` is ``None`` on a backend
-    that doesn't report it.
+    join, ``total_ms`` the whole start. ``ready_ms`` runs from the same
+    origin as ``ws_ms`` to the ``ready`` event. ``mic_ms`` is ``None``
+    here — this SDK publishes audio through an explicit call rather than
+    during the join, so there is no mic phase to measure. Every field is
+    ``None`` before the corresponding phase completes; ``server_timings`` is
+    ``None`` on a backend that doesn't report it.
     """
 
     ws_ms: float | None = None
+    """The REST session-start round trip."""
     room_ms: float | None = None
+    """Joining the media room."""
     mic_ms: float | None = None
+    """Always ``None`` here — this SDK publishes audio through an explicit
+    call rather than during the join, so there is no mic phase to measure."""
     total_ms: float | None = None
+    """The whole start, from the call to a live session."""
     server_timings: SessionStartTimings | None = None
+    """The server's own phase breakdown, so both halves of the connect land
+    on one record. ``None`` on a backend that does not report it."""
+    ready_ms: float | None = None
+    """From the same origin as ``ws_ms`` to the ``ready`` event — what the
+    user actually waited."""
 
 
-OnStateChange = Callable[[RealtimeSessionState], None]
+OnStateChange = Callable[[SessionState], None]
 PostDial = Callable[[str, str, Optional[str]], Awaitable[DialResult]]
 """Bound ``RealtimeClient._post_dial`` — ``(session_id, phone_number,
 caller_number) -> DialResult`` — injected so a session can place a dial
@@ -157,39 +201,49 @@ def _validate_e164(phone_number: str) -> str:
     digits = v[1:]
     if not v.startswith("+") or not digits.isdigit() or not (8 <= len(digits) <= 15):
         raise DialError(
-            code="invalid_phone_number",
+            code=DialErrorCode.INVALID_REQUEST,
             message="phone_number must be E.164, e.g. +14155550199",
         )
     return v
 
 
-_SERVER_EVENT_MODELS: tuple[type[BaseModel], ...] = (
-    ReadyEvent,
-    TranscriptDeltaEvent,
-    ModelTextEvent,
-    TurnCompleteEvent,
-    UserStartedSpeakingEvent,
-    UserStoppedSpeakingEvent,
-    BotStartedSpeakingEvent,
-    BotStoppedSpeakingEvent,
-    BotLlmStartedEvent,
-    BotLlmStoppedEvent,
-    BotTtsStartedEvent,
-    BotTtsStoppedEvent,
-    ToolCallEvent,
-    ToolDispatchStartedEvent,
-    ToolResultEvent,
-    ToolInvocationEvent,
-    ReconnectingEvent,
-    ErrorEvent,
-    PongEvent,
-    SessionStateWriteEvent,
-    UsageEvent,
-    UserSpeechTimeoutEvent,
-)
+def _elapsed_ms(started_at: float, mark: float | None) -> float | None:
+    return None if mark is None else (mark - started_at) * 1000
+
+
+def _round_ms(value: float | None) -> int | None:
+    return None if value is None else round(value)
+
 
 _SERVER_EVENT_BY_TYPE: dict[str, type[BaseModel]] = {
-    str(cls.model_fields["type"].default): cls for cls in _SERVER_EVENT_MODELS
+    "ready": ReadyEvent,
+    "transcript": TranscriptDeltaEvent,
+    "model-text": ModelTextEvent,
+    "turn-complete": TurnCompleteEvent,
+    "user-started-speaking": UserStartedSpeakingEvent,
+    "user-stopped-speaking": UserStoppedSpeakingEvent,
+    "bot-started-speaking": BotStartedSpeakingEvent,
+    "bot-stopped-speaking": BotStoppedSpeakingEvent,
+    "bot-llm-started": BotLlmStartedEvent,
+    "bot-llm-stopped": BotLlmStoppedEvent,
+    "bot-tts-started": BotTtsStartedEvent,
+    "bot-tts-stopped": BotTtsStoppedEvent,
+    "tool-call": ToolCallEvent,
+    "tool-dispatch-started": ToolDispatchStartedEvent,
+    "tool-result": ToolResultEvent,
+    "tool-invocation": ToolInvocationEvent,
+    "reconnecting": ReconnectingEvent,
+    "session-ending-soon": SessionEndingSoonEvent,
+    "error": ErrorEvent,
+    "pong": PongEvent,
+    "cosmo.session-state": SessionStateWriteEvent,
+    "cosmo.usage": UsageEvent,
+    "user-speech-timeout": UserSpeechTimeoutEvent,
+    "delegation-created": DelegationCreatedEvent,
+}
+
+_EVENT_WIRE_TYPE: dict[type[BaseModel], str] = {
+    cls: wire for wire, cls in _SERVER_EVENT_BY_TYPE.items()
 }
 
 
@@ -214,6 +268,11 @@ _STREAM_END = _StreamEnd()
 # data is dropped whole. All ceilings sit far above any legitimate session's
 # needs (the server chunks at ~8 KB raw per packet).
 _MAX_QUEUED_EVENTS = 1024
+# How long an abandoned prepared join is allowed to finish before it is
+# cancelled outright. livekit's ``Room.connect`` subscribes to its event
+# queue before a room handle exists, so a cancelled connect strands that
+# subscriber; letting the join land and disconnecting the room is clean.
+_ABANDONED_JOIN_DRAIN_S = 15.0
 _MAX_INFLIGHT_ENVELOPES = 64
 _MAX_ENVELOPE_CHUNKS = 1024
 _MAX_ENVELOPE_TOTAL_CHARS = 4 * 1024 * 1024
@@ -221,6 +280,13 @@ _MAX_ENVELOPE_TOTAL_CHARS = 4 * 1024 * 1024
 # ``session-ended`` is normally followed by the room closing; if that close
 # never arrives, finish after this grace so iteration doesn't hang forever.
 _SESSION_ENDED_GRACE_SECONDS = 5.0
+
+# Bound on the wait between the transport joining and the server's ``ready``
+# handshake. Deliberately longer than the server's own 30s boot deadline
+# (which fails a stuck boot as an ``error`` frame + room close), so a failed
+# boot arrives as that informative close rather than this blind timeout;
+# only genuine infra loss lands here.
+_READY_TIMEOUT_S = 40.0
 
 _LEVELS_INTERVAL_SECONDS = 0.05
 # ``agent`` reads 0.0 when no frame arrived within this window: a track using
@@ -242,8 +308,10 @@ class RealtimeSession:
         get_usage: GetUsage | None = None,
         on_close: Callable[[], Awaitable[None]] | None = None,
         hooks: HookEngine | None = None,
+        transport: TransportName = "webrtc",
     ) -> None:
         self._config = config
+        self._transport_kind = transport
         self._on_state_change = on_state_change
         self._post_dial = post_dial
         self._get_usage = get_usage
@@ -251,11 +319,25 @@ class RealtimeSession:
         self._hooks = hooks
         self._session_end_fired = False
         self._server_end_reason: str | None = None
-        self._state = RealtimeSessionState(kind=SessionStateKind.IDLE)
+        self._state = SessionState(kind=SessionStateKind.IDLE)
         self._transport: Transport | None = None
         self._job_sink: ClientToolJobSink | None = None
-        self._response: SessionResponse | None = None
+        self._response: StartedSession | None = None
         self._connect_timings = SessionConnectTimings()
+        self._connect_started_at: float | None = None
+        self._ready_at: float | None = None
+        # Wakes the start's ready wait: set by ``ready`` (either delivery)
+        # and by any terminal transition, so a pre-ready close settles the
+        # wait instead of leaving it to the timeout.
+        self._ready_settled = asyncio.Event()
+        # Pre-ready ``error`` frame, stashed as enrichment: a failed boot
+        # closes the room, and this upgrades that close's raise with the
+        # server's own code and message.
+        self._pending_handshake_error: tuple[str, str] | None = None
+        #: The transport's record of a room lost while the join was still in
+        #: flight — a close with no room to report against.
+        self._connect_lost: TransportClose | None = None
+        self._connect_timings_sent = False
         self._queue: asyncio.Queue[RealtimeSessionEvent | _StreamEnd] = asyncio.Queue(
             maxsize=_MAX_QUEUED_EVENTS
         )
@@ -265,7 +347,7 @@ class RealtimeSession:
         self._envelope_buffers: dict[str, dict[int, str]] = {}
         self._envelope_totals: dict[str, int] = {}
         self._envelope_chars: dict[str, int] = {}
-        self._mic: Any = None  # _mic.MicAudioSource | None
+        self._mic: MicSource | None = None
         self._mic_pub: Any = None  # opaque track publication | None
         # True once this client has published audio and bound the agent's
         # input; drives a re-bind on reconnect so the binding survives a drop.
@@ -280,15 +362,29 @@ class RealtimeSession:
         self._speaker: Any = None  # _speaker.SpeakerSink | None
         self._speaker_volume = 1.0
         self._audio_stream: Any = None  # the one caller-owned voice publish
+        # Coalesced conversation state, folded from the transcript and
+        # turn-complete streams. Survives teardown so ``transcript`` stays
+        # readable after the session ends.
+        self._transcript = TranscriptStore()
 
     # ── Public surface ─────────────────────────────────────────────
 
     @property
-    def state(self) -> RealtimeSessionState:
+    def state(self) -> SessionState:
+        """Where the session is in its transport lifecycle right now, and why
+        it left — read it after the stream ends to tell a clean end from a
+        transport failure. A snapshot, not a live view: read it again rather
+        than holding on to one."""
         return self._state
 
     @property
     def session_id(self) -> str:
+        """Server-assigned id for this session — the handle
+        :meth:`RealtimeClient.get_session_usage` and the recording surfaces
+        take, and the one worth logging to correlate with server-side records.
+
+        Raises :class:`SessionStateError` before the session has started, so
+        it is readable from the moment ``start`` returns."""
         return self._started().session_id
 
     @property
@@ -300,9 +396,18 @@ class RealtimeSession:
         """
         return self._connect_timings
 
-    def _started(self) -> SessionResponse:
+    @property
+    def transcript(self) -> tuple[TranscriptItem, ...]:
+        """The coalesced conversation so far — one item per turn, folded by
+        the session from its own transcript stream. A
+        :class:`TranscriptUpdatedEvent` is yielded with the new value on
+        every change. Survives :meth:`end`, so the full conversation stays
+        readable after the session ends."""
+        return self._transcript.current
+
+    def _started(self) -> StartedSession:
         if self._response is None:
-            raise NotConnectedError("Session start did not complete.")
+            raise SessionStateError(code=SessionStateErrorCode.NOT_CONNECTED, message="Session start did not complete.")
         return self._response
 
     def __aiter__(self) -> "RealtimeSession":
@@ -317,14 +422,31 @@ class RealtimeSession:
             raise StopAsyncIteration
         return item
 
-    async def send_text(self, content: str) -> None:
+    async def send_text(self, content: str, *, transcript: bool = True) -> None:
         """Send a text message instead of audio.
 
         The agent replies in whatever modality the session runs in. Configure
         the agent with ``audio=AudioConfig(output=False)`` for a text-only
         session.
+
+        The sent text lands in the session transcript as its own closed
+        user turn (the server does not echo typed input back); an
+        in-progress speech transcription is untouched. Pass
+        ``transcript=False`` to keep it out.
         """
         await self._publish(ClientText(content=content))
+        if transcript:
+            # The echo is a complete turn of its own — appended directly,
+            # never folded through the wire-final path, which would replace
+            # an in-progress speech bubble.
+            changed = self._transcript.append_closed(TranscriptRole.USER, content)
+            self._enqueue(
+                TranscriptDeltaEvent(
+                    role=TranscriptRole.USER, text=content, is_final=True
+                )
+            )
+            if changed:
+                self._enqueue(TranscriptUpdatedEvent(items=self._transcript.current))
 
     async def send_context(self, content: str) -> None:
         """Give the agent context without asking it anything.
@@ -335,6 +457,52 @@ class RealtimeSession:
         state; :meth:`send_text` is the opposite, it asks.
         """
         await self._publish(ClientContext(content=content))
+
+    async def append_thinking(
+        self, content: str, *, delegation_id: str | None = None
+    ) -> None:
+        """Give the voice model background it keeps to itself and draws on
+        when relevant. ``delegation_id`` names the
+        :class:`DelegationCreatedEvent` this answers; ``None`` steers the
+        session as a whole.
+        """
+        await self._publish(
+            DelegationAppend(
+                channel=DelegationChannel.THINKING,
+                content=content,
+                delegation_id=delegation_id,
+            )
+        )
+
+    async def append_commentary(
+        self, content: str, *, delegation_id: str | None = None
+    ) -> None:
+        """Give the voice model something to say now, in its own words.
+        ``delegation_id`` names the :class:`DelegationCreatedEvent` this
+        answers; ``None`` steers the session as a whole.
+        """
+        await self._publish(
+            DelegationAppend(
+                channel=DelegationChannel.COMMENTARY,
+                content=content,
+                delegation_id=delegation_id,
+            )
+        )
+
+    async def append_instructions(
+        self, content: str, *, delegation_id: str | None = None
+    ) -> None:
+        """Change how the voice model behaves from here on. ``delegation_id``
+        names the :class:`DelegationCreatedEvent` this answers; ``None``
+        steers the session as a whole.
+        """
+        await self._publish(
+            DelegationAppend(
+                channel=DelegationChannel.INSTRUCTIONS,
+                content=content,
+                delegation_id=delegation_id,
+            )
+        )
 
     async def set_muted(self, muted: bool) -> None:
         """Toggle the server-side mic gate."""
@@ -356,7 +524,13 @@ class RealtimeSession:
         mime_type: str = "image/jpeg",
         stream_id: str = "video.input.default",
     ) -> None:
-        """Send one base64-encoded image frame to the agent."""
+        """Send one base64-encoded image frame to the agent.
+
+        :param data: The image bytes, base64-encoded.
+        :param mime_type: Media type of those bytes, e.g. ``image/jpeg``.
+        :param stream_id: Labels the stream this frame belongs to, so several
+            concurrent video sources stay distinguishable.
+        """
         await self._publish(
             ClientImage(data=data, mime_type=mime_type, stream_id=stream_id)
         )
@@ -384,7 +558,7 @@ class RealtimeSession:
         Raises :class:`DialError` for a malformed number (validated
         locally, before any request) or a server rejection (phone calls
         disabled, over the minute limit, an unavailable caller-ID, an ended
-        session, …), and :class:`NotConnectedError` if the session never
+        session, …), and :class:`SessionStateError` if the session never
         started.
         """
         validated = _validate_e164(phone_number)
@@ -393,7 +567,7 @@ class RealtimeSession:
         )
         if self._post_dial is None:
             raise DialError(
-                code="not_dialable",
+                code=DialErrorCode.INVALID_REQUEST,
                 message="This session was not constructed with dial support.",
             )
         return await self._post_dial(self.session_id, validated, validated_caller)
@@ -408,13 +582,13 @@ class RealtimeSession:
         ``usage_status`` on the result reports whether it is present yet.
 
         Raises :class:`UsageError` on a server rejection or transport
-        failure, and :class:`NotConnectedError` if the session never
+        failure, and :class:`SessionStateError` if the session never
         started.
         """
         session_id = self.session_id
         if self._get_usage is None:
             raise UsageError(
-                code="not_supported",
+                code=UsageErrorCode.INVALID_REQUEST,
                 message="This session was not constructed with usage support.",
             )
         return await self._get_usage(session_id)
@@ -432,7 +606,7 @@ class RealtimeSession:
         if self._transport is not None and self._transport.is_connected():
             try:
                 await self._publish(ClientEnd())
-            except NotConnectedError:
+            except SessionStateError:
                 pass
             except Exception:
                 logger.exception("realtime.end_send_failed", stack_info=True)
@@ -464,19 +638,20 @@ class RealtimeSession:
         For non-mic audio (synthetic, WAV replay) use
         :meth:`start_audio_stream`."""
         if enabled:
-            self._require_transport()
+            transport = self._require_transport()
             if self._mic is None:
-                from cosmo_ai.audio import _mic
-
                 if self._audio_stream is not None:
-                    raise AudioPublishAlreadyActiveError(
-                        "an audio stream is publishing — a session carries one "
-                        "voice; call stop_audio_stream() before the microphone"
+                    raise SessionStateError(
+                        code=SessionStateErrorCode.AUDIO_PUBLISH_ALREADY_ACTIVE,
+                        message="an audio stream is publishing — a session carries one "
+                        "voice; call stop_audio_stream() before the microphone",
                     )
-                mic = _mic.MicAudioSource(capture)
+                # How the microphone is opened is the transport's business:
+                # WebRTC's device module on one lane, PortAudio on the other.
+                mic = transport.create_mic_source(capture)
                 await mic.start()  # opens the device before anything is published
                 try:
-                    pub = await self._publish_audio(mic.livekit_source)
+                    pub = await self._publish_audio(mic.audio_source)
                 except BaseException:
                     await mic.stop()
                     raise
@@ -498,27 +673,32 @@ class RealtimeSession:
     async def start_audio_stream(
         self, source: Any, *, track_name: str = "mic"
     ) -> None:
-        """Take the session's voice with a caller-owned ``rtc.AudioSource``.
+        """Take the session's voice with a caller-owned audio source.
 
         For audio the SDK cannot capture itself: a synthetic generator, WAV
         replay, a load generator, or any pipeline running where there is no
         input device. You own the source and keep it fed through
-        ``source.capture_frame(...)``. For the OS microphone use
-        :meth:`set_microphone_enabled`.
+        ``source.capture_frame(...)``. A :class:`~cosmo_ai.PcmAudioSource`
+        publishes on either transport; a raw ``rtc.AudioSource`` works only
+        on the WebRTC transport — the websocket transport rejects it, since
+        it exposes no samples to read onto the socket. For the OS microphone
+        use :meth:`set_microphone_enabled`.
 
         A session carries one voice, so this raises
-        :class:`~cosmo_ai.errors.AudioPublishAlreadyActiveError` while the
+        :class:`~cosmo_ai.errors.SessionStateError` while the
         microphone or another stream holds it."""
         self._require_transport()
         if self._mic is not None:
-            raise AudioPublishAlreadyActiveError(
-                "the microphone is publishing — a session carries one voice; "
-                "call set_microphone_enabled(False) before starting a stream"
+            raise SessionStateError(
+                code=SessionStateErrorCode.AUDIO_PUBLISH_ALREADY_ACTIVE,
+                message="the microphone is publishing — a session carries one voice; "
+                "call set_microphone_enabled(False) before starting a stream",
             )
         if self._audio_stream is not None:
-            raise AudioPublishAlreadyActiveError(
-                "an audio stream is already publishing — a session carries one "
-                "voice; call stop_audio_stream() before starting another"
+            raise SessionStateError(
+                code=SessionStateErrorCode.AUDIO_PUBLISH_ALREADY_ACTIVE,
+                message="an audio stream is already publishing — a session carries one "
+                "voice; call stop_audio_stream() before starting another",
             )
         self._audio_stream = await self._publish_audio(source, track_name=track_name)
 
@@ -662,12 +842,16 @@ class RealtimeSession:
     ) -> None:
         """Create the screen-share track; the publish is deferred to the first
         :meth:`push_screen_share_frame` so frame dimensions can be resolved from
-        the source. Idempotent (restarts an active share)."""
+        the source. Idempotent (restarts an active share). WebRTC-transport
+        only: on the websocket transport every video and screen-share call
+        raises :class:`~cosmo_ai.errors.SessionStartError` with code
+        ``video_unsupported``."""
         await self._require_transport().start_screen_share(width=width, height=height)
 
     async def push_screen_share_frame(self, frame: Any) -> None:
         """Push one captured ``rtc.VideoFrame`` into the active share. No-op
-        without :meth:`start_screen_share`."""
+        without :meth:`start_screen_share`; refuses like it on the websocket
+        transport."""
         transport = self._transport
         if transport is not None:
             transport.push_screen_share_frame(frame)
@@ -695,9 +879,13 @@ class RealtimeSession:
         ``rtc.VideoFrame`` works, and nothing here opens a device.
 
         One video publish at a time — raises
-        :class:`~cosmo_ai.errors.VideoPublishAlreadyActiveError` while a stream
+        :class:`~cosmo_ai.errors.SessionStateError` while a stream
         or a screen share is live. The publish is deferred to the first frame,
-        so dimensions resolve from the source.
+        so dimensions resolve from the source. Refuses like
+        :meth:`start_screen_share` on the websocket transport.
+
+        :param width: Frame width in pixels the track advertises.
+        :param height: Frame height in pixels the track advertises.
         """
         transport = self._require_transport()
         stream_id = await transport.add_video_stream(width=width, height=height)
@@ -715,8 +903,11 @@ class RealtimeSession:
     async def _start(
         self,
         start_remote: Callable[
-            [SessionConfig], Awaitable[SessionResponse]
+            [SessionConfig], Awaitable[StartedSession]
         ],
+        prepared: PreparedRoom | None = None,
+        start_prepared: Callable[[SessionConfig], Awaitable[StartedSession]] | None = None,
+        started_at: float | None = None,
     ) -> "RealtimeSession":
         self._set_state(SessionStateKind.CONNECTING)
         try:
@@ -725,9 +916,133 @@ class RealtimeSession:
             logger.exception("realtime.session_start_hook_failed", stack_info=True)
             await self._abort_start(DisconnectReason.HANDSHAKE_FAILED, str(exc))
             raise SessionStartError(
-                code="session_start_hook_failed", message=str(exc)
+                code=SessionStartErrorCode.CONFIG, message=str(exc)
             ) from exc
-        started_at = time.perf_counter()
+        # A background client tool acks and keeps working on its own task, so
+        # the websocket lane cannot stop it: the server refuses the deferred
+        # reply while the work runs on regardless. Refusing here means the
+        # handler never starts, rather than half-running and reporting failure.
+        if self._transport_kind == "websocket":
+            deferred = [
+                tool.name
+                for tool in self._client_tools()
+                if isinstance(tool, BackgroundClientTool)
+            ]
+            if deferred:
+                message = (
+                    "background client tools are not supported on the websocket "
+                    f"transport: {', '.join(sorted(deferred))}"
+                )
+                await self._abort_start(DisconnectReason.HANDSHAKE_FAILED, message)
+                raise SessionStartError(
+                    code=SessionStartErrorCode.CONFIG,
+                    message=message,
+                    server_code="background_tools_unsupported",
+                )
+            # The locator's capture payload travels as a byte stream, a
+            # channel the single-socket carrier does not have — refusing here
+            # means the capture handler never runs.
+            if any(
+                isinstance(tool, ScreenLocateTool)
+                for tool in (self._config.agent.tools or ())
+            ):
+                message = "screen_locate is not supported on the websocket transport"
+                await self._abort_start(DisconnectReason.HANDSHAKE_FAILED, message)
+                raise SessionStartError(
+                    code=SessionStartErrorCode.CONFIG,
+                    message=message,
+                    server_code="screen_locate_unsupported",
+                )
+        # ``started_at`` is when the caller began waiting; a prepared start
+        # passes the instant before it awaited its reservation, so the total
+        # covers that wait too.
+        if started_at is None:
+            started_at = time.perf_counter()
+        self._connect_started_at = started_at
+        if prepared is not None and start_prepared is not None:
+            legs = await self._start_prepared(start_remote, start_prepared, prepared)
+        else:
+            legs = await self._start_serial(start_remote)
+        response, ws_done_at, room_started_at, room_done_at = legs
+        self._response = response
+        # On the prepared path the two legs overlap, so they no longer sum to
+        # ``total_ms``: each still measures its own leg, and the total is the
+        # window a caller waits through.
+        self._connect_timings = SessionConnectTimings(
+            ws_ms=(ws_done_at - started_at) * 1000,
+            room_ms=(room_done_at - room_started_at) * 1000,
+            total_ms=(max(ws_done_at, room_done_at) - started_at) * 1000,
+            server_timings=response.timings,
+        )
+        self._fold_connect_marks()
+        self._set_state(SessionStateKind.CONNECTED)
+        logger.info(
+            "realtime.session_started",
+            session_id=response.session_id,
+            room_name=response.room_name,
+        )
+        timings = self._connect_timings
+        logger.debug(
+            "realtime.connect_timings",
+            session_id=response.session_id,
+            ws_ms=round(timings.ws_ms or 0.0, 1),
+            room_ms=round(timings.room_ms or 0.0, 1),
+            total_ms=round(timings.total_ms or 0.0, 1),
+            server_ms=response.timings.total_ms if response.timings else None,
+        )
+        await self._wait_until_ready()
+        return self
+
+    async def _wait_until_ready(self) -> None:
+        """Hold the start until the ready handshake lands, so a returned
+        session is usable — the window contract's four exits: the sign or
+        frame resolves it; a pre-ready close raises
+        :class:`SessionStartError` coded ``HANDSHAKE_FAILED`` (any stashed
+        pre-ready ``error`` frame supplies the server code and message);
+        silence past the bound raises it coded ``READY_TIMEOUT``;
+        cancellation tears down and re-raises."""
+        if self._ready_at is not None:
+            return
+        try:
+            await asyncio.wait_for(self._ready_settled.wait(), _READY_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            await self._finish(
+                reason=DisconnectReason.HANDSHAKE_FAILED,
+                detail="ready timeout",
+            )
+            raise SessionStartError(
+                code=SessionStartErrorCode.READY_TIMEOUT,
+                message=(
+                    "the server's ready handshake did not arrive within "
+                    f"{int(_READY_TIMEOUT_S)}s"
+                ),
+            ) from None
+        except asyncio.CancelledError:
+            # Cancellation-safe: the caller's task cancel must not leak a
+            # live room, a captured mic, or a held session slot.
+            await asyncio.shield(
+                self._finish(
+                    reason=DisconnectReason.CLIENT_CLOSED,
+                    detail="start cancelled",
+                )
+            )
+            raise
+        if self._ready_at is not None:
+            return
+        raise self._handshake_failure() or SessionStartError(
+            code=SessionStartErrorCode.HANDSHAKE_FAILED,
+            message="the session ended before ready",
+        )
+
+    async def _start_serial(
+        self,
+        start_remote: Callable[[SessionConfig], Awaitable[StartedSession]],
+    ) -> tuple[StartedSession, float, float, float]:
+        """Start, then join the room the start answered.
+
+        Returns the response and the three instants the phases are read off:
+        the start's completion, and the join's start and completion.
+        """
         try:
             response = await start_remote(self._config)
         except asyncio.CancelledError:
@@ -746,23 +1061,289 @@ class RealtimeSession:
             await self._abort_start(DisconnectReason.TRANSPORT_ERROR, None)
             raise
         except Exception as exc:
-            await self._abort_start(DisconnectReason.TRANSPORT_ERROR, str(exc))
-            raise SessionStartError(code="room_join_failed", message=str(exc)) from exc
-        connected_at = time.perf_counter()
+            # The room can die before the join resolves — a boot that failed
+            # fast, deleting the room mid-negotiation. The join then fails on
+            # its own, but the session-ending evidence (the server's pre-ready
+            # error frame, or a close seen mid-connect) is what the caller
+            # needs: raise the window's typed close exit, not the raw
+            # transport error.
+            handshake = self._handshake_failure()
+            await self._abort_start(
+                DisconnectReason.HANDSHAKE_FAILED
+                if handshake is not None
+                else DisconnectReason.TRANSPORT_ERROR,
+                str(handshake or exc),
+            )
+            if handshake is not None:
+                raise handshake from exc
+            raise SessionStartError(code=SessionStartErrorCode.JOIN_FAILED, message=str(exc)) from exc
+        return response, ws_done_at, ws_done_at, time.perf_counter()
+
+    def _handshake_failure(self) -> SessionStartError | None:
+        """The window's close exit as a typed error, when the evidence for
+        one exists: the server's stashed pre-ready ``error`` frame
+        (enrichment), or a session already terminal before ``ready``.
+        ``None`` when neither — an ordinary transport failure with nothing
+        to enrich."""
+        if self._ready_at is not None:
+            return None
+        stashed = self._pending_handshake_error
+        if stashed is not None:
+            code, message = stashed
+            # The pre-close ``error`` frame's own slug: the server's word for
+            # why the boot failed, an open set, so it rides on ``server_code``
+            # while the closed code stays what happened — a failed handshake.
+            return SessionStartError(
+                code=SessionStartErrorCode.HANDSHAKE_FAILED,
+                message=message,
+                server_code=code,
+            )
+        if not self._terminal:
+            # A room deleted while the join was still negotiating never
+            # reaches ``on_closed`` — the transport has no room to report
+            # against yet — so it latches the reason instead. That latch is
+            # the same evidence, arriving by the only route it can.
+            lost = self._connect_lost or getattr(self._transport, "_connect_lost", None)
+            if lost is None:
+                return None
+            return SessionStartError(
+                code=SessionStartErrorCode.HANDSHAKE_FAILED,
+                message=(
+                    f"the session ended before ready: {lost.detail}"
+                    if lost.detail
+                    else "the session ended before ready"
+                ),
+            )
+        detail = self._state.detail
+        return SessionStartError(
+            code=SessionStartErrorCode.HANDSHAKE_FAILED,
+            message=(
+                f"the session ended before ready: {detail}"
+                if detail
+                else "the session ended before ready"
+            ),
+        )
+
+    async def _start_prepared(
+        self,
+        start_remote: Callable[[SessionConfig], Awaitable[StartedSession]],
+        start_prepared: Callable[[SessionConfig], Awaitable[StartedSession]],
+        prepared: PreparedRoom,
+    ) -> tuple[StartedSession, float, float, float]:
+        """Join the prepared room while the start runs concurrently.
+
+        The start is awaited first: it alone can reveal that the backend
+        dispatched onto a different room, and waiting on the join before
+        checking would pay a doomed join in full. Every prepared-specific
+        failure degrades to the serialized shape on the response's own
+        credentials — a parked room is an accelerator, never a new way for
+        a start to fail. That includes a rejected start itself: the ref may
+        be what the server refused (an identity change since prepare), so a
+        rejection is retried once without it before it counts.
+        """
+        room_started_at = time.perf_counter()
+        join_done_at: list[float] = []
+
+        async def _join_and_stamp() -> None:
+            await self._connect_transport_prepared(prepared)
+            join_done_at.append(time.perf_counter())
+
+        join_task = asyncio.create_task(_join_and_stamp())
+        start_task: asyncio.Future[StartedSession] = asyncio.ensure_future(
+            start_prepared(self._config)
+        )
+        try:
+            response = await start_task
+        except asyncio.CancelledError:
+            await self._abandon_prepared_join(join_task)
+            await self._abort_start(DisconnectReason.CLIENT_CLOSED, "start cancelled")
+            raise
+        except SessionStartError as exc:
+            await self._abandon_prepared_join(join_task)
+            # Only a 403 is the server refusing the ref itself (the grant no
+            # longer matches this identity). Anything else — a transport
+            # error, an unreadable response, a gateway 5xx — may have opened
+            # a session already, and a start is not idempotent. A version
+            # mismatch is never retried whatever status carries it: an
+            # unprepared start would be refused for the same reason.
+            if (
+                exc.status != 403
+                or exc.code is SessionStartErrorCode.VERSION_MISMATCH
+            ):
+                await self._abort_start(DisconnectReason.HANDSHAKE_FAILED, str(exc))
+                raise
+            logger.warning(
+                "realtime.prepared_start_rejected_retrying_unprepared",
+                code=exc.code,
+            )
+            return await self._start_serial(start_remote)
+        except BaseException as exc:
+            # Broader than the serialized path's ``SessionStartError``: a
+            # failing start leaves a join in flight, and anything that gets
+            # out without tearing it down leaks a live room.
+            await self._abandon_prepared_join(join_task)
+            await self._abort_start(DisconnectReason.HANDSHAKE_FAILED, str(exc))
+            raise
+        ws_done_at = time.perf_counter()
+        # Published the instant it lands: the prepared transport's tool
+        # handlers are already live, and they resolve the session id from it.
         self._response = response
-        self._connect_timings = SessionConnectTimings(
-            ws_ms=(ws_done_at - started_at) * 1000,
-            room_ms=(connected_at - ws_done_at) * 1000,
-            total_ms=(connected_at - started_at) * 1000,
-            server_timings=response.timings,
+        if self._terminal:
+            # The prepared room closed under us while the start was in flight;
+            # the close already did the bookkeeping, so only the outcome is
+            # left to report. Joining a fresh room now would outlive the
+            # session it belongs to.
+            await self._abandon_prepared_join(join_task)
+            raise self._handshake_failure() or SessionStartError(
+                code=SessionStartErrorCode.HANDSHAKE_FAILED,
+                message="prepared room closed before the start completed",
+            )
+        if response.room_name != prepared.room_name:
+            # The backend declined the parked room (consumed, lapsed, or
+            # policy) and dispatched a fresh one; its response is the truth.
+            logger.warning(
+                "realtime.prepared_room_not_honored",
+                prepared_room=prepared.room_name,
+                dispatched_room=response.room_name,
+            )
+            await self._abandon_prepared_join(join_task)
+            return await self._join_dispatched_room(response, ws_done_at)
+        try:
+            await join_task
+        except asyncio.CancelledError:
+            await self._abort_start(DisconnectReason.CLIENT_CLOSED, "start cancelled")
+            raise
+        except ImportError:
+            await self._abort_start(DisconnectReason.TRANSPORT_ERROR, None)
+            raise
+        except Exception as exc:
+            # The held token failed to join; the response carries a fresh one
+            # for the same room.
+            logger.warning(
+                "realtime.prepared_join_failed_falling_back",
+                room_name=prepared.room_name,
+                error=str(exc),
+            )
+            return await self._join_dispatched_room(response, ws_done_at)
+        await self._raise_if_ended_after_join()
+        return response, ws_done_at, room_started_at, join_done_at[0]
+
+    async def _join_dispatched_room(
+        self, response: StartedSession, ws_done_at: float
+    ) -> tuple[StartedSession, float, float, float]:
+        """The serialized tail after an abandoned prepared join: connect on
+        the start response's own credentials."""
+        try:
+            await self._connect_transport(response)
+        except asyncio.CancelledError:
+            await self._abort_start(DisconnectReason.CLIENT_CLOSED, "start cancelled")
+            raise
+        except ImportError:
+            await self._abort_start(DisconnectReason.TRANSPORT_ERROR, None)
+            raise
+        except Exception as exc:
+            # Same evidence consult as the serialized join: a room deleted by
+            # a failed boot must reach the caller as the window's typed close
+            # exit, enriched when the server said why.
+            handshake = self._handshake_failure()
+            await self._abort_start(
+                DisconnectReason.HANDSHAKE_FAILED
+                if handshake is not None
+                else DisconnectReason.TRANSPORT_ERROR,
+                str(handshake or exc),
+            )
+            if handshake is not None:
+                raise handshake from exc
+            raise SessionStartError(code=SessionStartErrorCode.JOIN_FAILED, message=str(exc)) from exc
+        await self._raise_if_ended_after_join()
+        return response, ws_done_at, ws_done_at, time.perf_counter()
+
+    async def _raise_if_ended_after_join(self) -> None:
+        """A close that latched while a prepared start was still joining has
+        already done the session-end bookkeeping; the room just joined would
+        otherwise outlive the session it belongs to."""
+        if not self._terminal:
+            return
+        transport, self._transport = self._transport, None
+        if transport is not None:
+            try:
+                await asyncio.shield(transport.disconnect())
+            except Exception:
+                logger.exception("realtime.transport_disconnect_failed", stack_info=True)
+        raise self._handshake_failure() or SessionStartError(
+            code=SessionStartErrorCode.HANDSHAKE_FAILED,
+            message="session ended before the prepared start completed",
         )
-        self._set_state(SessionStateKind.CONNECTED)
-        logger.info(
-            "realtime.session_started",
-            session_id=response.session_id,
-            room_name=response.room_name,
+
+    async def _abandon_prepared_join(self, join_task: asyncio.Task[None]) -> None:
+        """Give up on the prepared join, whether it is still in flight or has
+        already produced a live room. A join in flight is drained, not
+        cancelled, and the room it produces is then released."""
+        try:
+            await asyncio.wait_for(asyncio.shield(join_task), _ABANDONED_JOIN_DRAIN_S)
+        except asyncio.TimeoutError:
+            logger.warning("realtime.prepared_join_drain_timed_out")
+            join_task.cancel()
+            with contextlib.suppress(BaseException):
+                await join_task
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        transport, self._transport = self._transport, None
+        if transport is None:
+            return
+        try:
+            await asyncio.shield(transport.disconnect())
+        except Exception:
+            logger.exception("realtime.transport_disconnect_failed", stack_info=True)
+
+    def _live_session_id(self) -> str | None:
+        return self._response.session_id if self._response is not None else None
+
+    async def _connect_transport_prepared(self, prepared: PreparedRoom) -> None:
+        """The join half of the prepared start. Mirrors ``_connect_transport``
+        except for the session id, which the still-in-flight start carries —
+        handlers resolve it lazily, per invocation."""
+        transport = self._make_transport()
+        if not isinstance(transport, PreparedJoinTransport):
+            raise SessionStartError(
+                code=SessionStartErrorCode.CONFIG,
+                message=(
+                    f"{type(transport).__name__} cannot join a prepared room"
+                ),
+            )
+        self._transport = transport
+        callbacks = TransportCallbacks(
+            on_frame=self._on_transport_frame,
+            on_closed=self._on_transport_closed,
+            on_reconnecting=self._on_transport_reconnecting,
+            on_reconnected=self._on_transport_reconnected,
         )
-        return self
+        try:
+            self._job_sink = ClientToolJobSink(
+                publish=self._publish,
+                is_open=lambda: not self._terminal and self._transport is not None,
+            )
+            register_client_tool_handlers(
+                transport,
+                self._client_tools(),
+                hooks=self._hooks,
+                session_id=self._live_session_id,
+                job_sink=self._job_sink,
+            )
+            register_screen_locate(transport, self._config.agent.tools or ())
+            await transport.connect_prepared(prepared, callbacks)
+        except BaseException:
+            transport_ref, self._transport = self._transport, None
+            if transport_ref is not None:
+                try:
+                    await asyncio.shield(transport_ref.disconnect())
+                except Exception:
+                    logger.exception(
+                        "realtime.transport_disconnect_failed", stack_info=True
+                    )
+            raise
 
     async def _abort_start(self, reason: DisconnectReason, detail: str | None) -> None:
         """Bookkeeping for a start that never reached CONNECTED: latch terminal,
@@ -771,6 +1352,55 @@ class RealtimeSession:
         await self._fire_session_end(reason, detail)
         self._put_terminal(_STREAM_END)
         self._set_state(SessionStateKind.DISCONNECTED, reason=reason, detail=detail)
+        # Settled last, for the same reason ``_finish`` does.
+        self._ready_settled.set()
+
+    def _mark_connect_event(self, event: BaseModel) -> None:
+        """Stamp the ``ready`` mark the phases can't see — readiness is room
+        state now (participant attribute + frame), so every session that
+        comes up observes it."""
+        if isinstance(event, ReadyEvent) and self._ready_at is None:
+            self._ready_at = time.perf_counter()
+            self._ready_settled.set()
+            self._fold_connect_marks()
+
+    def _fold_connect_marks(self) -> None:
+        """Recompute the ``ready`` mark into the frozen timings. It can land
+        before the phases are built, so nothing accumulates in place."""
+        started_at = self._connect_started_at
+        if started_at is None:
+            return
+        self._connect_timings = replace(
+            self._connect_timings,
+            ready_ms=_elapsed_ms(started_at, self._ready_at),
+        )
+        self._maybe_send_connect_timings()
+
+    def _maybe_send_connect_timings(self) -> None:
+        """Report the client's half of the connect waterfall once the phases
+        are in hand and ``ready`` has landed. One report per session."""
+        timings = self._connect_timings
+        if self._connect_timings_sent or timings.total_ms is None:
+            return
+        if self._ready_at is None:
+            return
+        self._connect_timings_sent = True
+        self._spawn(self._send_connect_timings(timings))
+
+    async def _send_connect_timings(self, timings: SessionConnectTimings) -> None:
+        """Best-effort: a session is not worth failing over a metric."""
+        try:
+            await self._publish(
+                ClientConnectTimings(
+                    request_ms=_round_ms(timings.ws_ms),
+                    room_ms=_round_ms(timings.room_ms),
+                    mic_ms=_round_ms(timings.mic_ms),
+                    ready_ms=_round_ms(timings.ready_ms),
+                    server=self._started().timings,
+                )
+            )
+        except Exception:
+            logger.exception("realtime.connect_timings_send_failed", stack_info=True)
 
     async def _apply_session_start_hooks(self) -> None:
         if self._hooks is None:
@@ -807,14 +1437,19 @@ class RealtimeSession:
         )
 
     def _make_transport(self) -> Transport:
-        """Construct the production transport. Isolated so tests inject a fake by
-        patching this one method; the livekit import is deferred to here to
-        keep importing the SDK light."""
+        """Construct the production transport for this session's lane.
+        Isolated so tests inject a fake by patching this one method; each
+        adapter's import is deferred to here to keep importing the SDK
+        light."""
+        if self._transport_kind == "websocket":
+            from cosmo_ai.session._websocket import WebSocketTransport
+
+            return WebSocketTransport()
         from cosmo_ai.session._livekit import LiveKitTransport
 
         return LiveKitTransport()
 
-    async def _connect_transport(self, response: SessionResponse) -> None:
+    async def _connect_transport(self, response: StartedSession) -> None:
         self._transport = self._make_transport()
         callbacks = TransportCallbacks(
             on_frame=self._on_transport_frame,
@@ -846,6 +1481,10 @@ class RealtimeSession:
             # BaseException: a cancelled or failed handshake must not leak a
             # live room.
             transport, self._transport = self._transport, None
+            # Carry off the transport's own record of a room that went down
+            # mid-join before the reference is dropped: it is the only
+            # evidence for a close that had no room to be reported against.
+            self._connect_lost = getattr(transport, "_connect_lost", None)
             try:
                 await asyncio.shield(transport.disconnect())
             except Exception:
@@ -879,6 +1518,11 @@ class RealtimeSession:
             ended_event = SessionEndedEvent(
                 reason=detail or _DEFAULT_ENDED_REASON[reason]
             )
+        # Close any still-open bubble before the terminal item, so a consumer
+        # that drains to the end sees finals only — and ``transcript`` holds
+        # no forever-open turns afterwards.
+        if self._transcript.close_open():
+            self._put_terminal(TranscriptUpdatedEvent(items=self._transcript.current))
         self._put_terminal(ended_event)
         self._put_terminal(_STREAM_END)
         self._set_state(SessionStateKind.DISCONNECTED, reason=reason, detail=detail)
@@ -914,6 +1558,10 @@ class RealtimeSession:
                 await on_close()
             except Exception:
                 logger.exception("realtime.on_close_failed", stack_info=True)
+        # Last: teardown precedes settling, so a caller woken out of the ready
+        # gate finds a fully torn-down session — no live room, no captured
+        # microphone, no session slot — rather than one mid-teardown.
+        self._ready_settled.set()
 
     def _set_state(
         self,
@@ -922,7 +1570,7 @@ class RealtimeSession:
         reason: DisconnectReason | None = None,
         detail: str | None = None,
     ) -> None:
-        state = RealtimeSessionState(kind=kind, disconnect_reason=reason, detail=detail)
+        state = SessionState(kind=kind, disconnect_reason=reason, detail=detail)
         previous, self._state = self._state, state
         logger.info(
             "realtime.session_state_changed",
@@ -971,7 +1619,16 @@ class RealtimeSession:
         # the close (a buffered ``session-ended``) has already run and latched.
         reason: DisconnectReason
         detail: str | None
-        if self._server_end_reason is not None:
+        if self._ready_at is None:
+            # One ending, one reason: a close before ``ready`` is the
+            # window's handshake failure on every surface — what ``start()``
+            # raises, the state ``on_state_change`` reports, the stream's
+            # terminal item, and the SessionEnd hook. The server-ended and
+            # transport-error reasons below describe a session that lived.
+            failure = self._handshake_failure()
+            reason = DisconnectReason.HANDSHAKE_FAILED
+            detail = str(failure) if failure is not None else close.detail
+        elif self._server_end_reason is not None:
             reason, detail = DisconnectReason.SERVER_ENDED, self._server_end_reason
         elif close.kind == "server_ended":
             reason, detail = DisconnectReason.SERVER_ENDED, close.detail
@@ -1084,17 +1741,50 @@ class RealtimeSession:
             self._emit(UnknownEvent(raw_type=frame_type, payload=raw))
             return
 
+        # ``ready`` arrives on two channels — the agent's participant
+        # attribute (room state, read by late joiners) and the data-channel
+        # frame. First delivery wins; the echo reaches no surface.
+        if isinstance(event, ReadyEvent):
+            if self._ready_at is not None:
+                return
+            for rejected in event.rejected_tools:
+                logger.warning(
+                    "realtime.tool_spec_rejected",
+                    tool=rejected.name,
+                    reason=rejected.reason,
+                )
+        # Before ready, an error frame is enrichment for the room close a
+        # failed boot sends next — stashed so that close raises with the
+        # server's own code and message. The frame itself settles nothing.
+        if isinstance(event, ErrorEvent) and self._ready_at is None:
+            self._pending_handshake_error = (event.code.value, event.message)
+        self._mark_connect_event(event)
         self._emit(event)  # type: ignore[arg-type]
 
     def _emit(self, event: RealtimeSessionEvent) -> None:
         if self._terminal:
             return
+        # Fold into the session-owned transcript before the event is
+        # enqueued, so a consumer reading ``transcript`` on any event always
+        # sees that event applied.
+        transcript_changed = False
+        if isinstance(event, TranscriptDeltaEvent):
+            transcript_changed = self._transcript.apply_delta(
+                event.role, event.text, event.is_final
+            )
+        elif isinstance(event, TurnCompleteEvent):
+            transcript_changed = self._transcript.apply_turn_complete(event.role)
+        self._enqueue(event)
+        if transcript_changed:
+            self._enqueue(TranscriptUpdatedEvent(items=self._transcript.current))
+
+    def _enqueue(self, event: RealtimeSessionEvent) -> None:
         try:
             self._queue.put_nowait(event)
         except asyncio.QueueFull:
             logger.warning(
                 "realtime.event_queue_full_dropping",
-                event_type=getattr(event, "type", type(event).__name__),
+                event_type=_EVENT_WIRE_TYPE.get(type(event), type(event).__name__),
                 qsize=self._queue.qsize(),
             )
 
@@ -1176,10 +1866,13 @@ class RealtimeSession:
 
     async def _publish(self, message: BaseModel) -> None:
         transport = self._require_transport()
-        payload = message.model_dump_json(exclude_none=True).encode("utf-8")
+        # ``id`` is local (log correlation); the wire schema forbids strays.
+        payload = message.model_dump_json(
+            exclude_none=True, exclude={"id"}
+        ).encode("utf-8")
         await transport.send_frame(payload)
 
     def _require_transport(self) -> Transport:
         if self._transport is None:
-            raise NotConnectedError("Session is not connected.")
+            raise SessionStateError(code=SessionStateErrorCode.NOT_CONNECTED, message="Session is not connected.")
         return self._transport

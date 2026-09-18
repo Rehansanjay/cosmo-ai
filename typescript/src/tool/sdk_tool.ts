@@ -1,4 +1,4 @@
-import type { ClientToolSpec } from '../core/agent';
+import type { ClientTool } from '../core/agent';
 
 /** Marks a spec as one the SDK built itself.
  *
@@ -11,7 +11,7 @@ import type { ClientToolSpec } from '../core/agent';
  *  object. It is non-enumerable, so it never reaches the wire. */
 const SDK_CLIENT_TOOL = Symbol('cosmo.sdk.clientTool');
 
-export function markSdkClientTool(spec: ClientToolSpec): ClientToolSpec {
+export function markSdkClientTool(spec: ClientTool): ClientTool {
   return Object.defineProperty(spec, SDK_CLIENT_TOOL, {
     value: true,
     enumerable: false,

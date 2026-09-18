@@ -1,4 +1,4 @@
-import { useTranscript } from 'cosmo-ai';
+import { useTranscript } from 'cosmo-ai/react';
 
 // A turn is one transcript item however long it runs, so a talkative answer
 // would grow the caption until it covered the camera. Keep the most recent

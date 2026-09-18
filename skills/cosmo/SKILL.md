@@ -4,11 +4,14 @@ description: >-
   Teaches the current Cosmo Realtime SDK API across TypeScript (`cosmo-ai`
   on npm), Python (`cosmo-ai-sdk` on PyPI), and Swift (`cosmo-swift-sdk` via
   Swift Package Manager, imported as `CosmoRealtime`): login and credentials,
-  voice/multimodal agents, realtime sessions, client tools, hooks, agent
+  voice/multimodal agents, realtime sessions, client tools and the tools
+  the platform ships (server tools, on-screen renderers), hooks, agent
   skills, telephony, minting end-user tokens, and deploying/sharing apps
   built on the SDK. Use when writing, reviewing, or debugging code that uses
   any of these SDKs — read reference/core.md before writing any realtime
-  code.
+  code. Also use when a build breaks after an SDK version bump —
+  reference/migrations.md maps each release's breaking changes to their
+  replacements.
 ---
 
 # Cosmo Realtime SDK
@@ -16,6 +19,19 @@ description: >-
 One wire protocol, three SDKs, one shape: a **client** (credential +
 endpoint) builds an immutable **agent** (persona: instructions, voice,
 tools), and `agent.start()` runs a **session** (a stream of typed events).
+
+This skill is a summary; the docs at https://platform.askcosmo.ai/docs are
+the source of truth. **Before your first SDK change, fetch the docs page for
+each capability the app uses.** The map of pages is in
+[reference/core.md](reference/core.md#where-to-look-in-the-docs); read this
+file and that one whole, since a `head` stops above the map. The page is the
+contract. The installed package's `.d.ts` only says what compiles, and grepping
+`node_modules` is not a substitute for reading it.
+
+```bash
+curl -fsSL https://platform.askcosmo.ai/docs/llms.txt                 # every page, one line each
+curl -fsSL https://platform.askcosmo.ai/docs/raw/concepts/transcripts  # one page, plain markdown
+```
 
 ## Step 1: get a credential (start here, all three SDKs)
 
@@ -68,8 +84,33 @@ rules and the cross-SDK gotchas. Then the language layer:
 - **Python**: [reference/python.md](reference/python.md) — install and
   platform notes, Pydantic tools
 - **Swift**: [reference/swift.md](reference/swift.md) — SwiftPM install,
-  zero-argument options, the `CosmoRealtimeMint` module, TLS and backend
-  selection
+  zero-argument options, TLS and backend selection
+
+## Step 3: read the docs page for each capability the app uses
+
+The reference pages above are summaries. Before writing against a capability —
+tools the platform ships, hooks, skills, telephony, video, screen share, state
+— fetch its docs page (the `curl` at the top of this file) from the map in
+[reference/core.md](reference/core.md#where-to-look-in-the-docs).
+
+## Choose the realtime engine
+
+For managed Cosmo sessions, use **Grok realtime for voice-only apps** and **Gemini realtime for apps
+that need camera, video, or shared-screen understanding**, including apps
+that combine voice with those inputs. Set the agent model explicitly;
+see [provider selection](reference/core.md#choose-the-realtime-engine)
+for the cross-language configuration and voice rules. The local OSS
+`cosmo-server` supports only Gemini; use Gemini for its voice sessions.
+
+## Before you write a tool
+
+The platform ships tools of its own — web search, a close-up of the camera or
+screen, locating something in the frame and drawing it on the user's screen,
+acting on a shared screen, hanging up a call. Check the docs before writing a
+client tool for a job like that; an app-local tool that estimates what the
+platform measures ships broken. The map of where to look is in
+[reference/core.md](reference/core.md#where-to-look-in-the-docs); the docs
+describe the released SDK, so their spelling is the one your install accepts.
 
 ## Workflows
 
@@ -80,13 +121,38 @@ rules and the cross-SDK gotchas. Then the language layer:
 - **Production credentials — the token server and the end-user token
   lifecycle** (mint scope, TokenSource, TTL, revocation; all languages):
   [reference/end-user-tokens.md](reference/end-user-tokens.md)
+- **Build broke after an SDK version bump** (all languages — grep the
+  symbol the compiler lost, apply the sections between your version and
+  the target): [reference/migrations.md](reference/migrations.md)
+
+## Debug a session
+
+Set `COSMO_LOG_LEVEL` to `debug` to make the SDK verbose on standard error,
+including each session's connect-latency breakdown. Values are `silent`,
+`error`, `warn`, `info`, `debug`. TypeScript reads it outside the browser,
+where `setLogLevel('debug')` is the way in. In Swift the variable gates only
+the connect-latency line; read a Swift session in full through `os_log`
+instead (`log stream --predicate 'subsystem == "socratic.cosmo-realtime"'
+--info --debug`).
+
+After a session ends, read it back from the shell:
+
+```bash
+cosmo sessions list                         # recent sessions, newest first
+cosmo sessions logs <session-id>            # print the transcript
+cosmo sessions logs <session-id> --bundle   # zip it with the recordings
+cosmo sessions usage <session-id>           # duration, talk time, tokens
+cosmo sessions timeline <session-id>        # when each turn happened
+```
 
 ## Start from a runnable example
 
 Complete runnable examples for all three SDKs live in the
 [cosmo-ai repository](https://github.com/socratic-ai/cosmo-ai) under
 `examples/`: a token-minting server, a browser voice page (Vite + React),
-a deployable docs agent, and a video-grounded voice coach (TypeScript); a
+a deployable docs agent, a video-grounded voice coach, and a live-camera
+plant doctor that locates what you ask about and draws over the preview
+(TypeScript); a
 minimal session, a terminal voice client, outbound calling, and
 hooks/skills/MCP agents (Python); HelloRealtime with MCP/hooks/skills
 variants and a GUI agent app (Swift). Derive new apps from the closest

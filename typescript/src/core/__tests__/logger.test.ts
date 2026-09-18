@@ -1,7 +1,7 @@
 /** The SDK's log gate. Default is quiet for info/debug so a library import
  *  never puts diagnostics into the host app's console. */
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getLogLevel, log, setLogLevel } from '../logger';
 
 afterEach(() => setLogLevel('warn'));
@@ -43,5 +43,41 @@ describe('log level gate', () => {
     expect(warn).not.toHaveBeenCalled();
     error.mockRestore();
     warn.mockRestore();
+  });
+});
+
+describe('COSMO_LOG_LEVEL', () => {
+  const original = process.env.COSMO_LOG_LEVEL;
+
+  beforeEach(() => vi.resetModules());
+  afterEach(() => {
+    if (original === undefined) delete process.env.COSMO_LOG_LEVEL;
+    else process.env.COSMO_LOG_LEVEL = original;
+  });
+
+  async function freshLogger() {
+    return await import('../logger');
+  }
+
+  it('sets the starting level', async () => {
+    process.env.COSMO_LOG_LEVEL = 'debug';
+    expect((await freshLogger()).getLogLevel()).toBe('debug');
+  });
+
+  it('is case- and whitespace-insensitive', async () => {
+    process.env.COSMO_LOG_LEVEL = '  SILENT ';
+    expect((await freshLogger()).getLogLevel()).toBe('silent');
+  });
+
+  it('ignores a value that is not a level, rather than throwing', async () => {
+    process.env.COSMO_LOG_LEVEL = 'verbose';
+    expect((await freshLogger()).getLogLevel()).toBe('warn');
+  });
+
+  it('yields to an explicit setLogLevel call', async () => {
+    process.env.COSMO_LOG_LEVEL = 'debug';
+    const logger = await freshLogger();
+    logger.setLogLevel('silent');
+    expect(logger.getLogLevel()).toBe('silent');
   });
 });

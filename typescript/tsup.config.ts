@@ -14,14 +14,14 @@ export default defineConfig({
     'core/events': 'src/core/events.ts',
     'core/types': 'src/core/types.ts',
     'core/state': 'src/core/state.ts',
-    'core/transcript_fold': 'src/core/transcript_fold.ts',
-    'core/transcript_reducer': 'src/core/transcript_reducer.ts',
     'transport/types': 'src/transport/types.ts',
+    react: 'src/react/index.ts',
     'react/RealtimeProvider': 'src/react/RealtimeProvider.tsx',
     'react/hooks': 'src/react/hooks.ts',
-    'react/transcript_reducer': 'src/react/transcript_reducer.ts',
     'react/components/RealtimeAudio': 'src/react/components/RealtimeAudio.tsx',
     'react/components/StartAudio': 'src/react/components/StartAudio.tsx',
+    'react/components/MicToggle': 'src/react/components/MicToggle.tsx',
+    'react/components/BarVisualizer': 'src/react/components/BarVisualizer.tsx',
     tool: 'src/tool/index.ts',
     'tool/draw': 'src/tool/draw.ts',
     'tool/screen': 'src/tool/screen.ts',
@@ -31,7 +31,11 @@ export default defineConfig({
       'src/desktop/local_desktop_preset_union.gen.ts',
   },
   format: ['cjs', 'esm'],
-  dts: true,
+  // Declarations come from `tsc` via scripts/emit_declarations.mjs, which
+  // mirrors src/ instead of bundling: bundled declarations hoist every shared
+  // type into content-hashed chunks, and the barrel becomes an alias table
+  // pointing into names that change on each build.
+  dts: false,
   splitting: true,
   // No sourcemaps: tsup embeds absolute build paths in chunk maps, which
   // would make the packed tarball's bytes depend on the checkout location —

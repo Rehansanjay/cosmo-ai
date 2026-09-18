@@ -1,7 +1,7 @@
 {
   "name": "cosmo-ai",
-  "version": "0.6.0",
-  "description": "Realtime SDK for voice and multimodal sessions backed by LiveKit and Cosmo — audio/video streaming, transcript events, tool calls, and React hooks.",
+  "version": "0.7.0",
+  "description": "Realtime SDK for voice and multimodal sessions backed by LiveKit and Cosmo \u2014 audio/video streaming, transcript events, tool calls, and React hooks.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",
@@ -16,27 +16,218 @@
         "default": "./dist/index.js"
       }
     },
-    "./*": {
+    "./core/events": {
       "import": {
-        "types": "./dist/*.d.mts",
-        "default": "./dist/*.mjs"
+        "types": "./dist/core/events.d.mts",
+        "default": "./dist/core/events.mjs"
       },
       "require": {
-        "types": "./dist/*.d.ts",
-        "default": "./dist/*.js"
+        "types": "./dist/core/events.d.ts",
+        "default": "./dist/core/events.js"
+      }
+    },
+    "./core/realtime_client": {
+      "import": {
+        "types": "./dist/core/realtime_client.d.mts",
+        "default": "./dist/core/realtime_client.mjs"
+      },
+      "require": {
+        "types": "./dist/core/realtime_client.d.ts",
+        "default": "./dist/core/realtime_client.js"
+      }
+    },
+    "./core/state": {
+      "import": {
+        "types": "./dist/core/state.d.mts",
+        "default": "./dist/core/state.mjs"
+      },
+      "require": {
+        "types": "./dist/core/state.d.ts",
+        "default": "./dist/core/state.js"
+      }
+    },
+    "./core/types": {
+      "import": {
+        "types": "./dist/core/types.d.mts",
+        "default": "./dist/core/types.mjs"
+      },
+      "require": {
+        "types": "./dist/core/types.d.ts",
+        "default": "./dist/core/types.js"
+      }
+    },
+    "./desktop/local_desktop_preset_union.gen": {
+      "import": {
+        "types": "./dist/desktop/local_desktop_preset_union.gen.d.mts",
+        "default": "./dist/desktop/local_desktop_preset_union.gen.mjs"
+      },
+      "require": {
+        "types": "./dist/desktop/local_desktop_preset_union.gen.d.ts",
+        "default": "./dist/desktop/local_desktop_preset_union.gen.js"
+      }
+    },
+    "./presets": {
+      "import": {
+        "types": "./dist/presets.d.mts",
+        "default": "./dist/presets.mjs"
+      },
+      "require": {
+        "types": "./dist/presets.d.ts",
+        "default": "./dist/presets.js"
+      }
+    },
+    "./react": {
+      "import": {
+        "types": "./dist/react.d.mts",
+        "default": "./dist/react.mjs"
+      },
+      "require": {
+        "types": "./dist/react.d.ts",
+        "default": "./dist/react.js"
+      }
+    },
+    "./react/RealtimeProvider": {
+      "import": {
+        "types": "./dist/react/RealtimeProvider.d.mts",
+        "default": "./dist/react/RealtimeProvider.mjs"
+      },
+      "require": {
+        "types": "./dist/react/RealtimeProvider.d.ts",
+        "default": "./dist/react/RealtimeProvider.js"
+      }
+    },
+    "./react/components/BarVisualizer": {
+      "import": {
+        "types": "./dist/react/components/BarVisualizer.d.mts",
+        "default": "./dist/react/components/BarVisualizer.mjs"
+      },
+      "require": {
+        "types": "./dist/react/components/BarVisualizer.d.ts",
+        "default": "./dist/react/components/BarVisualizer.js"
+      }
+    },
+    "./react/components/MicToggle": {
+      "import": {
+        "types": "./dist/react/components/MicToggle.d.mts",
+        "default": "./dist/react/components/MicToggle.mjs"
+      },
+      "require": {
+        "types": "./dist/react/components/MicToggle.d.ts",
+        "default": "./dist/react/components/MicToggle.js"
+      }
+    },
+    "./react/components/RealtimeAudio": {
+      "import": {
+        "types": "./dist/react/components/RealtimeAudio.d.mts",
+        "default": "./dist/react/components/RealtimeAudio.mjs"
+      },
+      "require": {
+        "types": "./dist/react/components/RealtimeAudio.d.ts",
+        "default": "./dist/react/components/RealtimeAudio.js"
+      }
+    },
+    "./react/components/StartAudio": {
+      "import": {
+        "types": "./dist/react/components/StartAudio.d.mts",
+        "default": "./dist/react/components/StartAudio.mjs"
+      },
+      "require": {
+        "types": "./dist/react/components/StartAudio.d.ts",
+        "default": "./dist/react/components/StartAudio.js"
+      }
+    },
+    "./react/hooks": {
+      "import": {
+        "types": "./dist/react/hooks.d.mts",
+        "default": "./dist/react/hooks.mjs"
+      },
+      "require": {
+        "types": "./dist/react/hooks.d.ts",
+        "default": "./dist/react/hooks.js"
+      }
+    },
+    "./server": {
+      "import": {
+        "types": "./dist/server.d.mts",
+        "default": "./dist/server.mjs"
+      },
+      "require": {
+        "types": "./dist/server.d.ts",
+        "default": "./dist/server.js"
+      }
+    },
+    "./tool": {
+      "import": {
+        "types": "./dist/tool.d.mts",
+        "default": "./dist/tool.mjs"
+      },
+      "require": {
+        "types": "./dist/tool.d.ts",
+        "default": "./dist/tool.js"
+      }
+    },
+    "./tool/draw": {
+      "import": {
+        "types": "./dist/tool/draw.d.mts",
+        "default": "./dist/tool/draw.mjs"
+      },
+      "require": {
+        "types": "./dist/tool/draw.d.ts",
+        "default": "./dist/tool/draw.js"
+      }
+    },
+    "./tool/screen": {
+      "import": {
+        "types": "./dist/tool/screen.d.mts",
+        "default": "./dist/tool/screen.mjs"
+      },
+      "require": {
+        "types": "./dist/tool/screen.d.ts",
+        "default": "./dist/tool/screen.js"
+      }
+    },
+    "./tool/video_geometry": {
+      "import": {
+        "types": "./dist/tool/video_geometry.d.mts",
+        "default": "./dist/tool/video_geometry.mjs"
+      },
+      "require": {
+        "types": "./dist/tool/video_geometry.d.ts",
+        "default": "./dist/tool/video_geometry.js"
+      }
+    },
+    "./tool/zod": {
+      "import": {
+        "types": "./dist/tool/zod.d.mts",
+        "default": "./dist/tool/zod.mjs"
+      },
+      "require": {
+        "types": "./dist/tool/zod.d.ts",
+        "default": "./dist/tool/zod.js"
+      }
+    },
+    "./transport/types": {
+      "import": {
+        "types": "./dist/transport/types.d.mts",
+        "default": "./dist/transport/types.mjs"
+      },
+      "require": {
+        "types": "./dist/transport/types.d.ts",
+        "default": "./dist/transport/types.js"
       }
     }
   },
   "files": [
     "dist",
     "skills",
+    "CHANGELOG.md",
     "README.md",
     "LICENSE",
     "NOTICE",
     "THIRD-PARTY-LICENSES.md"
   ],
   "scripts": {
-    "build": "tsup && node scripts/source_hash.mjs > dist/source-hash",
+    "build": "tsup && node scripts/hoist_client_directives.mjs && node scripts/emit_declarations.mjs && node scripts/source_hash.mjs > dist/source-hash",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "clean": "rm -rf dist",
@@ -68,6 +259,12 @@
     "zod": "^4.2.0"
   },
   "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "react-dom": {
+      "optional": true
+    },
     "zod": {
       "optional": true
     }

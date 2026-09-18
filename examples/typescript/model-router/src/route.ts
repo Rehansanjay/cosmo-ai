@@ -1,4 +1,4 @@
-import { naturalness, type AgentConfig, type ModelOptions } from 'cosmo-ai';
+import { naturalness, type AgentConfig, type RealtimeModelBlock } from 'cosmo-ai';
 
 export type RoutedProvider = 'gemini' | 'openai' | 'openai_mini';
 
@@ -11,7 +11,7 @@ export type RouteResult = {
 type RouteRule = {
   keywords: string[];
   provider: RoutedProvider;
-  modelOptions: ModelOptions;
+  model: RealtimeModelBlock;
   speakingStyle: string;
   rationale: string;
 };
@@ -20,7 +20,7 @@ const RULES: RouteRule[] = [
   {
     keywords: ['practice', 'speech', 'presentation', 'rehearse'],
     provider: 'gemini',
-    modelOptions: {
+    model: {
       provider: 'gemini',
       thinkingLevel: 'low',
       endOfSpeechSensitivity: 'low',
@@ -33,14 +33,14 @@ const RULES: RouteRule[] = [
   {
     keywords: ['quick', 'bill', 'account', 'simple'],
     provider: 'openai_mini',
-    modelOptions: { provider: 'openai_mini' },
+    model: { provider: 'openai_mini' },
     speakingStyle: naturalness('warm'),
     rationale: 'Short factual ask — cheapest/fastest tier, no tuning needed.',
   },
   {
     keywords: ['error', 'bug', 'not working', 'fix'],
     provider: 'openai',
-    modelOptions: { provider: 'openai', turnDetection: 'semantic_vad', eagerness: 'low' },
+    model: { provider: 'openai', turnDetection: 'semantic_vad', eagerness: 'low' },
     speakingStyle: naturalness('delivery'),
     rationale:
       'Debugging needs the user to finish describing the problem — OpenAI semantic VAD, low eagerness.',
@@ -48,7 +48,7 @@ const RULES: RouteRule[] = [
   {
     keywords: ['urgent', 'asap', 'emergency', 'right now'],
     provider: 'openai',
-    modelOptions: {
+    model: {
       provider: 'openai',
       turnDetection: 'server_vad',
       silenceDurationMs: 400,
@@ -60,7 +60,7 @@ const RULES: RouteRule[] = [
   {
     keywords: ['brainstorm', 'ideas', 'explore', 'think through'],
     provider: 'gemini',
-    modelOptions: { provider: 'gemini', thinkingLevel: 'high', temperature: 0.9 },
+    model: { provider: 'gemini', thinkingLevel: 'high', temperature: 0.9 },
     speakingStyle: naturalness('delivery'),
     rationale: 'Open-ended ideation benefits from more reasoning depth — Gemini, thinkingLevel high.',
   },
@@ -69,12 +69,12 @@ const RULES: RouteRule[] = [
 // Gemini, not openai_mini: this is what any unmatched input lands on,
 // including someone's very first, exploratory message — unlike the openai/
 // openai_mini RULES above (a deliberate choice to test that path), a
-// feature-gated provider here would break the demo by default on any
-// workspace without realtime-openai-provider-enabled (see README).
+// provider the server may not have a key for would break the demo by
+// default (see README).
 const FALLBACK: RouteRule = {
   keywords: [],
   provider: 'gemini',
-  modelOptions: { provider: 'gemini' },
+  model: { provider: 'gemini' },
   speakingStyle: naturalness('warm'),
   rationale: 'No strong signal in the intent — Gemini, the provider every workspace has.',
 };
@@ -92,13 +92,7 @@ export function route(intent: string): RouteResult {
     provider: rule.provider,
     rationale: rule.rationale,
     agentConfig: {
-      // The backend resolves provider from `model` (accepts the bare
-      // provider name), never from `modelOptions.provider` — that field only
-      // tunes whichever provider `model` selects. Omitting it here would
-      // silently start every routed session on the platform default
-      // (Gemini) regardless of what modelOptions/the badge claim.
-      model: rule.provider,
-      modelOptions: rule.modelOptions,
+      model: rule.model,
       voice: { speakingStyle: rule.speakingStyle },
     },
   };

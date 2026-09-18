@@ -16,7 +16,7 @@ from cosmo_ai._internal.transport import (
     TransportCallbacks,
     TransportClose,
 )
-from cosmo_ai._internal.protocol import SessionResponse
+from cosmo_ai._internal.transport import StartedSession
 from cosmo_ai.session._engine import OnStateChange
 
 _T = TypeVar("_T")
@@ -37,6 +37,13 @@ START_RESPONSE_JSON: dict[str, Any] = {
     "token": "test-token",
     "room_name": "room-test",
     "session_id": "sess-test",
+}
+
+PREPARE_ROOM_RESPONSE_JSON: dict[str, Any] = {
+    "livekit_url": "wss://test.invalid",
+    "token": "prep-token",
+    "room_name": "room-prep",
+    "room_grant": "grant-prep",
 }
 
 
@@ -63,11 +70,23 @@ class FakeTransport:
     frames, RPC registrations, and media calls, and drives inbound frames /
     lifecycle through the session's callbacks (the ``simulate_*`` methods)."""
 
-    def __init__(self, sent: list[dict[str, Any]]) -> None:
+    def __init__(
+        self, sent: list[dict[str, Any]], *, ready_on_connect: bool = True
+    ) -> None:
         self._sent = sent
+        #: ``start()`` resolves at ready, so the fake mirrors a healthy
+        #: worker and lands the handshake as part of ``connect``. Pass
+        #: ``False`` only where the test drives the whole start itself —
+        #: a start with no ready blocks until the ready timeout.
+        self.ready_on_connect = ready_on_connect
+        #: Payload for the auto-emitted ``ready``; defaults to a minimal
+        #: frame carrying the started session's id.
+        self.ready_frame: dict[str, Any] | None = None
         self.rpc_methods: dict[str, RpcHandler] = {}
         self.connected = False
         self.disconnected = False
+        self.connects: list[str] = []
+        self.prepared_joins: list[str] = []
         self._callbacks: TransportCallbacks | None = None
         self.published_sources: list[tuple[Any, str]] = []
         self.unpublished: list[Any] = []
@@ -81,10 +100,28 @@ class FakeTransport:
         self.byte_streams: list[tuple[bytes, str]] = []
 
     async def connect(
-        self, response: SessionResponse, callbacks: TransportCallbacks
+        self, started: StartedSession, callbacks: TransportCallbacks
     ) -> None:
         self._callbacks = callbacks
         self.connected = True
+        self.disconnected = False
+        self.connects.append(started.room_name)
+        if self.ready_on_connect:
+            self._emit_ready(str(getattr(started, "session_id", "sess-fake")))
+
+    async def connect_prepared(
+        self, prepared: Any, callbacks: TransportCallbacks
+    ) -> None:
+        self._callbacks = callbacks
+        self.connected = True
+        self.disconnected = False
+        self.prepared_joins.append(prepared.room_name)
+        if self.ready_on_connect:
+            self._emit_ready("sess-fake")
+
+    def _emit_ready(self, session_id: str) -> None:
+        frame = self.ready_frame or {"type": "ready", "session_id": session_id}
+        self.simulate_frame(json.dumps(frame).encode("utf-8"))
 
     def is_connected(self) -> bool:
         return self.connected and not self.disconnected
@@ -101,6 +138,13 @@ class FakeTransport:
 
     def register_rpc_method(self, name: str, handler: RpcHandler) -> None:
         self.rpc_methods[name] = handler
+
+    def create_mic_source(self, capture: Any) -> Any:
+        # The WebRTC capture path, like the LiveKit transport builds: these
+        # tests pin what happens when that device will not open.
+        from cosmo_ai.audio._mic import MicAudioSource
+
+        return MicAudioSource(capture)
 
     async def publish_audio_source(
         self, source: Any, *, track_name: str = "mic"
@@ -178,6 +222,7 @@ class FakeSessionHarness:
     def __init__(self, transport_cls: type[FakeTransport] = FakeTransport) -> None:
         self.start_bodies: list[dict[str, Any]] = []
         self.start_urls: list[str] = []
+        self.start_headers: list[dict[str, str]] = []
         self.frames: list[dict[str, Any]] = []
         self.transport = transport_cls(self.frames)
         self.session: RealtimeSession | None = None
@@ -189,7 +234,6 @@ _PERSONA_KEYS = frozenset(
         "inputs",
         "instructions",
         "model",
-        "model_options",
         "voice",
         "tools",
         "interruption_sensitivity",
@@ -217,20 +261,37 @@ async def start_fake_session(
     respond: Callable[[httpx.Request], httpx.Response] | None = None,
     on_state_change: OnStateChange | None = None,
     harness: FakeSessionHarness | None = None,
+    prepared: bool = False,
+    ready_frame: dict[str, Any] | None = None,
+    settle_connect: bool = True,
+    client_transport: str = "webrtc",
     **session_kwargs: Any,
 ) -> FakeSessionHarness:
+    """Start a session over the fake transport.
+
+    ``start()`` resolves at ready, so the transport lands the handshake as
+    part of ``connect``. By default the harness then settles the connect —
+    draining that leading ``ReadyEvent`` and the fire-and-forget
+    connect-timings report — so the stream and ``frames`` begin where these
+    tests have always begun. ``ready_frame`` shapes the handshake payload;
+    ``settle_connect=False`` leaves the connect's own stream items and
+    frames in place for tests that assert on them."""
     harness = harness or FakeSessionHarness()
+    harness.transport.ready_frame = ready_frame
 
     def default_respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/prepare-room"):
+            return httpx.Response(200, json=PREPARE_ROOM_RESPONSE_JSON)
         return httpx.Response(200, json=START_RESPONSE_JSON)
 
     def record_and_respond(request: httpx.Request) -> httpx.Response:
         harness.start_bodies.append(json.loads(request.content))
         harness.start_urls.append(str(request.url))
+        harness.start_headers.append(dict(request.headers))
         return (respond or default_respond)(request)
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(record_and_respond))
-    client = RealtimeClient(api_key="test-key")
+    client = RealtimeClient(api_key="test-key", transport=client_transport)  # type: ignore[arg-type]
     client._http_client = http  # internal seam: inject the mock transport
     try:
         with mock.patch.object(
@@ -242,8 +303,25 @@ async def start_fake_session(
                 agent = client.catalog_agent(persona.pop("name"), **persona)
             else:
                 agent = client.agent(**persona)
-            handle = agent.start(on_state_change=on_state_change, **run)
+            if prepared:
+                prepared_session = agent.prepare_session(
+                    on_state_change=on_state_change, **run
+                )
+                # Deterministic: the reservation lands before the start that
+                # consumes it.
+                await prepared_session._inflight
+                handle = prepared_session.start()
+            else:
+                handle = agent.start(on_state_change=on_state_change, **run)
             harness.session = await handle
+            if settle_connect:
+                await asyncio.wait_for(harness.session.__anext__(), timeout=1)
+                # Let the fire-and-forget connect-timings report land, then
+                # drop it: ``frames`` records what the test itself sent, not
+                # the connect's own traffic.
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                harness.frames.clear()
     finally:
         await http.aclose()
     return harness

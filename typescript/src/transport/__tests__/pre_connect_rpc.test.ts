@@ -6,9 +6,10 @@
  * "method not found" (the join→register startup race).
  */
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
+import { SDK_NAME, SDK_VERSION } from '../../constants';
 
 import { LiveKitTransport } from '../livekit_transport';
-import type { SessionConfig } from '../../wire/types.gen';
+import type { SessionConfig } from '../../protocol';
 
 const { registerRpcMethod, unregisterRpcMethod, roomConnect, setMic, publishData, remoteParticipants } =
   vi.hoisted(() => ({
@@ -58,6 +59,7 @@ vi.mock('livekit-client', () => {
 const START_URL = 'https://api.example.com/api/v1/external/realtime/session/start';
 
 const CONFIG: SessionConfig = {
+  sdk: { name: SDK_NAME, version: SDK_VERSION },
   type: 'session-config',
   agent: { type: 'inline', voice: { name: 'Breezy' } },
 };

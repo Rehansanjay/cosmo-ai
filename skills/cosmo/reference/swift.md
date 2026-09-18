@@ -17,7 +17,8 @@ higher one of its own (Cartographer targets macOS 14).
 let client = try RealtimeClient()
 let agent = try client.agent(
     instructions: "You are terse.",
-    voice: .init(name: "Puck")
+    model: .grok(GrokModel()),
+    voice: .init(name: "ara")
 )
 let session = try await agent.start()
 
@@ -42,13 +43,14 @@ for try await event in session.events {
   `COSMO_BASE_URL` and is exposed read-only. A GUI app has no inherited
   environment — publish the choice with `setenv` before starting a
   session. One process, one backend.
-- **Minting is deliberately absent from `CosmoRealtime`** — a shipped app
-  can't mint. Server-side Swift that mints imports the opt-in
-  `CosmoRealtimeMint` product.
-- **Tools**: `AgentTool.define(...)` with a trailing handler closure,
+- **Minting needs an api-key credential** — `client.mintToken(_:)`
+  is on `RealtimeClient`, and a client holding a minted token or a
+  `TokenSource` raises `MintTokenError` with `code == .missingApiKey`. Run it
+  server-side; a workspace key never belongs in a shipped app.
+- **Tools**: `AgentTool.clientTool(...)` with a trailing handler closure,
   passed to `client.agent(tools:)`; the returned object is the tool
   result.
-- **Slow tools**: `AgentTool.defineBackground(...)`. The closure
+- **Slow tools**: `AgentTool.backgroundClientTool(...)`. The closure
   takes `(args, job: ClientToolJob)` and returns `Void` — `await
   job.ack("on it")` releases the reply so the agent keeps talking, then
   `try await job.complete(result:summary:)` or `try await
@@ -56,6 +58,14 @@ for try await event in session.events {
   Returning without acking is an error, not an inline result; a throw
   after acking is reported through the job. `ClientToolJob` is the
   per-invocation handle, not a kind of tool.
+- **Background voices / the agent answering other speakers**:
+  `client.agent(audio: AudioConfig(noiseCancellation: .voiceFocus))` — off by
+  default; the tradeoff and the rest of the `audio` block:
+  [core.md](core.md).
+- **Wrong-language transcripts / the agent flipping languages**: there
+  is no `language:` parameter to set — not on `client.agent(...)` or
+  any config type; don't invent one. The control is `instructions` —
+  the wording and what the platform already does: [core.md](core.md).
 - **`verifyTLS` defaults to `.auto`**: certificate verification is
   skipped only for loopback hosts, so a self-signed-https local backend
   works. Plain `http://` is a separate rule — `COSMO_BASE_URL` accepts it
@@ -64,6 +74,10 @@ for try await event in session.events {
   against `assistant.askcosmo.ai`. Set `COSMO_BASE_URL` to the backend
   the key was issued for — or use the stored `cosmo login` credential,
   which carries its backend with it.
+- **Websocket transport**: `RealtimeClient(transport: .websocket)` reaches
+  a local OSS `cosmo-server`; managed Cosmo serves WebRTC only. There is
+  no `COSMO_TRANSPORT` fallback in Swift; pass the argument. What the
+  socket refuses: [core.md](core.md).
 
 ## Runnable examples
 

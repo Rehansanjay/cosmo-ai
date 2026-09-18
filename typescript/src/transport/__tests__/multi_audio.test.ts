@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { SDK_NAME, SDK_VERSION } from '../../constants';
 import { LiveKitTransport } from '../livekit_transport';
-import type { SessionConfig } from '../../wire/types.gen';
+import type { SessionConfig } from '../../protocol';
 
 const mockHandlers = vi.hoisted(
   (): Record<string, (...args: unknown[]) => void> => ({}),
@@ -43,7 +44,7 @@ function fire(event: string, ...args: unknown[]): void {
   mockHandlers[event]?.(...args);
 }
 
-const CONFIG: SessionConfig = { type: 'session-config' };
+const CONFIG: SessionConfig = { type: 'session-config' , sdk: { name: SDK_NAME, version: SDK_VERSION } };
 
 const SESSION_RESPONSE = {
   livekit_url: 'wss://lk.example',

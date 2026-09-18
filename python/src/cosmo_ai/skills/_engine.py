@@ -20,7 +20,7 @@ Directory semantics: a directory that itself contains a ``SKILL.md`` is that
 one skill; otherwise each ``<child>/SKILL.md`` is a skill. A directory that
 yields no skills logs a warning and attaches none (an empty per-user skills
 folder is a valid state); a path that doesn't exist or a file that doesn't
-parse raises :class:`SkillParseError` when the agent is built, not mid-call.
+parse raises :class:`SkillError` when the agent is built, not mid-call.
 
 Skills never appear on the wire as such — they compile into an instructions
 suffix (the menu) and one ``cosmo_sdk_load_skill`` client tool, identically for
@@ -30,8 +30,10 @@ both input forms.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Union
 
@@ -47,10 +49,43 @@ logger: structlog.stdlib.BoundLogger = get_logger(__name__)
 _SKILL_FILENAME = "SKILL.md"
 
 
-class SkillParseError(RealtimeError, ValueError):
+class SkillErrorCode(str, Enum):
+    """Stable codes clients match on to tell one skills failure from another.
+
+    The set is closed: every one is raised by this SDK, never by the server,
+    so it changes only when the SDK does."""
+
+    NOT_A_DIRECTORY = "not_a_directory"
+    """The skills path does not point at a directory."""
+    CANNOT_READ = "cannot_read"
+    """A ``SKILL.md`` exists but could not be read from disk."""
+    MISSING_FRONTMATTER = "missing_frontmatter"
+    """``SKILL.md`` does not open with a ``---`` fence."""
+    UNTERMINATED_FRONTMATTER = "unterminated_frontmatter"
+    """The opening ``---`` fence is never closed."""
+    MALFORMED_FRONTMATTER_LINE = "malformed_frontmatter_line"
+    """A frontmatter line is not ``key: value``."""
+    DUPLICATE_FRONTMATTER_KEY = "duplicate_frontmatter_key"
+    """The same frontmatter key appears twice."""
+    MISSING_DESCRIPTION = "missing_description"
+    """Frontmatter has no ``description``. It is the routing signal the model
+    reads to decide whether to load the skill, so it is required."""
+    DUPLICATE_SKILL_NAME = "duplicate_skill_name"
+    """Two skills resolved to the same name."""
+
+
+class SkillError(RealtimeError, ValueError):
     """The ``skills`` input is unusable: the path is not a directory, a
     SKILL.md cannot be read or is malformed (no frontmatter, missing required
-    field), or two skills share a name."""
+    field), or two skills share a name.
+
+    ``code`` names which of those it was — match on it rather than on the
+    message, which is written for a human and is not part of the contract."""
+
+    def __init__(self, *, code: SkillErrorCode, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -59,26 +94,42 @@ class Skill:
     ``body`` is loaded on demand."""
 
     name: str
+    """How the skill is identified. Unique across the agent's skills."""
     description: str
+    """What the skill is for. Stays resident in the model's context — this
+    is what it reads to decide whether to load ``body`` at all, so it has to
+    be specific enough to route on."""
     body: str
+    """The skill's full text, loaded only once the model asks for it."""
 
 
 SkillsInput = Union[
     str, "os.PathLike[str]", Sequence[Union[str, "os.PathLike[str]", Skill]]
 ]
+"""What the agent's ``skills=`` parameter accepts: a path to a directory of
+skills, or a sequence mixing such paths with :class:`Skill` values. A single
+skill goes in a sequence of one; only the path form is allowed bare. Each path
+expands in place to the skills that directory holds, so paths and explicit
+skills compose. Duplicate skill names raise."""
 
 
 def _split_frontmatter(text: str) -> tuple[str, str]:
     """Return ``(frontmatter, body)``. Raises if the leading ``---`` fence is
     absent or unterminated."""
     if not text.startswith("---\n"):
-        raise SkillParseError("SKILL.md must start with a '---' frontmatter fence")
+        raise SkillError(
+            code=SkillErrorCode.MISSING_FRONTMATTER,
+            message="SKILL.md must start with a '---' frontmatter fence",
+        )
     rest = text[len("---\n") :]
     end = rest.find("\n---\n")
     if end == -1:
         if rest.endswith("\n---"):
             return rest[: -len("\n---")], ""
-        raise SkillParseError("SKILL.md frontmatter fence is not closed with '---'")
+        raise SkillError(
+            code=SkillErrorCode.UNTERMINATED_FRONTMATTER,
+            message="SKILL.md frontmatter fence is not closed with '---'",
+        )
     return rest[:end], rest[end + len("\n---\n") :]
 
 
@@ -99,15 +150,24 @@ def parse_skill_md(text: str, *, default_name: str) -> Skill:
             continue
         key, sep, value = line.partition(":")
         if not sep:
-            raise SkillParseError(f"malformed frontmatter line: {line!r}")
+            raise SkillError(
+                code=SkillErrorCode.MALFORMED_FRONTMATTER_LINE,
+                message=f"malformed frontmatter line: {line!r}",
+            )
         k = key.strip()
         if k in fields:
-            raise SkillParseError(f"duplicate frontmatter key: {k!r}")
+            raise SkillError(
+                code=SkillErrorCode.DUPLICATE_FRONTMATTER_KEY,
+                message=f"duplicate frontmatter key: {k!r}",
+            )
         fields[k] = value.strip()
 
     description = fields.get("description")
     if not description:
-        raise SkillParseError("SKILL.md frontmatter must include a 'description'")
+        raise SkillError(
+            code=SkillErrorCode.MISSING_DESCRIPTION,
+            message="SKILL.md frontmatter must include a 'description'",
+        )
 
     return Skill(
         name=fields.get("name") or default_name,
@@ -120,25 +180,49 @@ def _parse_skill_file(skill_file: Path, *, default_name: str) -> Skill:
     try:
         text = skill_file.read_text(encoding="utf-8")
     except OSError as exc:
-        raise SkillParseError(f"{skill_file}: cannot read: {exc}") from None
+        raise SkillError(
+            code=SkillErrorCode.CANNOT_READ, message=f"{skill_file}: cannot read: {exc}"
+        ) from None
     try:
         return parse_skill_md(text, default_name=default_name)
-    except SkillParseError as exc:
-        raise SkillParseError(f"{skill_file}: {exc}") from None
+    except SkillError as exc:
+        raise SkillError(
+            code=exc.code, message=f"{skill_file}: {exc.message}"
+        ) from None
 
 
 def _skills_from_dir(path: Path) -> list[Skill]:
     """The directory arm: ``path`` is one skill (its own SKILL.md) or a root of
     ``<skill>/SKILL.md`` folders. Zero skills warns and returns empty."""
-    if not path.is_dir():
-        raise SkillParseError(f"skills path is not a directory: {path}")
+    # ``Path.is_dir``/``is_file`` only swallow ENOENT, ENOTDIR, EBADF and
+    # ELOOP, so an unreadable path raises straight out of the probe — every
+    # test of it belongs inside the guard, not just the listing.
     own = path / _SKILL_FILENAME
-    if own.is_file():
+    try:
+        is_dir = path.is_dir()
+        own_is_file = is_dir and own.is_file()
+        children = (
+            [
+                child
+                for child in sorted(p for p in path.iterdir() if p.is_dir())
+                if (child / _SKILL_FILENAME).is_file()
+            ]
+            if is_dir and not own_is_file
+            else []
+        )
+    except OSError as exc:
+        raise SkillError(
+            code=SkillErrorCode.CANNOT_READ, message=f"{path}: cannot read: {exc}"
+        ) from None
+    if not is_dir:
+        raise SkillError(
+            code=SkillErrorCode.NOT_A_DIRECTORY, message=f"skills path is not a directory: {path}"
+        )
+    if own_is_file:
         return [_parse_skill_file(own, default_name=path.name)]
     skills = [
         _parse_skill_file(child / _SKILL_FILENAME, default_name=child.name)
-        for child in sorted(p for p in path.iterdir() if p.is_dir())
-        if (child / _SKILL_FILENAME).is_file()
+        for child in children
     ]
     if not skills:
         logger.warning("realtime.skills.none_found", path=str(path))
@@ -169,7 +253,10 @@ def resolve_skills(skills: SkillsInput | None) -> tuple[Skill, ...] | None:
     seen: set[str] = set()
     for skill in resolved:
         if skill.name in seen:
-            raise SkillParseError(f"duplicate skill name: {skill.name!r}")
+            raise SkillError(
+                code=SkillErrorCode.DUPLICATE_SKILL_NAME,
+                message=f"duplicate skill name: {skill.name!r}",
+            )
         seen.add(skill.name)
     return tuple(resolved)
 
@@ -180,12 +267,21 @@ _MENU_HEADER = (
     "conversation reaches the matching path:"
 )
 
+_NEWLINE_RUN = re.compile("[\n\v\f\r\x85\u2028\u2029]+")
+
+
+def _single_line(s: str) -> str:
+    """Collapse newlines (the set Swift's ``Character.isNewline`` matches) so a
+    description can never inject extra lines into the menu block embedded in
+    the system instructions."""
+    return " ".join(part for part in _NEWLINE_RUN.split(s) if part)
+
 
 def menu_text(skills: Sequence[Skill]) -> str:
     """The resident prompt menu; empty when there are no skills."""
     if not skills:
         return ""
-    lines = [f"- {s.name}: {s.description}" for s in skills]
+    lines = [f"- {s.name}: {_single_line(s.description)}" for s in skills]
     return _MENU_HEADER + "\n" + "\n".join(lines)
 
 

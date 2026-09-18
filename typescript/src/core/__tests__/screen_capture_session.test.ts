@@ -8,9 +8,11 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { RealtimeClient } from '../realtime_client';
 import {
+  screenLocateTool,
   type ScreenCapture,
 } from '../../tool/screen';
 import { makeFakeTransport, type FakeTransport } from './test_helpers';
+import { preToolUse } from '../hooks';
 
 
 const CAPTURE_RPC = 'screen_capture';
@@ -28,7 +30,7 @@ function startableClient(transport: FakeTransport): RealtimeClient {
     await original(opts);
     opts.onSessionStarted?.('sess-fake');
   };
-  return new RealtimeClient({ transportFactory: () => transport });
+  return new RealtimeClient({ apiKey: 'test-key', transportFactory: () => transport });
 }
 
 describe('screen-capture session wiring through RealtimeClient', () => {
@@ -36,7 +38,7 @@ describe('screen-capture session wiring through RealtimeClient', () => {
     const fake = makeFakeTransport();
     const client = startableClient(fake);
 
-    await client.agent({ tools: [{ kind: 'screen_locate', capture }] }).start();
+    await client.agent({ tools: [screenLocateTool(capture)] }).start();
 
     expect([...fake.rpcMethods.keys()]).toEqual([CAPTURE_RPC]);
   });
@@ -54,7 +56,7 @@ describe('screen-capture session wiring through RealtimeClient', () => {
     const fake = makeFakeTransport();
     const client = startableClient(fake);
     const session = await client
-      .agent({ tools: [{ kind: 'screen_locate', capture }] })
+      .agent({ tools: [screenLocateTool(capture)] })
       .start();
 
     const reply = JSON.parse(await fake.invokeRpc(CAPTURE_RPC, '{"capture_id":"c"}'));
@@ -64,36 +66,53 @@ describe('screen-capture session wiring through RealtimeClient', () => {
     expect(fake.sentBytes[0].topic).toBe(CAPTURE_RPC);
     const payload = JSON.parse(new TextDecoder().decode(fake.sentBytes[0].data));
     expect(payload.capture_id).toBe('c');
-    expect(payload.ax_elements).toHaveLength(1);
+    expect(payload.elements).toHaveLength(1);
 
     await session.end();
     expect(fake.rpcMethods.size).toBe(0);
   });
 
+  it('never fires hooks on the capture RPC — wire plumbing is not a tool call', async () => {
+    const fake = makeFakeTransport();
+    const client = startableClient(fake);
+    const seen: string[] = [];
+
+    await client
+      .agent({
+        tools: [screenLocateTool(capture)],
+        hooks: [preToolUse((ctx) => void seen.push(ctx.toolName))],
+      })
+      .start();
+
+    const reply = JSON.parse(await fake.invokeRpc(CAPTURE_RPC, '{"capture_id":"c"}'));
+    expect(reply.result).toEqual({ captured: true });
+    expect(seen).toEqual([]);
+  });
+
   it('rejects a non-agent caller end-to-end', async () => {
     const fake = makeFakeTransport();
     const client = startableClient(fake);
-    await client.agent({ tools: [{ kind: 'screen_locate', capture }] }).start();
+    await client.agent({ tools: [screenLocateTool(capture)] }).start();
 
     await expect(
       fake.invokeRpc(CAPTURE_RPC, '{"capture_id":"c"}', { callerIsAgent: false }),
     ).rejects.toThrow(/only be invoked by the session agent/);
   });
 
-  it('warns and skips registration when the transport cannot stream bytes', async () => {
+  it('refuses screen_locate at session start when the transport cannot stream bytes', async () => {
+    // The capture payload travels as a byte stream the single-socket carrier
+    // does not have — start refuses before the capture handler could ever run.
     const fake = makeFakeTransport();
     (fake as { sendBytes?: unknown }).sendBytes = undefined;
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    try {
-      const client = startableClient(fake);
-      await client.agent({ tools: [{ kind: 'screen_locate', capture }] }).start();
+    const client = startableClient(fake);
 
-      expect(fake.rpcMethods.size).toBe(0);
-      expect(warn).toHaveBeenCalledWith(
-        expect.stringContaining('does not support RPC registration + byte streams'),
-      );
-    } finally {
-      warn.mockRestore();
-    }
+    await expect(
+      client.agent({ tools: [screenLocateTool(capture)] }).start(),
+    ).rejects.toMatchObject({
+      name: 'SessionStartError',
+      code: 'config',
+      serverCode: 'screen_locate_unsupported',
+    });
+    expect(fake.rpcMethods.size).toBe(0);
   });
 });

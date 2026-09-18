@@ -19,85 +19,14 @@
  */
 
 import { log } from '../core/logger';
+import type { ServerEnvelope } from '../protocol';
 import type {
-  BotLlmStartedEvent,
-  BotLlmStoppedEvent,
-  BotStartedSpeakingEvent,
-  BotStoppedSpeakingEvent,
-  BotTtsStartedEvent,
-  BotTtsStoppedEvent,
-  ClientActivityEnd,
-  ClientBindInput,
-  ClientContext,
-  ClientEnd,
   ClientEnvelope,
-  ClientImage,
-  ClientMute,
-  ClientPing,
-  ClientText,
-  SessionStateWriteEvent,
-  ToolJobResult,
-  UsageEvent,
-  UserSpeechTimeoutEvent,
-  ErrorEvent,
-  ModelTextEvent,
-  PongEvent,
-  ReadyEvent,
-  ReconnectingEvent,
-  ServerEnvelope,
-  SessionEndedEvent,
-  SessionEndingSoonEvent,
-  ToolCallEvent,
-  ToolDispatchStartedEvent,
-  ToolInvocationEvent,
-  ToolResultEvent,
-  TranscriptDeltaEvent,
-  TurnCompleteEvent,
-  UserStartedSpeakingEvent,
-  UserStoppedSpeakingEvent,
-} from '../wire/types.gen';
+  RealtimeClientMessage,
+  RealtimeServerMessage,
+} from '../protocol';
 
-export type RealtimeClientMessage =
-  | ClientMute
-  | ClientEnd
-  | ClientPing
-  | ClientActivityEnd
-  | ClientBindInput
-  | ClientText
-  | ClientContext
-  | ClientImage
-  | ToolJobResult
-  | ClientEnvelope;
-
-/** Server messages exposed to handlers — the external protocol's
- *  server union. The transport unwraps ``server-envelope-chunk``
- *  carriers before dispatch, so the envelope type intentionally does
- *  NOT appear here. */
-export type RealtimeServerMessage =
-  | ReadyEvent
-  | TranscriptDeltaEvent
-  | ModelTextEvent
-  | TurnCompleteEvent
-  | UserStartedSpeakingEvent
-  | UserStoppedSpeakingEvent
-  | UserSpeechTimeoutEvent
-  | BotStartedSpeakingEvent
-  | BotStoppedSpeakingEvent
-  | BotLlmStartedEvent
-  | BotLlmStoppedEvent
-  | BotTtsStartedEvent
-  | BotTtsStoppedEvent
-  | ToolCallEvent
-  | ToolDispatchStartedEvent
-  | ToolResultEvent
-  | ToolInvocationEvent
-  | UsageEvent
-  | SessionStateWriteEvent
-  | ReconnectingEvent
-  | SessionEndingSoonEvent
-  | SessionEndedEvent
-  | ErrorEvent
-  | PongEvent;
+export type { RealtimeClientMessage, RealtimeServerMessage };
 
 /** A packet that could not be decoded into a wire frame at all: malformed
  *  JSON, a non-object, or an object with no ``type`` discriminator. Carried

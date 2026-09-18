@@ -4,6 +4,7 @@ import asyncio
 import json
 
 from cosmo_ai import UserSpeechTimeoutEvent
+from cosmo_ai.hooks import HookError, HookErrorCode
 from cosmo_ai.hooks import EndCall, Say, SilenceTimeout
 
 from .fakes import start_fake_session
@@ -15,7 +16,7 @@ def test_assemble_config_serializes_server_hooks() -> None:
     client = RealtimeClient(api_key="k")
     config = client._assemble_config(
         name=None, inputs=None,
-        instructions=None, model=None, model_options=None,
+        instructions=None, model=None,
         voice=None,
         tools=None,
         interruption_sensitivity=None, audio=None,
@@ -63,15 +64,15 @@ def test_server_hooks_ride_the_unified_hooks_list_onto_the_wire() -> None:
 
 def test_catalog_agent_rejects_server_hooks() -> None:
     import pytest
-
     from cosmo_ai.client import RealtimeClient
 
     client = RealtimeClient(api_key="k")
-    with pytest.raises(TypeError, match="stored config verbatim"):
+    with pytest.raises(HookError, match="stored config verbatim") as excinfo:
         client.catalog_agent(
             "driver-pay",
             hooks=[SilenceTimeout(timeout_seconds=9, action=EndCall())],  # type: ignore[list-item]
         )
+    assert excinfo.value.code is HookErrorCode.SERVER_HOOK_NOT_ALLOWED
 
 
 def test_decode_registry_includes_user_speech_timeout() -> None:
