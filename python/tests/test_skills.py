@@ -214,7 +214,7 @@ def test_resolve_rejects_non_skill_non_path_elements() -> None:
 
 @pytest.mark.parametrize("target", ["root", "child"])
 def test_unreadable_directory_is_a_cannot_read_skill_error(
-    tmp_path: Path, target: str
+    tmp_path: Path, target: str, deny_read
 ) -> None:
     """``Path.is_dir``/``is_file`` swallow only ENOENT, ENOTDIR, EBADF and
     ELOOP, so an unreadable directory used to escape as a bare
@@ -222,26 +222,20 @@ def test_unreadable_directory_is_a_cannot_read_skill_error(
     root = tmp_path / "skills"
     (root / "a-skill").mkdir(parents=True)
     blocked = root if target == "root" else root / "a-skill"
-    blocked.chmod(0o000)
-    try:
-        with pytest.raises(SkillError) as exc_info:
-            resolve_skills(root)
-        assert exc_info.value.code is SkillErrorCode.CANNOT_READ
-    finally:
-        blocked.chmod(0o755)
+    deny_read(blocked)
+    with pytest.raises(SkillError) as exc_info:
+        resolve_skills(root)
+    assert exc_info.value.code is SkillErrorCode.CANNOT_READ
 
 
-def test_unreadable_skill_file_is_a_cannot_read_skill_error(tmp_path: Path) -> None:
+def test_unreadable_skill_file_is_a_cannot_read_skill_error(tmp_path: Path, deny_read) -> None:
     root = tmp_path / "skills"
     _write_skill(root, "faq")
     skill_file = root / "faq" / "SKILL.md"
-    skill_file.chmod(0o000)
-    try:
-        with pytest.raises(SkillError) as exc_info:
-            resolve_skills(root)
-        assert exc_info.value.code is SkillErrorCode.CANNOT_READ
-    finally:
-        skill_file.chmod(0o644)
+    deny_read(skill_file)
+    with pytest.raises(SkillError) as exc_info:
+        resolve_skills(root)
+    assert exc_info.value.code is SkillErrorCode.CANNOT_READ
 
 
 def test_menu_text_lists_all_skills() -> None:
