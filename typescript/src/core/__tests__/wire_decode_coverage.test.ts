@@ -14,7 +14,7 @@
  * says why here.
  */
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
@@ -24,6 +24,11 @@ import { decodeStreamEvent, WIRE_NAME } from '../wire_decode';
 const SPEC_PATH = fileURLToPath(
   new URL('../../../../external-openapi.json', import.meta.url),
 );
+
+// The spec is generated in the monorepo and is not part of the published SDK
+// repo, where these two tests would otherwise fail with ENOENT for every
+// contributor. The rest of the file needs no spec and always runs.
+const HAS_SPEC = existsSync(SPEC_PATH);
 
 /** Inbound frames the SDK converts into one of its own event types. */
 const CONVERTED = new Set([
@@ -92,7 +97,7 @@ function specServerFrameTypes(): Set<string> {
 }
 
 describe('inbound frame coverage', () => {
-  it('converts every server frame the spec defines, or excuses it', () => {
+  it.skipIf(!HAS_SPEC)('converts every server frame the spec defines, or excuses it', () => {
     const spec = specServerFrameTypes();
     const accounted = new Set([...CONVERTED, ...Object.keys(NOT_AN_INBOUND_FRAME)]);
     const unaccounted = [...spec].filter((t) => !accounted.has(t)).sort();
@@ -105,7 +110,7 @@ describe('inbound frame coverage', () => {
     ).toEqual([]);
   });
 
-  it('names no frame the spec no longer defines', () => {
+  it.skipIf(!HAS_SPEC)('names no frame the spec no longer defines', () => {
     const spec = specServerFrameTypes();
     const stale = [...CONVERTED, ...Object.keys(NOT_AN_INBOUND_FRAME)]
       .filter((t) => !spec.has(t))
