@@ -4,7 +4,7 @@ public let sdkName = "cosmo-swift-sdk"
 
 /// The package version, sent as the SDK identity on ``session-config`` and
 /// the `X-Cosmo-SDK` request header.
-public let sdkVersion = "0.8.0"
+public let sdkVersion = "0.8.1"
 
 /// The `X-Cosmo-SDK` header value carried on every Cosmo REST call.
 let sdkIdentityHeaderValue = "\(sdkName)/\(sdkVersion)"

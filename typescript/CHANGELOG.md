@@ -11,6 +11,29 @@ next release's section, never by editing an old one.
 > Several names changed after — read the reference docs for the current
 > shape, and v0.1.0 only as history.
 
+## v0.7.1 — 2026-09-24
+
+### Added
+
+- `experimental.avatar` asks the server for a video avatar — a vendor renderer joins the session and republishes the agent's speech as lip-synced video, and the agent then publishes no audio of its own. One renderer today (`provider: "tavus"`, with a `face_id`); the field is discriminated on `provider` so further renderers join without a wire change. Server-gated per workspace: a session that asks for one while the gate is off simply starts without it.
+- `GeminiModel` accepts `toolResponsePolicy` and `toolResponseOverrides` to let selected tools run while the agent continues speaking, with `GeminiToolResponsePolicy` controlling result scheduling. The `gemini-3.8-live-extended-thinking` model requires non-blocking tools, accepts low, medium or high thinking, and does not accept scheduling.
+- `Plugin` bundles instructions, skills, tools, and hooks for inline agents through the `plugins` parameter. Contributions compose in plugin order before direct configuration, with named conflicts rejected at construction.
+- `<RealtimeVideo />` and `session.attachVideoElement()` play the session's remote video — an avatar renderer speaking for the agent — through a `<video>` you own and style. A session without a renderer never gets a track, so the element stays empty. Muted on playback: the renderer's audio arrives as its own track that `<RealtimeAudio />` already plays, and a second sink would double it.
+- `avatar` on the options `agent.start()` takes asks for one — `agent.start({ avatar: { provider: 'tavus', face_id } })`. Server-gated per workspace, so a session that asks while the gate is off runs without one.
+
+### Changed
+
+- Speaker diarization is available through the speaker log server tool without a workspace rollout flag. Opt in with `speakerLogTool()`. See the [server tools guide](https://platform.askcosmo.ai/docs/guides/server-side-tools) for setup.
+
+### Fixed
+
+- a `delegation_created` event that arrived with an empty `transcript` —
+  GPT Live raises a hand-off mid-turn without attaching what the user said —
+  now carries the session's last user turn, so a backend answering hand-offs
+  always has something to act on. Each turn stands in for at most one hand-off,
+  so two blank hand-offs in a row never replay the same instruction.
+- agent state returns from thinking to listening when model work ends, without interrupting ongoing speech.
+
 ## v0.7.0 — 2026-09-18
 
 ### Breaking

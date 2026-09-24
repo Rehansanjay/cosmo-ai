@@ -295,6 +295,11 @@ export class WebSocketTransport implements RealtimeTransport {
     return () => this.outputStreamListeners.delete(callback) as unknown as void;
   }
 
+  attachVideoElement(_el: HTMLVideoElement | null): void {
+    // The websocket transport carries no media tracks, so there is never a
+    // remote video track to play.
+  }
+
   attachAudioElement(element: HTMLAudioElement | null): void {
     if (this.hostAudioElement === element) return;
     const previous = this.outputElement;

@@ -551,6 +551,19 @@ the member classes are internal."""
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+class TavusAvatar(BaseModel):
+    """A Tavus renderer for the agent's video avatar."""
+
+    provider: Literal["tavus"] = "tavus"
+    """The renderer. Always ``tavus``."""
+    face_id: str = Field(min_length=1)
+    """Which Tavus face renders the agent."""
+
+
+Avatar = TavusAvatar
+"""The avatar a session asks for. One renderer today."""
+
+
 class ExperimentalParams(BaseModel):
     """Unstable session-config knobs nested under
     ``SessionConfig.session.experimental``. Fields here may change
@@ -559,6 +572,10 @@ class ExperimentalParams(BaseModel):
 
     resume_session_id: UUID | None = None
     """When set, the server resumes the named prior session."""
+    avatar: Avatar | None = None
+    """When set, a vendor renderer joins the session and republishes the
+    agent's speech as lip-synced video. Server-gated: a workspace without
+    the avatar flag simply starts without one."""
 
 
 class Say(BaseModel):
@@ -720,6 +737,18 @@ class CosmoVadConfig(BaseModel):
     of the classifier's verdict."""
 
 
+class GeminiToolResponsePolicy(BaseModel):
+    """Whether Gemini waits for a tool and when it responds to its result."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    behavior: Literal["blocking", "non_blocking"]
+    """``blocking`` waits for the result; ``non_blocking`` allows speech while it runs."""
+    scheduling: Literal["when_idle", "silent", "interrupt"] | None = None
+    """Answer when idle, absorb silently, or interrupt speech. Omitted uses
+    ``when_idle`` on Gemini Live; Extended Thinking requires this omitted."""
+
+
 class GeminiModel(BaseModel):
     """The Gemini-realtime provider with its knobs. Assigning this block to
     ``model`` picks the provider; the ``provider`` discriminator makes setting
@@ -734,6 +763,11 @@ class GeminiModel(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    tool_response_policy: GeminiToolResponsePolicy | None = None
+    """Default tool behavior. Omitted keeps tools blocking, except Extended Thinking,
+    which requires non-blocking tools and does not accept scheduling."""
+    tool_response_overrides: dict[str, GeminiToolResponsePolicy] | None = None
+    """Policies keyed by declared tool name, replacing the default for those tools."""
     provider: Literal["gemini"] = "gemini"
     """Names the provider this block configures. Always ``gemini``; the
     SDKs stamp it, so you never write it yourself."""

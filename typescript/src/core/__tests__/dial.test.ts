@@ -59,6 +59,7 @@ function makeFakeTransport(sessionId = 'sess-123'): RealtimeTransport {
     getOutputStream: () => null,
     onOutputStreamChanged: () => () => {},
     attachAudioElement: () => {},
+    attachVideoElement: () => {},
     onMessage: (cb) => {
       messageListeners.add(cb);
       return () => {

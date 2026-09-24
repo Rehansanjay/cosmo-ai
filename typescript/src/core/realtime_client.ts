@@ -1,3 +1,4 @@
+import { resolvePlugins } from './plugins';
 /**
  * ``RealtimeClient`` — instantiable entry point of the Cosmo Realtime SDK.
  *
@@ -340,7 +341,7 @@ export class RealtimeClient {
    *  ``agent.start()``. Fields left unset fall through to the server-side
    *  protocol defaults. */
   agent(config: AgentConfig = {}): RealtimeAgent {
-    return new RealtimeAgent(this, { ...config });
+    return new RealtimeAgent(this, resolvePlugins(config));
   }
 
   /** Build an agent that runs a workspace catalog agent by machine handle;

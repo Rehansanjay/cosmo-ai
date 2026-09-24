@@ -81,3 +81,88 @@ import CosmoRealtimeAPI
         #expect(model.delegation == CosmoRealtimeAPI.Components.Schemas.OpenAILiveDelegation.client)
     }
 }
+
+
+/// GPT Live hands off mid-turn without attaching what the user said.
+@Suite struct BlankHandoffTranscriptTests {
+
+    private func items(_ turns: [(TranscriptRole, String)]) -> [TranscriptItem] {
+        turns.enumerated().map { index, turn in
+            TranscriptItem(id: "t\(index)", role: turn.0, text: turn.1, isFinal: true)
+        }
+    }
+
+    @Test func keepsWhatTheProviderSent() {
+        var resolver = DelegationTranscripts()
+
+        #expect(
+            resolver.resolve(
+                delegationId: "d1",
+                wireTranscript: "where is my order",
+                items: items([(.user, "hi")])
+            ) == "where is my order"
+        )
+    }
+
+    @Test func standsInTheLastUserTurn() {
+        var resolver = DelegationTranscripts()
+        let transcript = items([
+            (.user, "lets begin"), (.assistant, "Question one…"), (.user, "option B"),
+        ])
+
+        #expect(
+            resolver.resolve(delegationId: "d1", wireTranscript: "", items: transcript)
+                == "option B"
+        )
+    }
+
+    @Test func oneHandOffResolvesOnce() {
+        var resolver = DelegationTranscripts()
+        let transcript = items([(.user, "option B")])
+
+        #expect(
+            resolver.resolve(delegationId: "d1", wireTranscript: "", items: transcript)
+                == "option B"
+        )
+        #expect(
+            resolver.resolve(
+                delegationId: "d1",
+                wireTranscript: "",
+                items: transcript + items([(.user, "lock it")])
+            ) == "option B"
+        )
+    }
+
+    @Test func aTurnNeverStandsInTwice() {
+        var resolver = DelegationTranscripts()
+        let transcript = items([(.user, "option B")])
+
+        #expect(
+            resolver.resolve(delegationId: "d1", wireTranscript: "", items: transcript)
+                == "option B"
+        )
+        #expect(resolver.resolve(delegationId: "d2", wireTranscript: "", items: transcript) == "")
+    }
+
+    @Test func neverStandsInATurnTheProviderNamed() {
+        var resolver = DelegationTranscripts()
+        let transcript = items([(.user, "option B")])
+
+        #expect(
+            resolver.resolve(delegationId: "d1", wireTranscript: "option B", items: transcript)
+                == "option B"
+        )
+        #expect(resolver.resolve(delegationId: "d2", wireTranscript: "", items: transcript) == "")
+    }
+
+    @Test func nothingToOfferBeforeTheUserSpoke() {
+        var resolver = DelegationTranscripts()
+
+        #expect(
+            resolver.resolve(
+                delegationId: "d1", wireTranscript: "", items: items([(.assistant, "Welcome!")])
+            ) == ""
+        )
+        #expect(resolver.resolve(delegationId: "d2", wireTranscript: "   ", items: []) == "")
+    }
+}

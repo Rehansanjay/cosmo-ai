@@ -567,6 +567,15 @@ export class RealtimeSession implements AsyncIterable<RealtimeSessionEvent> {
     this.engine.attachAudioElement(el);
   }
 
+  /** Play the session's remote video through a ``<video>`` element you own.
+   *  There is a track to play only when an avatar renderer is speaking for
+   *  the agent; otherwise the element stays empty. Pass ``null`` to detach.
+   *  Idempotent, and callable before or after the session connects. React
+   *  apps get this from ``<RealtimeVideo />``. */
+  attachVideoElement(el: HTMLVideoElement | null): void {
+    this.engine.attachVideoElement(el);
+  }
+
   /** Retry playback after a browser autoplay block. Call it from a user
    *  gesture handler — that is what makes the retry succeed. ``<StartAudio
    *  />`` is the React affordance for this. */
@@ -644,7 +653,12 @@ export class RealtimeSession implements AsyncIterable<RealtimeSessionEvent> {
       });
       return;
     }
-    this.push(decodeStreamEvent(message as WireServerMessage));
+    const decoded = decodeStreamEvent(message as WireServerMessage);
+    this.push(
+      decoded.type === 'delegation_created'
+        ? { ...this.engine.resolveDelegation(decoded), type: 'delegation_created' }
+        : decoded,
+    );
     this.flushTranscriptUpdates();
   }
 

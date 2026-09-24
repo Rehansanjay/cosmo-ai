@@ -228,4 +228,20 @@ describe('session-owned transcript', () => {
       { role: 'assistant', text: 'Goodbye th', isFinal: true },
     ]);
   });
+  it('keeps thinking after an utterance and clears it when model work ends', async () => {
+    const { session, fake } = await startSession();
+    fake.emitMessage({ type: 'bot-started-speaking' });
+    fake.emitMessage(delta('ASSISTANT', 'The lookup is running.', true));
+    fake.emitMessage({ type: 'bot-stopped-speaking' });
+    fake.emitMessage(turnComplete('ASSISTANT'));
+    fake.emitMessage({ type: 'bot-llm-started' });
+    expect(session.getSnapshot().agentState).toBe('thinking');
+    fake.emitMessage({ type: 'bot-llm-stopped' });
+    expect(session.getSnapshot().agentState).toBe('listening');
+    fake.emitMessage({ type: 'bot-started-speaking' });
+    fake.emitMessage({ type: 'bot-llm-stopped' });
+    expect(session.getSnapshot().agentState).toBe('speaking');
+    await session.end();
+  });
+
 });

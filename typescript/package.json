@@ -1,6 +1,6 @@
 {
   "name": "cosmo-ai",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Realtime SDK for voice and multimodal sessions backed by LiveKit and Cosmo \u2014 audio/video streaming, transcript events, tool calls, and React hooks.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",

@@ -1,3 +1,4 @@
+import type { Plugin } from './plugins';
 /**
  * ``RealtimeAgent`` — the reusable persona, and the cross-SDK entry point
  * for opening sessions.
@@ -9,6 +10,7 @@
  */
 
 import type {
+  Avatar,
   InterruptionSensitivity,
   NoiseCancellation,
   EndOfSpeechSensitivity,
@@ -235,6 +237,15 @@ export type CosmoVadConfig = {
   maxHoldMs?: number;
 };
 
+/** Whether Gemini waits for a tool and when it responds to its result. */
+export type GeminiToolResponsePolicy = {
+  /** Blocking waits for a result; non_blocking allows conversation while it runs. */
+  behavior: 'blocking' | 'non_blocking';
+  /** Answer when idle, absorb silently, or interrupt speech. Unset uses when_idle
+   * on Gemini Live; Extended Thinking requires this omitted. */
+  scheduling?: 'when_idle' | 'silent' | 'interrupt';
+};
+
 /** The Gemini-realtime provider with its knobs. Assigning this block to
  *  ``model`` picks the provider; the ``provider`` discriminator makes setting
  *  a Gemini knob for another provider a type error rather than a silent
@@ -247,6 +258,11 @@ export type CosmoVadConfig = {
  *  with the other detector a type error; the server rejects the same pairing
  *  rather than silently ignoring it. */
 export type GeminiModel = {
+  /** Default tool behavior. Unset keeps tools blocking, except Extended Thinking,
+   * which requires non-blocking tools and does not accept scheduling. */
+  toolResponsePolicy?: GeminiToolResponsePolicy;
+  /** Policies keyed by declared tool name, replacing the default for those tools. */
+  toolResponseOverrides?: Record<string, GeminiToolResponsePolicy>;
   /** Names the provider this block configures. Always ``gemini``;
    *  the constructor stamps it, so you never write it yourself. */
   provider: 'gemini';
@@ -508,6 +524,8 @@ export type AudioConfig = {
  *  ``client.catalogAgent(name, {...})`` — this type has no catalog-launch
  *  fields, so the two cannot be mixed. */
 export type AgentConfig = {
+  /** Bundles expanded in order before directly supplied contributions. */
+  plugins?: readonly Plugin[];
   /** System instructions. Replaces the server's neutral default when set. */
   instructions?: string;
   /** What runs on the other end: a family alias or concrete model id (string
@@ -584,6 +602,11 @@ export type SessionStartOptions = {
    *  is still warm, otherwise by seeding the new upstream session with the
    *  prior transcript. */
   resumeSessionId?: string;
+  /** Ask for a video avatar: a renderer joins the session and republishes
+   *  the agent's speech as lip-synced video, which ``<RealtimeVideo />``
+   *  plays. Server-gated — a workspace without the avatar flag runs the
+   *  session without one. */
+  avatar?: Avatar;
   /** Persist this run's recording artifacts (audio/video/transcript/tool
    *  events) server-side. Unset stores as much as the account's consents
    *  allow. The per-artifact options below win over this one. */
@@ -707,6 +730,8 @@ function toWireModel(
         provider: 'gemini',
         ...prune({
           model_id: mo.modelId,
+          tool_response_policy: mo.toolResponsePolicy,
+          tool_response_overrides: mo.toolResponseOverrides,
           temperature: mo.temperature,
           max_output_tokens: mo.maxOutputTokens,
           thinking_level: mo.thinkingLevel,
@@ -896,8 +921,13 @@ export function buildAgentSessionConfig(
     store_transcript: options.storeTranscript,
     store_video: options.storeVideo,
     experimental:
-      options.resumeSessionId !== undefined
-        ? { resume_session_id: options.resumeSessionId }
+      options.resumeSessionId !== undefined || options.avatar !== undefined
+        ? {
+            ...(options.resumeSessionId !== undefined
+              ? { resume_session_id: options.resumeSessionId }
+              : {}),
+            ...(options.avatar !== undefined ? { avatar: options.avatar } : {}),
+          }
         : undefined,
   };
 

@@ -153,6 +153,15 @@ export type CosmoVadConfig = {
     prefix_ms?: number;
 };
 
+/** Whether Gemini waits for a tool and when it responds to its result. */
+export type GeminiToolResponsePolicy = {
+    /** Blocking waits for a result; non_blocking allows conversation while it runs. */
+    behavior: 'blocking' | 'non_blocking';
+    /** Answer when idle, absorb silently, or interrupt speech. Omitted uses
+     * when_idle on Gemini Live; Extended Thinking requires this omitted. */
+    scheduling?: 'when_idle' | 'silent' | 'interrupt';
+};
+
 /**
  * The Gemini-realtime provider with its knobs. Assigning this block to
  * ``model`` picks the provider; the ``provider`` discriminator makes setting
@@ -167,6 +176,10 @@ export type CosmoVadConfig = {
  * at session start rather than silently ignored.
  */
 export type GeminiModel = {
+    /** Default tool behavior. Extended Thinking requires non-blocking without scheduling. */
+    tool_response_policy?: GeminiToolResponsePolicy;
+    /** Policies keyed by declared tool name, replacing the default for those tools. */
+    tool_response_overrides?: { [key: string]: GeminiToolResponsePolicy };
     /**
      * Tuning for the ``cosmo_vad`` detector. Valid only while that detector
      * runs (``turn_detection`` unset or ``cosmo_vad``); sending it alongside
@@ -646,7 +659,30 @@ export type ServerToolSpec = {
  * change shape or disappear between releases. Stable equivalents graduate
  * to top-level ``SessionConfig`` fields.
  */
+export type TavusAvatar = {
+    /**
+     * Which Tavus face renders the agent.
+     */
+    face_id: string;
+    provider: 'tavus';
+};
+
+/**
+ * The avatar a session asks for, discriminated on ``provider``. One member
+ * today; further renderers join the union without a transport change.
+ */
+export type Avatar = TavusAvatar;
+
 export type ExperimentalParams = {
+    /**
+     * When set, a vendor renderer joins the room and republishes the
+     * agent's speech as lip-synced video; the agent then publishes no audio
+     * of its own. Refused, and the session starts without one, unless the
+     * workspace has the avatar flag on.
+     */
+    avatar?: {
+        provider?: 'tavus';
+    } & TavusAvatar;
     /**
      * When set, the server resumes the named prior session — natively when
      * a resumption handle is still warm, otherwise by seeding the new

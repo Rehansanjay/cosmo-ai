@@ -479,6 +479,47 @@ public struct CosmoVadConfig: Sendable, Equatable {
     }
 }
 
+/// Whether Gemini waits for a tool and when it responds to its result.
+public struct GeminiToolResponsePolicy: Sendable, Equatable {
+    /// Whether the conversation waits for a result.
+    public enum Behavior: String, Sendable {
+        /// Wait for the tool result before continuing.
+        case blocking
+        /// Allow conversation while the tool runs.
+        case nonBlocking = "non_blocking"
+    }
+    /// When Gemini responds to a non-blocking result.
+    public enum Scheduling: String, Sendable {
+        /// Respond after the current speech finishes.
+        case whenIdle = "when_idle"
+        /// Absorb the result without speaking.
+        case silent
+        /// Interrupt current speech to respond.
+        case interrupt
+    }
+    /// Whether the conversation waits for the result.
+    public var behavior: Behavior
+    /// Omitted uses whenIdle on Gemini Live. Extended Thinking requires nil.
+    public var scheduling: Scheduling?
+
+    /// Choose tool behavior and optional result scheduling.
+    public init(behavior: Behavior, scheduling: Scheduling? = nil) {
+        self.behavior = behavior
+        self.scheduling = scheduling
+    }
+
+    var wire: CosmoRealtimeAPI.Components.Schemas.GeminiToolResponsePolicy {
+        .init(behavior: behavior == .blocking ? .blocking : .nonBlocking,
+              scheduling: scheduling.map {
+                  switch $0 {
+                  case .whenIdle: return .whenIdle
+                  case .silent: return .silent
+                  case .interrupt: return .interrupt
+                  }
+              })
+    }
+}
+
 /// Gemini realtime: the concrete model and the knobs Gemini reads. Build
 /// one for ``RealtimeModel/gemini(_:)``.
 public struct GeminiModel: Sendable, Equatable {
@@ -505,6 +546,10 @@ public struct GeminiModel: Sendable, Equatable {
         }
     }
 
+    /// Default tool behavior. Extended Thinking requires non-blocking without scheduling.
+    public var toolResponsePolicy: GeminiToolResponsePolicy?
+    /// Policies keyed by declared tool name, replacing the default for those tools.
+    public var toolResponseOverrides: [String: GeminiToolResponsePolicy]?
     /// Concrete Gemini model to run. ``nil`` runs the provider default. A
     /// model id that is not a Gemini model is rejected at session start.
     public var modelId: String?
@@ -552,7 +597,9 @@ public struct GeminiModel: Sendable, Equatable {
         endOfSpeechSensitivity: EndOfSpeechSensitivity? = nil,
         silenceDurationMs: Int? = nil,
         prefixPaddingMs: Int? = nil,
-        cosmoVad: CosmoVadConfig? = nil
+        cosmoVad: CosmoVadConfig? = nil,
+        toolResponsePolicy: GeminiToolResponsePolicy? = nil,
+        toolResponseOverrides: [String: GeminiToolResponsePolicy]? = nil
     ) {
         self.modelId = modelId
         self.temperature = temperature
@@ -564,6 +611,8 @@ public struct GeminiModel: Sendable, Equatable {
         self.silenceDurationMs = silenceDurationMs
         self.prefixPaddingMs = prefixPaddingMs
         self.cosmoVad = cosmoVad
+        self.toolResponsePolicy = toolResponsePolicy
+        self.toolResponseOverrides = toolResponseOverrides
     }
 
     var wire: CosmoRealtimeAPI.Components.Schemas.GeminiModel {
@@ -578,6 +627,8 @@ public struct GeminiModel: Sendable, Equatable {
             silenceDurationMs: silenceDurationMs,
             temperature: temperature,
             thinkingLevel: thinkingLevel.map { .init($0) },
+            toolResponseOverrides: toolResponseOverrides.map { .init(additionalProperties: $0.mapValues(\.wire)) },
+            toolResponsePolicy: toolResponsePolicy?.wire,
             turnDetection: turnDetection?.wire
         )
     }

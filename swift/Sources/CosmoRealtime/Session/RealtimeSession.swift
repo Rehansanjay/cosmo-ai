@@ -211,6 +211,7 @@ public actor RealtimeSession {
     /// turn-complete streams. Survives teardown so ``transcript`` stays
     /// readable after the session ends.
     private var transcriptStore = TranscriptStore()
+    private var delegationTranscripts = DelegationTranscripts()
 
     /// The coalesced conversation so far — one item per turn, folded by
     /// the session from its own transcript stream.
@@ -1103,6 +1104,7 @@ public actor RealtimeSession {
             _armServerEndGrace()
         case .event(let event):
             var transcriptChanged = false
+            var emitted = event
             switch event {
             case .ready(let ready):
                 // ``ready`` arrives on two channels — the agent's participant
@@ -1146,10 +1148,18 @@ public actor RealtimeSession {
                 )
             case .turnComplete(let complete):
                 transcriptChanged = transcriptStore.applyTurnComplete(role: complete.role)
+            case .delegationCreated(let handoff):
+                var filled = handoff
+                filled.transcript = delegationTranscripts.resolve(
+                    delegationId: handoff.delegationId,
+                    wireTranscript: handoff.transcript,
+                    items: transcriptStore.current
+                )
+                emitted = .delegationCreated(filled)
             default:
                 break
             }
-            eventsContinuation.yield(event)
+            eventsContinuation.yield(emitted)
             if transcriptChanged {
                 eventsContinuation.yield(
                     .transcriptUpdated(TranscriptUpdatedEvent(items: transcriptStore.current))

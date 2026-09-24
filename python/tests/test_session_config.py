@@ -15,6 +15,7 @@ from cosmo_ai import (
     RealtimeClient,
     CosmoVadConfig,
     GeminiModel,
+    GeminiToolResponsePolicy,
     GrokModel,
     OpenAIModel,
 )
@@ -311,3 +312,21 @@ def test_background_client_tool_requires_a_handler() -> None:
             description="Long export.",
             parameters={"type": "object", "properties": {}},
         )  # type: ignore[call-arg]
+
+
+def test_gemini_tool_policies_serialize_with_overrides() -> None:
+    body = start_body(model=GeminiModel(
+        model_id="gemini-3.8-live",
+        tool_response_policy=GeminiToolResponsePolicy(behavior="blocking"),
+        tool_response_overrides={"lookup": GeminiToolResponsePolicy(
+            behavior="non_blocking", scheduling="when_idle"
+        )},
+    ))
+    model = body["agent"]["model"]
+    assert model["tool_response_policy"] == {"behavior": "blocking"}
+    assert model["tool_response_overrides"] == {
+        "lookup": {"behavior": "non_blocking", "scheduling": "when_idle"}
+    }
+    default = start_body(model=GeminiModel())["agent"]["model"]
+    assert "tool_response_policy" not in default
+    assert "tool_response_overrides" not in default

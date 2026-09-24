@@ -379,6 +379,21 @@ describe('parity primitives on the session-config body', () => {
     });
   });
 
+  it('serializes Gemini response policies and per-tool overrides', async () => {
+    const fake = makeFakeTransport();
+    const client = new RealtimeClient({ apiKey: 'test-key', transportFactory: () => fake });
+    await client.agent({ model: GeminiModel({
+      modelId: 'gemini-3.8-live',
+      toolResponsePolicy: { behavior: 'blocking' },
+      toolResponseOverrides: { lookup: { behavior: 'non_blocking', scheduling: 'when_idle' } },
+    }) }).start();
+    expect(inlineAgent(fake.lastConfig())?.model).toEqual({
+      provider: 'gemini', model_id: 'gemini-3.8-live',
+      tool_response_policy: { behavior: 'blocking' },
+      tool_response_overrides: { lookup: { behavior: 'non_blocking', scheduling: 'when_idle' } },
+    });
+  });
+
   it('the block constructors stamp the provider tag the caller never types', async () => {
     expect(GeminiModel()).toEqual({ provider: 'gemini' });
     expect(OpenAIModel({ turnDetection: 'semantic_vad', eagerness: 'high' })).toEqual({

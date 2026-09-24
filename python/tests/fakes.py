@@ -240,6 +240,7 @@ _PERSONA_KEYS = frozenset(
         "greeting",
         "audio",
         "skills",
+        "plugins",
         "hooks",
     }
 )

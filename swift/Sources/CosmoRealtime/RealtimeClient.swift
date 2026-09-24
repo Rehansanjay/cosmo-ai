@@ -232,6 +232,7 @@ public struct RealtimeClient: Sendable {
     /// An inline agent: the persona configured field by field, independent
     /// of any one run. Throws on duplicate skill names — when the agent is
     /// built, not mid-call.
+    /// - Parameter plugins: Bundles expanded in order before direct contributions.
     public func agent(
         instructions: String? = nil,
         model: RealtimeModel? = nil,
@@ -242,20 +243,26 @@ public struct RealtimeClient: Sendable {
         greeting: String? = nil,
         skills: [Skill]? = nil,
         mcp: [McpStdioServer]? = nil,
-        hooks: [Hook]? = nil
+        hooks: [Hook]? = nil,
+        plugins: [Plugin] = []
     ) throws -> RealtimeAgent {
-        RealtimeAgent(
+        let resolvedSkills = try skills.map(resolveSkills)
+        let combined = plugins.isEmpty ? nil : try resolvePlugins(plugins, direct: Plugin(
+            name: "agent", instructions: instructions, skills: resolvedSkills ?? [],
+            tools: tools, hooks: hooks ?? []
+        ))
+        return RealtimeAgent(
             client: self,
-            instructions: instructions,
+            instructions: combined?.instructions ?? instructions,
             model: model,
             voice: voice,
             audio: audio,
-            tools: tools,
+            tools: combined?.tools ?? tools,
             interruptionSensitivity: interruptionSensitivity,
             greeting: greeting,
-            skills: try skills.map(resolveSkills),
+            skills: combined?.skills ?? resolvedSkills,
             mcp: try mcp.map(resolveMcpServers),
-            hooks: hooks
+            hooks: combined?.hooks ?? hooks
         )
     }
 

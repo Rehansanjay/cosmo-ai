@@ -116,6 +116,7 @@ from cosmo_ai._internal.protocol import (
     UnknownEvent,
     ScreenLocateTool,
 )
+from cosmo_ai.session._delegation import DelegationTranscripts
 from cosmo_ai.session._transcript import TranscriptStore
 
 logger: structlog.stdlib.BoundLogger = get_logger(__name__)
@@ -366,6 +367,7 @@ class RealtimeSession:
         # turn-complete streams. Survives teardown so ``transcript`` stays
         # readable after the session ends.
         self._transcript = TranscriptStore()
+        self._delegations = DelegationTranscripts()
 
     # ── Public surface ─────────────────────────────────────────────
 
@@ -1767,6 +1769,14 @@ class RealtimeSession:
         # Fold into the session-owned transcript before the event is
         # enqueued, so a consumer reading ``transcript`` on any event always
         # sees that event applied.
+        if isinstance(event, DelegationCreatedEvent):
+            event = event.model_copy(
+                update={
+                    "transcript": self._delegations.resolve(
+                        event.delegation_id, event.transcript, self._transcript.current
+                    )
+                }
+            )
         transcript_changed = False
         if isinstance(event, TranscriptDeltaEvent):
             transcript_changed = self._transcript.apply_delta(

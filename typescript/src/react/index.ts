@@ -34,6 +34,7 @@ export type {
 } from './use_realtime_session';
 
 export { RealtimeAudio } from './components/RealtimeAudio';
+export { RealtimeVideo } from './components/RealtimeVideo';
 export { MicToggle } from './components/MicToggle';
 export { BarVisualizer } from './components/BarVisualizer';
 export { StartAudio } from './components/StartAudio';

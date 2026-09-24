@@ -824,6 +824,20 @@
         "additionalProperties": false,
         "description": "Unstable session-config knobs.\n\nFields here are experimental: unlike the rest of the protocol they may\nchange shape or disappear between releases. Stable equivalents graduate\nto top-level ``SessionConfig`` fields.",
         "properties": {
+          "avatar": {
+            "description": "When set, a vendor renderer joins the room and republishes the\nagent's speech as lip-synced video; the agent then publishes no audio\nof its own. Refused, and the session starts without one, unless the\nworkspace has the avatar flag on.",
+            "discriminator": {
+              "mapping": {
+                "tavus": "#/components/schemas/TavusAvatar"
+              },
+              "propertyName": "provider"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TavusAvatar"
+              }
+            ]
+          },
           "resume_session_id": {
             "description": "When set, the server resumes the named prior session \u2014 natively when\na resumption handle is still warm, otherwise by seeding the new\nupstream session with the prior transcript. The server picks between\nthe two; clients just pass the id.",
             "format": "uuid",
@@ -918,6 +932,17 @@
             "$ref": "#/components/schemas/ThinkingLevel",
             "description": "Reasoning depth. ``None`` keeps the server's per-mode default."
           },
+          "tool_response_overrides": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/GeminiToolResponsePolicy"
+            },
+            "description": "Response policies keyed by declared tool name, replacing the default for those tools.\nUse blocking overrides for actions whose result must precede further speech.",
+            "type": "object"
+          },
+          "tool_response_policy": {
+            "$ref": "#/components/schemas/GeminiToolResponsePolicy",
+            "description": "Default tool behavior. Omitted keeps tools blocking, except Extended Thinking,\nwhich requires non-blocking tools and does not accept scheduling."
+          },
           "turn_detection": {
             "$ref": "#/components/schemas/TurnDetectionMode",
             "description": "Which end-of-turn detector runs. ``None`` (the default) and\n``cosmo_vad`` run Cosmo's semantic turn detection, which classifies\nwhether the utterance reads as finished instead of timing a silence\nwindow \u2014 a mid-thought pause no longer ends the turn. ``server_vad``\nopts the session into the provider's own silence-window detection,\nwhich is what the three knobs below tune; they are unread under the\ndefault detector. ``semantic_vad`` is OpenAI-only and rejected."
@@ -927,6 +952,34 @@
           "provider"
         ],
         "title": "GeminiModel",
+        "type": "object"
+      },
+      "GeminiToolResponsePolicy": {
+        "additionalProperties": false,
+        "description": "Whether Gemini waits for a tool and when it responds to its result.",
+        "properties": {
+          "behavior": {
+            "description": "``blocking`` waits for the result; ``non_blocking`` allows speech while it runs.",
+            "enum": [
+              "blocking",
+              "non_blocking"
+            ],
+            "type": "string"
+          },
+          "scheduling": {
+            "description": "For non-blocking tools: answer when idle, absorb silently, or interrupt speech.\nOmitted uses ``when_idle`` on Gemini Live and model scheduling on Extended Thinking.",
+            "enum": [
+              "when_idle",
+              "silent",
+              "interrupt"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "behavior"
+        ],
+        "title": "GeminiToolResponsePolicy",
         "type": "object"
       },
       "GrokModel": {
@@ -2506,6 +2559,27 @@
           "kind"
         ],
         "title": "SpeakerLogToolSpec",
+        "type": "object"
+      },
+      "TavusAvatar": {
+        "additionalProperties": false,
+        "description": "A Tavus renderer for the agent's video avatar.",
+        "properties": {
+          "face_id": {
+            "description": "Which Tavus face renders the agent.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "provider": {
+            "const": "tavus",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "face_id"
+        ],
+        "title": "TavusAvatar",
         "type": "object"
       },
       "ThinkingLevel": {

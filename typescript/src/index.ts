@@ -33,6 +33,7 @@ export type {
   ClientToolHandler,
   CatalogAgentOptions,
   CosmoVadConfig,
+  GeminiToolResponsePolicy,
   RealtimeModel,
   RealtimeModelBlock,
   SessionStartOptions,
@@ -261,3 +262,6 @@ export {
   NATURALNESS_RUNGS,
   NATURALNESS_VERSION,
 } from './presets';
+
+export { PluginError } from './core/plugins';
+export type { Plugin, PluginErrorCode } from './core/plugins';

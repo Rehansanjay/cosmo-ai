@@ -431,6 +431,27 @@ describe('send wire shapes', () => {
     expect(events).toEqual([{ delegationId: 'item_1', transcript: 'where is my order' }]);
   });
 
+  it('a hand-off that carried nothing arrives with the last user turn', async () => {
+    const { session, fake } = await startSession();
+    const events: { transcript: string }[] = [];
+    const streamed: string[] = [];
+    session.on('delegation_created', (e) => events.push(e));
+    void (async () => {
+      for await (const event of session)
+        if (event.type === 'delegation_created') streamed.push(event.transcript);
+    })();
+
+    fake.emitMessage({ type: 'transcript', role: 'USER', text: 'option B', is_final: true });
+    fake.emitMessage({ type: 'delegation-created', delegation_id: 'item_1', transcript: '' });
+    fake.emitMessage({ type: 'delegation-created', delegation_id: 'item_2', transcript: '' });
+    await flushMicrotasks();
+
+    // The stream and the callback see one answer per hand-off, and the turn
+    // that stood in for the first does not stand in again for the second.
+    expect(events.map((e) => e.transcript)).toEqual(['option B', '']);
+    expect(streamed).toEqual(['option B', '']);
+  });
+
   it('sendText with transcript:false publishes the turn without echoing it locally', async () => {
     const { session, fake } = await startSession();
     const echoed: string[] = [];

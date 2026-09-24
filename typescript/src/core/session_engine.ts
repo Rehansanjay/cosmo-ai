@@ -55,8 +55,10 @@ import {
 } from '../transport/session_start_error';
 import { computeVisionInputStatus } from './vision_input_status';
 
+import { DelegationTranscripts } from './delegation_transcript';
 import {
   RealtimeEventEmitter,
+  type DelegationCreatedEvent,
   type UserSpeechTimeoutEvent,
   type RealtimeEventMap,
   type RealtimeEventName,
@@ -241,6 +243,7 @@ export class SessionEngine {
   /** SessionEnd fires exactly once per session, whatever exit path runs first. */
   private sessionEndFired = false;
   private hostAudioElement: HTMLAudioElement | null = null;
+  private hostVideoElement: HTMLVideoElement | null = null;
   // Stashed from the session-start POST so consumers can read it before
   // ``ready`` lands — see ``onSessionStarted`` below for why that matters on
   // outbound-phone sessions.
@@ -272,6 +275,7 @@ export class SessionEngine {
    *  turn-complete streams. Survives teardown so ``transcript`` stays
    *  readable after the session ends. */
   private readonly transcriptStore = new TranscriptStore();
+  private readonly delegationTranscripts = new DelegationTranscripts();
   /** Last ``ready`` payload of the current session, replayed to late
    *  subscribers — ``ready`` can fire before ``agent.start()`` resolves. */
   private lastReadyEvent: RealtimeEventMap['ready'] | null = null;
@@ -353,6 +357,20 @@ export class SessionEngine {
 
   getTranscript(): readonly TranscriptItem[] {
     return this.transcriptStore.current;
+  }
+
+  /** The hand-off, with the session's last user turn standing in when the
+   *  provider attached none. Resolving twice for one hand-off returns the
+   *  first answer, so the callback and the stream agree. */
+  resolveDelegation(event: DelegationCreatedEvent): DelegationCreatedEvent {
+    return {
+      ...event,
+      transcript: this.delegationTranscripts.resolve(
+        event.delegationId,
+        event.transcript,
+        this.transcriptStore.current,
+      ),
+    };
   }
 
   on<E extends RealtimeEventName>(
@@ -466,6 +484,7 @@ export class SessionEngine {
 
     try {
       const local = this.context.createTransport();
+      if (this.hostVideoElement) local.attachVideoElement?.(this.hostVideoElement);
       if (this.hostAudioElement) {
         local.attachAudioElement(this.hostAudioElement);
       }
@@ -1002,6 +1021,14 @@ export class SessionEngine {
     this.connection?.attachAudioElement(el);
   }
 
+  /** Play the session's remote video — an avatar renderer speaking for the
+   *  agent — through ``el``. Pass ``null`` to detach. Idempotent; a session
+   *  without a renderer simply never has a track to play. */
+  attachVideoElement(el: HTMLVideoElement | null): void {
+    this.hostVideoElement = el;
+    this.connection?.attachVideoElement?.(el);
+  }
+
   /** Register a transport-level RPC method handler the server invokes via
    *  LiveKit ``perform_rpc`` for client-tool execution. Forwarded to the
    *  active transport; throws if no session is connected.
@@ -1530,6 +1557,8 @@ export class SessionEngine {
         }
         return;
       case 'bot-llm-stopped':
+        if (this.snapshot.agentState === 'thinking') this.setAgentState('listening');
+        return;
       case 'bot-tts-started':
       case 'bot-tts-stopped':
         return;
@@ -1546,7 +1575,10 @@ export class SessionEngine {
         return;
       }
       case 'delegation-created': {
-        this.emitter.emit('delegation_created', decode.delegationCreatedEvent(message));
+        this.emitter.emit(
+          'delegation_created',
+          this.resolveDelegation(decode.delegationCreatedEvent(message)),
+        );
         return;
       }
       case 'pong':

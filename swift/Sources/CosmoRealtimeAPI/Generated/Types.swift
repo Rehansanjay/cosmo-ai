@@ -2272,6 +2272,49 @@ public enum Components {
         ///
         /// - Remark: Generated from `#/components/schemas/ExperimentalParams`.
         public struct ExperimentalParams: Codable, Hashable, Sendable {
+            /// When set, a vendor renderer joins the room and republishes the
+            /// agent's speech as lip-synced video; the agent then publishes no audio
+            /// of its own. Refused, and the session starts without one, unless the
+            /// workspace has the avatar flag on.
+            ///
+            /// - Remark: Generated from `#/components/schemas/ExperimentalParams/avatar`.
+            @frozen public enum AvatarPayload: Codable, Hashable, Sendable {
+                /// - Remark: Generated from `#/components/schemas/ExperimentalParams/avatar/TavusAvatar`.
+                case tavus(Components.Schemas.TavusAvatar)
+                public enum CodingKeys: String, CodingKey {
+                    case provider
+                }
+                public init(from decoder: any Swift.Decoder) throws {
+                    let container = try decoder.container(keyedBy: CodingKeys.self)
+                    let discriminator = try container.decode(
+                        Swift.String.self,
+                        forKey: .provider
+                    )
+                    switch discriminator {
+                    case "tavus":
+                        self = .tavus(try .init(from: decoder))
+                    default:
+                        throw Swift.DecodingError.unknownOneOfDiscriminator(
+                            discriminatorKey: CodingKeys.provider,
+                            discriminatorValue: discriminator,
+                            codingPath: decoder.codingPath
+                        )
+                    }
+                }
+                public func encode(to encoder: any Swift.Encoder) throws {
+                    switch self {
+                    case let .tavus(value):
+                        try value.encode(to: encoder)
+                    }
+                }
+            }
+            /// When set, a vendor renderer joins the room and republishes the
+            /// agent's speech as lip-synced video; the agent then publishes no audio
+            /// of its own. Refused, and the session starts without one, unless the
+            /// workspace has the avatar flag on.
+            ///
+            /// - Remark: Generated from `#/components/schemas/ExperimentalParams/avatar`.
+            public var avatar: Components.Schemas.ExperimentalParams.AvatarPayload?
             /// When set, the server resumes the named prior session — natively when
             /// a resumption handle is still warm, otherwise by seeding the new
             /// upstream session with the prior transcript. The server picks between
@@ -2282,20 +2325,31 @@ public enum Components {
             /// Creates a new `ExperimentalParams`.
             ///
             /// - Parameters:
+            ///   - avatar: When set, a vendor renderer joins the room and republishes the
             ///   - resumeSessionId: When set, the server resumes the named prior session — natively when
-            public init(resumeSessionId: Swift.String? = nil) {
+            public init(
+                avatar: Components.Schemas.ExperimentalParams.AvatarPayload? = nil,
+                resumeSessionId: Swift.String? = nil
+            ) {
+                self.avatar = avatar
                 self.resumeSessionId = resumeSessionId
             }
             public enum CodingKeys: String, CodingKey {
+                case avatar
                 case resumeSessionId = "resume_session_id"
             }
             public init(from decoder: any Swift.Decoder) throws {
                 let container = try decoder.container(keyedBy: CodingKeys.self)
+                self.avatar = try container.decodeIfPresent(
+                    Components.Schemas.ExperimentalParams.AvatarPayload.self,
+                    forKey: .avatar
+                )
                 self.resumeSessionId = try container.decodeIfPresent(
                     Swift.String.self,
                     forKey: .resumeSessionId
                 )
                 try decoder.ensureNoAdditionalProperties(knownKeys: [
+                    "avatar",
                     "resume_session_id"
                 ])
             }
@@ -2467,6 +2521,37 @@ public enum Components {
             ///
             /// - Remark: Generated from `#/components/schemas/GeminiModel/thinking_level`.
             public var thinkingLevel: Components.Schemas.ThinkingLevel?
+            /// Response policies keyed by declared tool name, replacing the default for those tools.
+            /// Use blocking overrides for actions whose result must precede further speech.
+            ///
+            /// - Remark: Generated from `#/components/schemas/GeminiModel/tool_response_overrides`.
+            public struct ToolResponseOverridesPayload: Codable, Hashable, Sendable {
+                /// A container of undocumented properties.
+                public var additionalProperties: [String: Components.Schemas.GeminiToolResponsePolicy]
+                /// Creates a new `ToolResponseOverridesPayload`.
+                ///
+                /// - Parameters:
+                ///   - additionalProperties: A container of undocumented properties.
+                public init(additionalProperties: [String: Components.Schemas.GeminiToolResponsePolicy] = .init()) {
+                    self.additionalProperties = additionalProperties
+                }
+                public init(from decoder: any Swift.Decoder) throws {
+                    additionalProperties = try decoder.decodeAdditionalProperties(knownKeys: [])
+                }
+                public func encode(to encoder: any Swift.Encoder) throws {
+                    try encoder.encodeAdditionalProperties(additionalProperties)
+                }
+            }
+            /// Response policies keyed by declared tool name, replacing the default for those tools.
+            /// Use blocking overrides for actions whose result must precede further speech.
+            ///
+            /// - Remark: Generated from `#/components/schemas/GeminiModel/tool_response_overrides`.
+            public var toolResponseOverrides: Components.Schemas.GeminiModel.ToolResponseOverridesPayload?
+            /// Default tool behavior. Omitted keeps tools blocking, except Extended Thinking,
+            /// which requires non-blocking tools and does not accept scheduling.
+            ///
+            /// - Remark: Generated from `#/components/schemas/GeminiModel/tool_response_policy`.
+            public var toolResponsePolicy: Components.Schemas.GeminiToolResponsePolicy?
             /// Which end-of-turn detector runs. ``None`` (the default) and
             /// ``cosmo_vad`` run Cosmo's semantic turn detection, which classifies
             /// whether the utterance reads as finished instead of timing a silence
@@ -2490,6 +2575,8 @@ public enum Components {
             ///   - silenceDurationMs: Silence, in milliseconds, that ends the user's turn. Lower shortens the
             ///   - temperature: Sampling temperature — higher is more varied, lower more deterministic.
             ///   - thinkingLevel: Reasoning depth. ``None`` keeps the server's per-mode default.
+            ///   - toolResponseOverrides: Response policies keyed by declared tool name, replacing the default for those tools.
+            ///   - toolResponsePolicy: Default tool behavior. Omitted keeps tools blocking, except Extended Thinking,
             ///   - turnDetection: Which end-of-turn detector runs. ``None`` (the default) and
             public init(
                 cosmoVad: Components.Schemas.CosmoVadConfig? = nil,
@@ -2502,6 +2589,8 @@ public enum Components {
                 silenceDurationMs: Swift.Int? = nil,
                 temperature: Swift.Double? = nil,
                 thinkingLevel: Components.Schemas.ThinkingLevel? = nil,
+                toolResponseOverrides: Components.Schemas.GeminiModel.ToolResponseOverridesPayload? = nil,
+                toolResponsePolicy: Components.Schemas.GeminiToolResponsePolicy? = nil,
                 turnDetection: Components.Schemas.TurnDetectionMode? = nil
             ) {
                 self.cosmoVad = cosmoVad
@@ -2514,6 +2603,8 @@ public enum Components {
                 self.silenceDurationMs = silenceDurationMs
                 self.temperature = temperature
                 self.thinkingLevel = thinkingLevel
+                self.toolResponseOverrides = toolResponseOverrides
+                self.toolResponsePolicy = toolResponsePolicy
                 self.turnDetection = turnDetection
             }
             public enum CodingKeys: String, CodingKey {
@@ -2527,6 +2618,8 @@ public enum Components {
                 case silenceDurationMs = "silence_duration_ms"
                 case temperature
                 case thinkingLevel = "thinking_level"
+                case toolResponseOverrides = "tool_response_overrides"
+                case toolResponsePolicy = "tool_response_policy"
                 case turnDetection = "turn_detection"
             }
             public init(from decoder: any Swift.Decoder) throws {
@@ -2571,6 +2664,14 @@ public enum Components {
                     Components.Schemas.ThinkingLevel.self,
                     forKey: .thinkingLevel
                 )
+                self.toolResponseOverrides = try container.decodeIfPresent(
+                    Components.Schemas.GeminiModel.ToolResponseOverridesPayload.self,
+                    forKey: .toolResponseOverrides
+                )
+                self.toolResponsePolicy = try container.decodeIfPresent(
+                    Components.Schemas.GeminiToolResponsePolicy.self,
+                    forKey: .toolResponsePolicy
+                )
                 self.turnDetection = try container.decodeIfPresent(
                     Components.Schemas.TurnDetectionMode.self,
                     forKey: .turnDetection
@@ -2586,7 +2687,70 @@ public enum Components {
                     "silence_duration_ms",
                     "temperature",
                     "thinking_level",
+                    "tool_response_overrides",
+                    "tool_response_policy",
                     "turn_detection"
+                ])
+            }
+        }
+        /// Whether Gemini waits for a tool and when it responds to its result.
+        ///
+        /// - Remark: Generated from `#/components/schemas/GeminiToolResponsePolicy`.
+        public struct GeminiToolResponsePolicy: Codable, Hashable, Sendable {
+            /// ``blocking`` waits for the result; ``non_blocking`` allows speech while it runs.
+            ///
+            /// - Remark: Generated from `#/components/schemas/GeminiToolResponsePolicy/behavior`.
+            @frozen public enum BehaviorPayload: String, Codable, Hashable, Sendable, CaseIterable {
+                case blocking = "blocking"
+                case nonBlocking = "non_blocking"
+            }
+            /// ``blocking`` waits for the result; ``non_blocking`` allows speech while it runs.
+            ///
+            /// - Remark: Generated from `#/components/schemas/GeminiToolResponsePolicy/behavior`.
+            public var behavior: Components.Schemas.GeminiToolResponsePolicy.BehaviorPayload
+            /// For non-blocking tools: answer when idle, absorb silently, or interrupt speech.
+            /// Omitted uses ``when_idle`` on Gemini Live and model scheduling on Extended Thinking.
+            ///
+            /// - Remark: Generated from `#/components/schemas/GeminiToolResponsePolicy/scheduling`.
+            @frozen public enum SchedulingPayload: String, Codable, Hashable, Sendable, CaseIterable {
+                case whenIdle = "when_idle"
+                case silent = "silent"
+                case interrupt = "interrupt"
+            }
+            /// For non-blocking tools: answer when idle, absorb silently, or interrupt speech.
+            /// Omitted uses ``when_idle`` on Gemini Live and model scheduling on Extended Thinking.
+            ///
+            /// - Remark: Generated from `#/components/schemas/GeminiToolResponsePolicy/scheduling`.
+            public var scheduling: Components.Schemas.GeminiToolResponsePolicy.SchedulingPayload?
+            /// Creates a new `GeminiToolResponsePolicy`.
+            ///
+            /// - Parameters:
+            ///   - behavior: ``blocking`` waits for the result; ``non_blocking`` allows speech while it runs.
+            ///   - scheduling: For non-blocking tools: answer when idle, absorb silently, or interrupt speech.
+            public init(
+                behavior: Components.Schemas.GeminiToolResponsePolicy.BehaviorPayload,
+                scheduling: Components.Schemas.GeminiToolResponsePolicy.SchedulingPayload? = nil
+            ) {
+                self.behavior = behavior
+                self.scheduling = scheduling
+            }
+            public enum CodingKeys: String, CodingKey {
+                case behavior
+                case scheduling
+            }
+            public init(from decoder: any Swift.Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                self.behavior = try container.decode(
+                    Components.Schemas.GeminiToolResponsePolicy.BehaviorPayload.self,
+                    forKey: .behavior
+                )
+                self.scheduling = try container.decodeIfPresent(
+                    Components.Schemas.GeminiToolResponsePolicy.SchedulingPayload.self,
+                    forKey: .scheduling
+                )
+                try decoder.ensureNoAdditionalProperties(knownKeys: [
+                    "behavior",
+                    "scheduling"
                 ])
             }
         }
@@ -5987,6 +6151,52 @@ public enum Components {
                 )
                 try decoder.ensureNoAdditionalProperties(knownKeys: [
                     "kind"
+                ])
+            }
+        }
+        /// A Tavus renderer for the agent's video avatar.
+        ///
+        /// - Remark: Generated from `#/components/schemas/TavusAvatar`.
+        public struct TavusAvatar: Codable, Hashable, Sendable {
+            /// Which Tavus face renders the agent.
+            ///
+            /// - Remark: Generated from `#/components/schemas/TavusAvatar/face_id`.
+            public var faceId: Swift.String
+            /// - Remark: Generated from `#/components/schemas/TavusAvatar/provider`.
+            @frozen public enum ProviderPayload: String, Codable, Hashable, Sendable, CaseIterable {
+                case tavus = "tavus"
+            }
+            /// - Remark: Generated from `#/components/schemas/TavusAvatar/provider`.
+            public var provider: Components.Schemas.TavusAvatar.ProviderPayload
+            /// Creates a new `TavusAvatar`.
+            ///
+            /// - Parameters:
+            ///   - faceId: Which Tavus face renders the agent.
+            ///   - provider:
+            public init(
+                faceId: Swift.String,
+                provider: Components.Schemas.TavusAvatar.ProviderPayload
+            ) {
+                self.faceId = faceId
+                self.provider = provider
+            }
+            public enum CodingKeys: String, CodingKey {
+                case faceId = "face_id"
+                case provider
+            }
+            public init(from decoder: any Swift.Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                self.faceId = try container.decode(
+                    Swift.String.self,
+                    forKey: .faceId
+                )
+                self.provider = try container.decode(
+                    Components.Schemas.TavusAvatar.ProviderPayload.self,
+                    forKey: .provider
+                )
+                try decoder.ensureNoAdditionalProperties(knownKeys: [
+                    "face_id",
+                    "provider"
                 ])
             }
         }

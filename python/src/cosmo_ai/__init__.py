@@ -13,6 +13,7 @@ from cosmo_ai._internal.protocol import (
     DelegationCreatedEvent,
     DialResult,
     GeminiModel,
+    GeminiToolResponsePolicy,
     GrokModel,
     InterruptionSensitivity,
     MintedToken,
@@ -98,6 +99,7 @@ from cosmo_ai.errors import (
     VerifyErrorCode,
     SessionStateError,
 )
+from cosmo_ai.plugins import Plugin, PluginError, PluginErrorCode
 from cosmo_ai.session import (
     DisconnectReason,
     RealtimeSession,
@@ -118,6 +120,9 @@ from cosmo_ai.tools import (
 )
 
 __all__ = [
+    "Plugin",
+    "PluginError",
+    "PluginErrorCode",
     "AgentTool",
     "detect_objects_tool",
     "end_call_tool",
@@ -151,6 +156,7 @@ __all__ = [
     "ErrorCode",
     "ErrorEvent",
     "GeminiModel",
+    "GeminiToolResponsePolicy",
     "GrokModel",
     "InterruptionSensitivity",
     "MicrophoneCapture",

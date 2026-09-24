@@ -742,6 +742,15 @@ export type ExamineImageToolSpec = {
  */
 export type ExperimentalParams = {
     /**
+     * When set, a vendor renderer joins the room and republishes the
+     * agent's speech as lip-synced video; the agent then publishes no audio
+     * of its own. Refused, and the session starts without one, unless the
+     * workspace has the avatar flag on.
+     */
+    avatar?: {
+        provider?: 'tavus';
+    } & TavusAvatar;
+    /**
      * When set, the server resumes the named prior session — natively when
      * a resumption handle is still warm, otherwise by seeding the new
      * upstream session with the prior transcript. The server picks between
@@ -841,6 +850,18 @@ export type GeminiModel = {
      */
     thinking_level?: ThinkingLevel;
     /**
+     * Response policies keyed by declared tool name, replacing the default for those tools.
+     * Use blocking overrides for actions whose result must precede further speech.
+     */
+    tool_response_overrides?: {
+        [key: string]: GeminiToolResponsePolicy;
+    };
+    /**
+     * Default tool behavior. Omitted keeps tools blocking, except Extended Thinking,
+     * which requires non-blocking tools and does not accept scheduling.
+     */
+    tool_response_policy?: GeminiToolResponsePolicy;
+    /**
      * Which end-of-turn detector runs. ``None`` (the default) and
      * ``cosmo_vad`` run Cosmo's semantic turn detection, which classifies
      * whether the utterance reads as finished instead of timing a silence
@@ -850,6 +871,21 @@ export type GeminiModel = {
      * default detector. ``semantic_vad`` is OpenAI-only and rejected.
      */
     turn_detection?: TurnDetectionMode;
+};
+
+/**
+ * Whether Gemini waits for a tool and when it responds to its result.
+ */
+export type GeminiToolResponsePolicy = {
+    /**
+     * ``blocking`` waits for the result; ``non_blocking`` allows speech while it runs.
+     */
+    behavior: 'blocking' | 'non_blocking';
+    /**
+     * For non-blocking tools: answer when idle, absorb silently, or interrupt speech.
+     * Omitted uses ``when_idle`` on Gemini Live and model scheduling on Extended Thinking.
+     */
+    scheduling?: 'when_idle' | 'silent' | 'interrupt';
 };
 
 /**
@@ -2301,6 +2337,17 @@ export type SpeakerLogToolSpec = {
      * The tool kind. Always ``speaker_log``.
      */
     kind: 'speaker_log';
+};
+
+/**
+ * A Tavus renderer for the agent's video avatar.
+ */
+export type TavusAvatar = {
+    /**
+     * Which Tavus face renders the agent.
+     */
+    face_id: string;
+    provider: 'tavus';
 };
 
 /**

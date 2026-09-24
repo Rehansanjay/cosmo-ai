@@ -19,6 +19,21 @@ struct SessionConfigTests {
         return nested
     }
 
+    @Test("Gemini response policies serialize with per-tool overrides")
+    func geminiToolPolicies() throws {
+        let fields = try encodedFields(SessionConfig(model: .gemini(.init(
+            modelId: "gemini-3.8-live",
+            toolResponsePolicy: .init(behavior: .blocking),
+            toolResponseOverrides: ["lookup": .init(behavior: .nonBlocking, scheduling: .whenIdle)]
+        ))))
+        let agent = try #require(object(fields, "agent"))
+        let model = try #require(object(agent, "model"))
+        #expect(model["tool_response_policy"] == .object(["behavior": .string("blocking")]))
+        #expect(model["tool_response_overrides"] == .object([
+            "lookup": .object(["behavior": .string("non_blocking"), "scheduling": .string("when_idle")])
+        ]))
+    }
+
     @Test("wire payload carries type and SDK identity; unset fields stay absent")
     func defaultsStayAbsent() throws {
         let fields = try encodedFields(SessionConfig())

@@ -234,6 +234,7 @@ describe('credential on session-start and merged getAuthHeaders', () => {
       getOutputStream: () => null,
       onOutputStreamChanged: () => () => {},
       attachAudioElement: () => {},
+      attachVideoElement: () => {},
       onMessage: (cb) => {
         messageListeners.add(cb);
         return () => {

@@ -28,7 +28,7 @@ it; file issues on cosmo-ai.
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/socratic-ai/cosmo-swift-sdk", from: "0.8.0"),
+    .package(url: "https://github.com/socratic-ai/cosmo-swift-sdk", from: "0.8.1"),
 ],
 targets: [
     .target(
@@ -711,3 +711,7 @@ and does not implement proprietary cryptographic algorithms. By downloading or
 using this software you represent that you are not located in, or a national or
 resident of, any country subject to U.S. embargo or comprehensive sanctions, and
 that you are not on any U.S. government restricted-party list.
+
+## Plugins
+
+Pass `plugins` when building an inline agent to compose named bundles of instructions, skills, tools, and hooks. Plugin contributions are combined in list order, followed by directly supplied contributions. See the [plugin guide](https://platform.askcosmo.ai/docs/capabilities/plugins).

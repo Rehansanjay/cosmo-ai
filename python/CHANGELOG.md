@@ -11,6 +11,26 @@ next release's section, never by editing an old one.
 > Several names changed after — read the reference docs for the current
 > shape, and v0.1.0 only as history.
 
+## v0.6.1 — 2026-09-24
+
+### Added
+
+- `experimental.avatar` asks the server for a video avatar — a vendor renderer joins the session and republishes the agent's speech as lip-synced video, and the agent then publishes no audio of its own. One renderer today (`provider: "tavus"`, with a `face_id`); the field is discriminated on `provider` so further renderers join without a wire change. Server-gated per workspace: a session that asks for one while the gate is off simply starts without it. Rendering the video needs a client that can surface a remote video track, which this SDK does not yet do.
+- `GeminiModel` accepts `tool_response_policy` and `tool_response_overrides` to let selected tools run while the agent continues speaking, with `GeminiToolResponsePolicy` controlling result scheduling. The `gemini-3.8-live-extended-thinking` model requires non-blocking tools, accepts low, medium or high thinking, and does not accept scheduling.
+- `Plugin` bundles instructions, skills, tools, and hooks for inline agents through the `plugins` parameter. Contributions compose in plugin order before direct configuration, with named conflicts rejected at construction.
+
+### Changed
+
+- Speaker diarization is available through the speaker log server tool without a workspace rollout flag. Opt in with `speaker_log_tool()`. See the [server tools guide](https://platform.askcosmo.ai/docs/guides/server-side-tools) for setup.
+
+### Fixed
+
+- a `DelegationCreatedEvent` that arrived with an empty `transcript` —
+  GPT Live raises a hand-off mid-turn without attaching what the user said —
+  now carries the session's last user turn, so a backend answering hand-offs
+  always has something to act on. Each turn stands in for at most one hand-off,
+  so two blank hand-offs in a row never replay the same instruction.
+
 ## v0.6.0 — 2026-09-18
 
 ### Breaking

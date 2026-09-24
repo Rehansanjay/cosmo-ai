@@ -254,6 +254,11 @@ export interface RealtimeTransport {
    *  already attached to a different element, the transport re-attaches
    *  it to the new one. */
   attachAudioElement(el: HTMLAudioElement | null): void;
+  /** Play the session's remote video — an avatar renderer speaking for the
+   *  agent — through ``el``, or ``null`` to detach. Optional: a transport
+   *  without remote-video support may omit it; the session then never
+   *  attaches video. */
+  attachVideoElement?(el: HTMLVideoElement | null): void;
 
   /** Replay all remote audio elements from a user gesture to recover from a
    *  browser autoplay block. Optional: transports without per-element audio

@@ -431,6 +431,14 @@ export class LiveKitTransport implements RealtimeTransport {
 
   private _wireRoomEvents(room: Room): void {
     room.on(RoomEvent.TrackSubscribed, (track: RemoteTrack) => {
+      if (track.kind === Track.Kind.Video) {
+        // The agent publishes none of its own; a remote video track means a
+        // renderer is speaking for it. Muted on playback — its audio arrives
+        // as a separate track the audio path already plays.
+        this.remoteVideoTrack = track;
+        if (this.hostVideoElement) track.attach(this.hostVideoElement);
+        return;
+      }
       if (track.kind !== Track.Kind.Audio) return;
       // First remote audio track plays on the host element (the gestured,
       // already-unblocked ``<audio>`` that <RealtimeAudio/> owns, also used
@@ -443,6 +451,13 @@ export class LiveKitTransport implements RealtimeTransport {
       }
     });
     room.on(RoomEvent.TrackUnsubscribed, (track: RemoteTrack) => {
+      if (track.kind === Track.Kind.Video) {
+        if (this.remoteVideoTrack === track) {
+          if (this.hostVideoElement) track.detach(this.hostVideoElement);
+          this.remoteVideoTrack = null;
+        }
+        return;
+      }
       if (track.kind !== Track.Kind.Audio) return;
       const extra = this.extraAudioElements.get(track);
       if (extra) {
@@ -814,6 +829,23 @@ export class LiveKitTransport implements RealtimeTransport {
     const media = track?.mediaStreamTrack ?? null;
     this.outputStream = media ? new MediaStream([media]) : null;
     for (const cb of this.outputStreamListeners) cb();
+  }
+
+  /** Host ``<video>`` from ``attachVideoElement``, and the remote video
+   *  track to play through it. A session only has one when an avatar
+   *  renderer is attached server-side; without an element the track is
+   *  subscribed and left unplayed. */
+  private hostVideoElement: HTMLVideoElement | null = null;
+  private remoteVideoTrack: RemoteTrack | null = null;
+
+  attachVideoElement(el: HTMLVideoElement | null): void {
+    if (this.hostVideoElement === el) return;
+    this.hostVideoElement?.replaceChildren?.();
+    if (this.hostVideoElement && this.remoteVideoTrack) {
+      this.remoteVideoTrack.detach(this.hostVideoElement);
+    }
+    this.hostVideoElement = el;
+    if (el && this.remoteVideoTrack) this.remoteVideoTrack.attach(el);
   }
 
   attachAudioElement(el: HTMLAudioElement | null): void {

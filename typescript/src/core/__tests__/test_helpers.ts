@@ -133,6 +133,7 @@ export function makeFakeTransport(
     getOutputStream: () => null,
     onOutputStreamChanged: () => () => {},
     attachAudioElement: () => {},
+    attachVideoElement: () => {},
     onMessage: (cb) => {
       messageListeners.add(cb);
       return () => {

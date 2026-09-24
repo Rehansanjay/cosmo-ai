@@ -115,6 +115,7 @@ from cosmo_ai.skills._engine import (
     resolve_skills,
 )
 from cosmo_ai._internal.credentials_file import resolve_credential
+from cosmo_ai.plugins import Plugin, _resolve_plugins
 from cosmo_ai.token_source import TokenSource
 from cosmo_ai.tools._sdk_tools import assert_no_reserved_tool_names
 
@@ -262,6 +263,7 @@ class RealtimeClient:
         mcp: McpInput | None = None,
         skills: SkillsInput | None = None,
         hooks: Sequence[Hook | ServerHook] | None = None,
+        plugins: Sequence[Plugin] | None = None,
     ) -> "RealtimeAgent":
         """Build an inline :class:`RealtimeAgent` — the persona/configuration of the
         model on the other end (instructions, model, voice, tools,
@@ -312,6 +314,7 @@ class RealtimeClient:
             :class:`~cosmo_ai.mcp.McpStdioServer` values.
         :param skills: A skills directory, or a list mixing directories with
             inline :class:`~cosmo_ai.skills.Skill` objects.
+        :param plugins: Bundles expanded in order before directly supplied contributions.
         :param hooks: In-process callbacks that observe or gate the session
             (:class:`~cosmo_ai.hooks.Hook`), and declarative server-side
             hooks (:class:`~cosmo_ai.hooks.ServerHook`) the server runs.
@@ -320,6 +323,20 @@ class RealtimeClient:
         :raises McpError: An MCP config path is unreadable or malformed, or
             two servers share a name.
         """
+        resolved_skills = resolve_skills(skills)
+        if plugins:
+            combined = _resolve_plugins(
+                plugins,
+                Plugin(
+                    name="agent",
+                    instructions=instructions,
+                    skills=resolved_skills or (),
+                    tools=tools or (),
+                    hooks=hooks or (),
+                ),
+            )
+            instructions, tools, hooks = combined.instructions, combined.tools, combined.hooks
+            resolved_skills = tuple(combined.skills)
         return RealtimeAgent(
             _client=self,
             instructions=instructions,
@@ -330,7 +347,7 @@ class RealtimeClient:
             greeting=greeting,
             audio=audio,
             mcp=resolve_mcp(mcp),
-            skills=resolve_skills(skills),
+            skills=resolved_skills,
             hooks=resolve_hooks(hooks),
         )
 
