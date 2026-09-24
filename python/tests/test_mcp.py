@@ -194,19 +194,14 @@ def test_resolve_rewrap_preserves_inner_code(tmp_path: Path):
     assert str(cfg) in excinfo.value.message
 
 
-def test_resolve_unreadable_config_raises_cannot_read(tmp_path: Path):
+def test_resolve_unreadable_config_raises_cannot_read(tmp_path: Path, deny_read):
     # `Path.is_file` only swallows ENOENT/ENOTDIR/EBADF/ELOOP, so before the
     # probe moved inside the guard this escaped as a bare PermissionError.
     walled = tmp_path / "walled"
     walled.mkdir()
     cfg = _write_config(walled, {"mcpServers": {}})
-    walled.chmod(0o000)
-    try:
-        assert (
-            mcp_error_code(lambda: mcp_mod.resolve_mcp(cfg)) is McpErrorCode.CANNOT_READ
-        )
-    finally:
-        walled.chmod(0o755)
+    deny_read(walled)
+    assert mcp_error_code(lambda: mcp_mod.resolve_mcp(cfg)) is McpErrorCode.CANNOT_READ
 
 
 def test_resolve_non_utf8_config_is_cannot_read(tmp_path: Path):
