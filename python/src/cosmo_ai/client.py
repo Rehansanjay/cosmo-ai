@@ -206,6 +206,14 @@ class RealtimeClient:
                 code=CredentialsErrorCode.CONFLICTING_CREDENTIALS,
                 message="provide at most one of api_key or token",
             )
+        # Normalize before the guard below reads the value. A key pasted with
+        # a byte-order mark would otherwise slip past the ``cosmo_`` prefix
+        # check and then be cleaned into a working bearer credential, which is
+        # the exact mistake that check exists to refuse.
+        if isinstance(api_key, str):
+            api_key = _clean_credential(api_key)
+        if isinstance(token, str):
+            token = _clean_credential(token)
         if (
             isinstance(token, str)
             and token.startswith("cosmo_")
